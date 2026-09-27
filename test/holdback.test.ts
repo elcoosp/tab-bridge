@@ -87,3 +87,40 @@ test("safeEmitLength holds back any suffix that could grow into an opener", () =
   assert.equal(safeEmitLength("abc```tool_call"), 3); // full-opener suffix is held
   assert.equal(safeEmitLength("abc```x"), 7); // trailing x breaks the opener -> emit all
 });
+
+test("naked tool_call marker (dropped backticks) becomes a call event", () => {
+  const h = new HoldbackBuffer();
+  const evs = h.push('stop.tool_call\n{"name":"get_weather","arguments":{"city":"Paris"}}\n```tail');
+  const fin = join(h.finish());
+  const { calls, content } = join(evs);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "get_weather");
+  assert.equal(calls[0].argsJson, '{"city":"Paris"}');
+  assert.equal(content + fin.content, "stop.tail");
+});
+
+test("naked marker split across fragments resolves once closed", () => {
+  const h = new HoldbackBuffer();
+  const e1 = join(h.push("thinking out loud.\ntool_ca"));
+  assert.equal(e1.content, "thinking out loud."); // newline held with the partial marker
+  const e2 = join(h.push('ll\n{"name":"ls","arguments":{}}\n```'));
+  const e3 = join(h.finish());
+  assert.equal(e2.calls.length + e3.calls.length, 1);
+  assert.equal(e2.content + e3.content, "\n");
+});
+
+test("naked marker with invalid JSON flushes as content with warning", () => {
+  const h = new HoldbackBuffer();
+  const evs = h.push("tool_call\nnot json at all\n```");
+  const { calls, content } = join(evs);
+  assert.equal(calls.length, 0);
+  assert.ok(content.includes("tool_call"));
+  assert.ok(content.includes("not json"));
+});
+
+test("prose mentioning tool_call without marker shape passes through", () => {
+  const h = new HoldbackBuffer();
+  const e = join(h.push("the tool_call block is how tools work"));
+  const fin = join(h.finish());
+  assert.equal(e.content + fin.content, "the tool_call block is how tools work");
+});

@@ -106,3 +106,11 @@ test("arguments may arrive as a JSON string", () => {
   assert.equal(out.calls.length, 1);
   assert.equal(out.calls[0].arguments, '{"cmd":"ls"}');
 });
+
+test("naked tool_call marker (dropped backticks) still parses", () => {
+  const text = 'stop.tool_call\n{"name": "execute_command", "arguments": {"cmd": "ls"}}\n```tail';
+  const out = parseResponse(text, TOOLS);
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, "execute_command");
+  assert.equal(out.warnings.length, 0);
+});

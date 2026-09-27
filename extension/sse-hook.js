@@ -259,6 +259,17 @@
       let sawDoneMarker = false;
       let sawFinish = false;
       let hintError = null;
+      // Frames that carried a payload but yielded no text: proves whether
+      // "missing" bytes were never extracted (odd wire shape) vs never sent.
+      let skipped = 0;
+      let skippedSample = "";
+
+      function noteSkipped(payload) {
+        skipped += 1;
+        if (skippedSample.length < 200) {
+          skippedSample += String(payload).slice(0, 200 - skippedSample.length);
+        }
+      }
 
       function feed(chunk) {
         let text = carry + chunk;
@@ -286,7 +297,10 @@
             continue;
           }
           const obj = safeJsonParse(payload);
-          if (obj === undefined) continue;
+          if (obj === undefined) {
+            noteSkipped(payload);
+            continue;
+          }
 
           // DeepSeek `event: hint` frames carry provider errors (rate limit)
           if (event === "hint") {
@@ -303,6 +317,7 @@
 
           const r = extractFromFrame(obj);
           if (!r) {
+            noteSkipped(payload);
             if (event === "close") out.done = true;
             continue;
           }
@@ -341,6 +356,11 @@
         return {
           text: emitted,
           rawLength: raw.length,
+          // First 300 raw chars: settles "what did the wire actually send"
+          // debates (tag variants, boundary nibbles) from one diag paste.
+          rawHead: raw.slice(0, 300),
+          skipped,
+          skippedHead: skippedSample,
           sawAny: raw.length > 0,
           sawDoneMarker,
           sawFinish,
@@ -392,6 +412,112 @@
       /* noop */
     }
   };
+  // Visible-by-default log: console.debug is hidden unless Verbose is on,
+  // which is why stuck turns showed "no logs". info() is for turn-lifecycle
+  // events only (arm / stream-start / complete / errors), never deltas.
+  const info = (...a) => {
+    try {
+      console.log("[tab-bridge:sse]", ...a);
+    } catch {
+      /* noop */
+    }
+  };
+
+  // Field diagnostics: readable from the page console as
+  // `window.__tabBridgeSseDiag`. Tells us whether the completion POST was
+  // ever seen, what it looked like, and what the capture produced.
+  // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
+  // read the manifest; the injector reports its own version live).
+  const diag = {
+    hookVersion: "1.2.10",
+    installedAt: new Date().toISOString(),
+    arms: 0,
+    lastArm: null,
+    fetchesSeenWhileArmed: 0,
+    /** Most recent non-matching fetch URLs seen while armed (max 8). */
+    lastFetchUrls: [],
+    /** One entry per captured stream (max 8). */
+    captures: [],
+    /** Passive transport census: completion-URL requests seen per transport,
+     * counted ALWAYS (even unarmed) so the diag alone reveals whether the
+     * app streams over fetch, XHR, or EventSource. */
+    census: { fetch: 0, xhr: 0, eventsource: 0 },
+    /** Most recent completion-URL sightings "transport METHOD url" (max 8). */
+    lastCompletionUrls: [],
+  };
+  try {
+    window.__tabBridgeSseDiag = diag;
+  } catch {
+    /* noop */
+  }
+
+  function censusNote(transport, method, url) {
+    let u = "";
+    try {
+      u = String(url == null ? "" : url);
+      if (!internals.COMPLETION_RE.test(u)) return;
+    } catch {
+      return;
+    }
+    try {
+      if (diag.census[transport] !== undefined) diag.census[transport] += 1;
+      diag.lastCompletionUrls.push(`${transport} ${method} ${u.slice(0, 160)}`);
+      if (diag.lastCompletionUrls.length > 8) diag.lastCompletionUrls.shift();
+    } catch {
+      /* noop */
+    }
+  }
+
+  function recordCapture(entry) {
+    diag.captures.push({ at: new Date().toISOString(), ...entry });
+    if (diag.captures.length > 8) diag.captures.shift();
+  }
+
+  function noteFetchWhileArmed(method, url, matched) {
+    diag.fetchesSeenWhileArmed += 1;
+    if (!matched) {
+      diag.lastFetchUrls.push(`${method} ${String(url).slice(0, 160)}`);
+      if (diag.lastFetchUrls.length > 8) diag.lastFetchUrls.shift();
+    }
+  }
+
+  /**
+   * Shared stream finish: info-log, diag record, and the empty-stream re-arm
+   * (an empty capture usually means we latched onto a non-answer request, so
+   * stay armed for the real answer POST while the arm deadline allows).
+   * Returns the parser's end() summary.
+   */
+  function finishStreamCapture(turnId, kind, parser, deltaCount) {
+    const fin = parser.end();
+    info(
+      `stream complete for ${turnId} (${kind}):`,
+      fin.rawLength,
+      "raw chars,",
+      fin.text.length,
+      "visible in",
+      deltaCount,
+      "deltas,",
+      fin.skipped,
+      "frames skipped"
+    );
+    recordCapture({
+      turnId,
+      kind,
+      result: fin.text.length > 0 ? "text" : "empty",
+      deltas: deltaCount,
+      rawLength: fin.rawLength,
+      rawHead: fin.rawHead,
+      skipped: fin.skipped,
+      skippedHead: fin.skippedHead,
+      textHead: fin.text.slice(0, 120),
+      doneMarker: fin.sawDoneMarker || fin.sawFinish,
+    });
+    if (fin.text.length === 0 && armed && armed.turnId === turnId && Date.now() < armed.deadline) {
+      armed.started = false;
+      info("empty stream for", turnId, "— staying armed for the next completion request");
+    }
+    return fin;
+  }
 
   function post(msg) {
     try {
@@ -416,7 +542,10 @@
         deadline: Date.now() + (d.timeoutMs || 300000) + 30000,
         started: false,
       };
-      log("armed for", d.turnId);
+      diag.arms += 1;
+      diag.lastArm = { turnId: d.turnId, at: new Date().toISOString() };
+      diag.fetchesSeenWhileArmed = 0;
+      info("armed for", d.turnId);
       post({ type: "arm-ack", turnId: d.turnId });
       return;
     }
@@ -427,11 +556,12 @@
   });
 
   post({ type: "hello" });
-  log("hook installed (MAIN world)");
+  info("hook installed (MAIN world), version", diag.hookVersion);
 
   async function pumpSse(branch, turnId) {
     const parser = internals.createSseParser();
     const dec = new TextDecoder();
+    let deltaCount = 0;
     try {
       for (; ;) {
         const { value, done } = await branch.read();
@@ -446,9 +576,12 @@
           });
         }
         for (const d of res.deltas) post({ type: "delta", turnId, text: d });
+        deltaCount += res.deltas.length;
       }
     } catch (e) {
       post({ type: "stream-error", turnId, error: String((e && e.message) || e) });
+      info("stream-error for", turnId, String((e && e.message) || e));
+      recordCapture({ turnId, kind: "sse", result: "stream-error", deltas: deltaCount });
       try {
         branch.cancel();
       } catch {
@@ -456,8 +589,7 @@
       }
       return;
     }
-    const fin = parser.end();
-    log("stream complete:", fin.rawLength, "raw chars,", fin.text.length, "visible");
+    const fin = finishStreamCapture(turnId, "sse", parser, deltaCount);
     post({
       type: "complete",
       turnId,
@@ -480,10 +612,18 @@
       text = await new Response(branch).text();
     } catch (e) {
       post({ type: "stream-error", turnId, error: String((e && e.message) || e) });
+      info("stream-error (json) for", turnId, String((e && e.message) || e));
+      recordCapture({ turnId, kind: "json", result: "stream-error" });
       return;
     }
     const r = internals.extractFromFrame(internals.safeJsonParse(text));
     const out = r && typeof r.delta === "string" ? r.delta : "";
+    info("non-SSE completion for", turnId + ":", out.length, "chars");
+    recordCapture({ turnId, kind: "json", result: out.length > 0 ? "text" : "empty" });
+    if (out.length === 0 && armed && armed.turnId === turnId && Date.now() < armed.deadline) {
+      armed.started = false;
+      info("empty JSON completion for", turnId, "— staying armed for the next completion POST");
+    }
     post({
       type: "complete",
       turnId,
@@ -509,6 +649,8 @@
       /* ignore */
     }
     log("completion HTTP", status, snippet.slice(0, 80));
+    info("completion HTTP", status, "for", turnId, String(snippet).slice(0, 120));
+    recordCapture({ turnId, kind: "http-error", result: `http-${status}` });
     post({ type: "http-error", turnId, status, snippet: String(snippet).slice(0, 300) });
   }
 
@@ -530,14 +672,21 @@
     }
     let match = false;
     try {
+      censusNote("fetch", method, url);
+    } catch {
+      /* noop */
+    }
+    try {
       match = !!armed && !armed.started && method === "POST" && internals.COMPLETION_RE.test(url);
     } catch {
       match = false;
     }
+    if (armed && !armed.started) noteFetchWhileArmed(method, url, match);
     if (!match) return origFetch.call(this, input, init);
 
     const turnId = armed.turnId;
     armed.started = true; // exactly one capture per armed turn
+    info("intercepting completion POST for", turnId, String(url).slice(0, 120));
     return Promise.resolve()
       .then(() => origFetch.call(this, input, init))
       .then((resp) => {
@@ -547,7 +696,7 @@
             return resp;
           }
           const ct = (resp.headers && resp.headers.get("content-type")) || "";
-          log("stream attached:", resp.status, ct, String(url).slice(0, 120));
+          info("stream attached for", turnId + ":", resp.status, ct, String(url).slice(0, 120));
           post({ type: "stream-start", turnId, status: resp.status, contentType: ct });
           const branches = resp.body.tee();
           if (resp.status >= 400) drainError(branches[1], turnId, resp.status);
@@ -577,4 +726,294 @@
         throw err;
       });
   };
+
+  // -------------------------------------------------------------------------
+  // XHR tap: some frontends stream over XMLHttpRequest (responseText grows
+  // incrementally). Same arm/capture contract as the fetch tap.
+  // -------------------------------------------------------------------------
+  function attachXhrCapture(xhr, turnId) {
+    const parser = internals.createSseParser();
+    let seen = 0;
+    let deltaCount = 0;
+    let announced = false;
+
+    const announce = () => {
+      if (announced) return;
+      announced = true;
+      let ct = "";
+      try {
+        ct = xhr.getResponseHeader("content-type") || "";
+      } catch {
+        /* headers unavailable */
+      }
+      info("XHR stream attached for", turnId + ":", xhr.status || 0, ct);
+      post({ type: "stream-start", turnId, status: xhr.status || 200, contentType: ct });
+    };
+
+    const pump = () => {
+      let full = "";
+      try {
+        full = xhr.responseText || "";
+      } catch {
+        return; // non-text responseType: nothing to stream-parse
+      }
+      if (full.length <= seen) return;
+      const chunk = full.slice(seen);
+      seen = full.length;
+      announce();
+      let res;
+      try {
+        res = parser.feed(chunk);
+      } catch {
+        return;
+      }
+      if (res.hintError) {
+        post({
+          type: "hint-error",
+          turnId,
+          content: res.hintError.content,
+          finishReason: res.hintError.finishReason,
+        });
+      }
+      for (const d of res.deltas) post({ type: "delta", turnId, text: d });
+      deltaCount += res.deltas.length;
+    };
+
+    const finish = (result) => {
+      if (result === "http-error") {
+        let snippet = "";
+        try {
+          snippet = String(xhr.responseText || "").slice(0, 300);
+        } catch {
+          /* ignore */
+        }
+        info("XHR completion HTTP", xhr.status, "for", turnId, snippet.slice(0, 120));
+        recordCapture({ turnId, kind: "xhr", result: `http-${xhr.status}` });
+        post({ type: "http-error", turnId, status: xhr.status || 0, snippet });
+        return;
+      }
+      if (result === "failed") {
+        post({ type: "fetch-rejected", turnId, error: "xhr request failed/aborted" });
+        info("XHR request failed for", turnId);
+        recordCapture({ turnId, kind: "xhr", result: "failed", deltas: deltaCount });
+        return;
+      }
+      const fin = finishStreamCapture(turnId, "xhr", parser, deltaCount);
+      post({
+        type: "complete",
+        turnId,
+        text: fin.text,
+        sawAny: fin.sawAny,
+        doneMarker: fin.sawDoneMarker || fin.sawFinish,
+        hintError: fin.hintError,
+      });
+    };
+
+    try {
+      xhr.addEventListener("progress", pump);
+      xhr.addEventListener("load", () => {
+        pump();
+        finish(xhr.status >= 400 ? "http-error" : "done");
+      });
+      xhr.addEventListener("error", () => finish("failed"));
+      xhr.addEventListener("abort", () => finish("failed"));
+      xhr.addEventListener("timeout", () => finish("failed"));
+    } catch {
+      /* listener install failed — page flow untouched */
+    }
+  }
+
+  try {
+    const OrigXHR = window.XMLHttpRequest;
+    if (OrigXHR && OrigXHR.prototype && typeof OrigXHR.prototype.open === "function") {
+      const origOpen = OrigXHR.prototype.open;
+      const origSend = OrigXHR.prototype.send;
+      OrigXHR.prototype.open = function (method, url, ...rest) {
+        try {
+          this.__tbMethod = method;
+          this.__tbUrl = url == null ? "" : String(url);
+          censusNote("xhr", method, this.__tbUrl);
+        } catch {
+          /* noop */
+        }
+        return origOpen.call(this, method, url, ...rest);
+      };
+      OrigXHR.prototype.send = function (...args) {
+        try {
+          const method = String(this.__tbMethod || "GET").toUpperCase();
+          const url = this.__tbUrl || "";
+          if (!!armed && !armed.started && method === "POST" && internals.COMPLETION_RE.test(url)) {
+            const turnId = armed.turnId;
+            armed.started = true;
+            info("intercepting XHR completion POST for", turnId, url.slice(0, 120));
+            attachXhrCapture(this, turnId);
+          }
+        } catch (e) {
+          log("xhr tap failed:", String((e && e.message) || e));
+        }
+        return origSend.apply(this, args);
+      };
+    }
+  } catch {
+    /* XHR untappable — fetch tap still stands */
+  }
+
+  // -------------------------------------------------------------------------
+  // EventSource tap: if the app streams answers over SSE-as-transport, the
+  // fetch/XHR taps see nothing. Constructor census always runs; capture only
+  // while armed. Page listeners are snooped, never replaced.
+  // -------------------------------------------------------------------------
+  try {
+    const OrigES = window.EventSource;
+    if (typeof OrigES === "function") {
+      window.EventSource = function (url, config) {
+        const urlStr = String(url);
+        try {
+          censusNote("eventsource", "GET", urlStr);
+        } catch {
+          /* noop */
+        }
+        const es = new OrigES(url, config);
+        try {
+          if (!!armed && !armed.started && internals.COMPLETION_RE.test(urlStr)) {
+            const turnId = armed.turnId;
+            armed.started = true;
+            info("intercepting EventSource completion stream for", turnId, urlStr.slice(0, 120));
+            wrapEventSource(es, turnId);
+          }
+        } catch (e) {
+          log("eventsource tap failed:", String((e && e.message) || e));
+        }
+        return es;
+      };
+      window.EventSource.prototype = OrigES.prototype;
+    }
+  } catch {
+    /* EventSource untappable — fetch/XHR taps still stand */
+  }
+
+  function wrapEventSource(es, turnId) {
+    const parser = internals.createSseParser();
+    let deltaCount = 0;
+    let announced = false;
+    let done = false;
+
+    const announce = () => {
+      if (announced) return;
+      announced = true;
+      info("EventSource stream attached for", turnId);
+      post({ type: "stream-start", turnId, status: 200, contentType: "text/event-stream" });
+    };
+
+    const feedData = (data) => {
+      announce();
+      let res;
+      try {
+        res = parser.feed("data: " + String(data).split("\n").join("\ndata: ") + "\n\n");
+      } catch {
+        return;
+      }
+      for (const d of res.deltas) post({ type: "delta", turnId, text: d });
+      deltaCount += res.deltas.length;
+    };
+
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try {
+        es.close();
+      } catch {
+        /* noop */
+      }
+      const fin = finishStreamCapture(turnId, "eventsource", parser, deltaCount);
+      post({
+        type: "complete",
+        turnId,
+        text: fin.text,
+        sawAny: fin.sawAny,
+        doneMarker: true,
+        hintError: fin.hintError,
+      });
+    };
+
+    const feedHint = (data) => {
+      announce();
+      let obj;
+      try {
+        obj = typeof data === "string" ? internals.safeJsonParse(data) : data;
+      } catch {
+        return;
+      }
+      const content = obj && typeof obj.content === "string" ? obj.content : "";
+      const finishReason = obj && typeof obj.finish_reason === "string" ? obj.finish_reason : "";
+      if (content || finishReason) {
+        post({ type: "hint-error", turnId, content, finishReason });
+      }
+    };
+
+    try {
+      const origAdd = es.addEventListener.bind(es);
+      es.addEventListener = (type, listener, opts) => {
+        const snooping =
+          typeof listener === "function"
+            ? (ev) => {
+                try {
+                  if (type === "message") feedData(ev && ev.data !== undefined ? ev.data : "");
+                  else if (type === "hint") feedHint(ev && ev.data);
+                  else if (type === "close" || type === "done" || type === "finish") finish();
+                } catch {
+                  /* snoop never breaks the page */
+                }
+                listener(ev);
+              }
+            : listener;
+        return origAdd(type, snooping, opts);
+      };
+      // onmessage / onerror property handlers (path used instead of
+      // addEventListener by some clients).
+      const wrapProp = (prop, fn) => {
+        try {
+          let current = es[prop];
+          Object.defineProperty(es, prop, {
+            configurable: true,
+            get: () => current,
+            set: (v) => {
+              current =
+                typeof v === "function"
+                  ? (ev) => {
+                      try {
+                        fn(ev);
+                      } catch {
+                        /* noop */
+                      }
+                      v(ev);
+                    }
+                  : v;
+            },
+          });
+        } catch {
+          /* property not wrappable */
+        }
+      };
+      wrapProp("onmessage", (ev) => feedData(ev && ev.data !== undefined ? ev.data : ""));
+      const origOpen = es.onopen;
+      try {
+        es.onopen = (ev) => {
+          announce();
+          if (typeof origOpen === "function") origOpen(ev);
+        };
+      } catch {
+        /* noop */
+      }
+      wrapProp("onerror", () => {
+        try {
+          if (es.readyState === 2) finish();
+        } catch {
+          /* noop */
+        }
+      });
+    } catch {
+      /* snooping failed — raw stream still flows to the page */
+    }
+  }
 })();

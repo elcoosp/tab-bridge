@@ -69,6 +69,15 @@ export function parseServeArgs(argv: string[]): Config {
       if (i >= argv.length) throw new Error(`missing value for ${flag}`);
       return argv[i];
     };
+    /** Boolean flags accept `--flag`, `--flag=true|false`, or `--flag true|false`.
+     * A following `--other-flag` is never swallowed as the value. */
+    const boolFlag = (): boolean => {
+      if (inline !== undefined) return boolValue(inline, flag);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) return true;
+      i += 1;
+      return boolValue(next, flag);
+    };
     switch (flag) {
       case "--port":
         cfg.port = Number(val());
@@ -85,13 +94,13 @@ export function parseServeArgs(argv: string[]): Config {
         break;
       }
       case "--stateful":
-        cfg.stateful = boolValue(val(), "--stateful");
+        cfg.stateful = boolFlag();
         break;
       case "--auto-create-tabs":
-        cfg.autoCreateTabs = boolValue(val(), "--auto-create-tabs");
+        cfg.autoCreateTabs = boolFlag();
         break;
       case "--managed-only":
-        cfg.managedOnly = boolValue(val(), "--managed-only");
+        cfg.managedOnly = boolFlag();
         break;
       case "--ttl":
         cfg.ttlMs = parseDuration(val());

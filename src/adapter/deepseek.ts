@@ -101,20 +101,26 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
   }
 
   async ensureReady(tab: ManagedTab, timeoutMs: number): Promise<Ready> {
-    try {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const tabs = await this.pool.ping(Math.min(5_000, Math.max(500, deadline - Date.now())));
+    // PONG snapshots may temporarily miss the tab (worker SW restart wipes
+    // its tables; pings may also fail outright on a link flap). Both are
+    // transient: keep polling until the deadline, then report tab-not-known
+    // so the engine re-binds instead of surfacing a raw ping timeout.
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { ok: false, detail: "tab-not-known-to-worker" };
+      try {
+        const tabs = await this.pool.ping(Math.min(5_000, Math.max(500, remaining)));
         const me = tabs.find((t) => t.tabId === tab.tabId);
         if (me) {
           if (me.health === "ok") return { ok: true };
           return { ok: false, detail: me.health };
         }
+      } catch (e) {
+        if (e instanceof TimeoutError) return { ok: false, detail: "ensureReady-timeout" };
         if (Date.now() >= deadline) return { ok: false, detail: "tab-not-known-to-worker" };
+        await new Promise((r) => setTimeout(r, 500));
       }
-    } catch (e) {
-      if (e instanceof TimeoutError) return { ok: false, detail: "ensureReady-timeout" };
-      return { ok: false, detail: (e as Error).message };
     }
   }
 

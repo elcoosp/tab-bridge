@@ -37,6 +37,16 @@
 
 const SELECTOR_BUNDLE = "ds-2";
 
+/** Extension version, read live from the manifest so the tab console always
+ * shows which code is actually running (stale-tab confusion burner). */
+const INJECTOR_VERSION = (() => {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch {
+    return "dev";
+  }
+})();
+
 /** Prompts at or above this length go through a synthetic paste event so
  * DeepSeek's own paste pipeline (including its paste-to-file conversion)
  * decides how to carry the payload. */
@@ -55,7 +65,7 @@ const SSE_FALLBACK_AFTER_MS = 15_000;
 const SSE_IDLE_TIMEOUT_MS = 120_000;
 
 const RATE_LIMIT_RE =
-  /(?:messages?\s*(?:are\s*)?too\s*frequent|too\s*many\s*messages|消息发送过于频繁|发送消息过于频繁|发送太频繁|操作过于频繁|请求过于频繁|频率过高)/i;
+  /(?:messages?\s*(?:are\s*)?too\s*frequent|too\s*many\s*messages|too\s*many\s*requests|rate[\s_-]*limits?(?:\s*(?:reached|exceeded|hit))?|消息发送过于频繁|发送消息过于频繁|发送太频繁|操作过于频繁|请求过于频繁|频率过高)/i;
 
 const SELECTORS = {
   composer: [
@@ -125,7 +135,9 @@ function sleep(ms) {
 
 function dbg(...args) {
   try {
-    console.debug("[tab-bridge]", ...args);
+    // console.log, not debug: debug/verbose is hidden by default in DevTools,
+    // which made stuck turns show "no logs". Turn-lifecycle lines only.
+    console.log("[tab-bridge]", ...args);
   } catch {
     /* noop */
   }
@@ -182,6 +194,7 @@ function connectPort() {
     dbg("SW port lost — reconnecting");
     schedulePortReconnect();
   });
+  dbg(`injector ${INJECTOR_VERSION} (bundle ${SELECTOR_BUNDLE}) connected`);
   report("HEALTH", { state: "ok" });
 }
 
@@ -228,6 +241,23 @@ function noticeRateLimitHit() {
   for (const el of findAll(SELECTORS.noticeRegions)) {
     const t = (el.textContent || "").trim();
     if (t && t.length < 300 && RATE_LIMIT_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/**
+ * Broad submit-block scan: notice surfaces AND chat nodes that appeared after
+ * `preCount` (DeepSeek renders "Messages too frequent" as an inline bubble,
+ * not a toast, when the send is rejected pre-flight — no POST fires, so the
+ * SSE hint path never exists). Length guards keep a user prompt that merely
+ * mentions rate limits from matching: only short system-looking bubbles.
+ */
+function submitRateLimitHit(preCount) {
+  if (noticeRateLimitHit()) return true;
+  const nodes = conversationNodes();
+  for (let i = Math.max(0, preCount); i < nodes.length; i++) {
+    const t = (nodes[i].textContent || "").trim();
+    if (t && t.length < 400 && RATE_LIMIT_RE.test(t)) return true;
   }
   return false;
 }
@@ -286,15 +316,20 @@ function findSendButton(composer) {
 
 /**
  * Wait until the send control is actually enabled. Returns
- * { ok, btn?, detail? }. Handles the paste-to-file case: the composer is
+ * { ok, btn?, detail?, rateLimited? }. Handles the paste-to-file case: the composer is
  * empty but a "Pasted Content_*.txt" attachment is still processing and the
  * button stays disabled until DeepSeek finishes with it.
+ * A provider "Messages too frequent" notice aborts the wait immediately as
+ * rate-limited (the button never enables under a send block).
  */
-async function waitReadyToSubmit(composer, timeoutMs) {
+async function waitReadyToSubmit(composer, preCount, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let sawButton = false;
   let lastDetail = "send control not found";
   for (; ;) {
+    if (submitRateLimitHit(preCount)) {
+      return { ok: false, rateLimited: true, detail: "provider notice: messages too frequent" };
+    }
     const btn = findSendButton(composer);
     if (btn) {
       sawButton = true;
@@ -388,11 +423,14 @@ function conversationNodes() {
   return document.querySelectorAll(SELECTORS.messageNodes.join(","));
 }
 
-/** Did the tab react to the submit? (composer cleared / stop shown / bubble) */
+/** Did the tab react to the submit? (composer cleared / stop shown / bubble).
+ * Returns true, false, or "rate-limited" when the provider blocked the send
+ * (the notice is transient, so it is scanned inside the poll loop). */
 async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (; ;) {
     await sleep(250);
+    if (submitRateLimitHit(baseCount)) return "rate-limited";
     if (findFirst(SELECTORS.stopButton)) return true;
     if (conversationNodes().length > baseCount) return true;
     if (hadText && readComposer(composer).length === 0) return true;
@@ -405,12 +443,23 @@ async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
  * the tab actually started the turn (one retry via the alternate method).
  */
 async function submitPrompt(composer, text, readyTimeoutMs) {
+  const preCount = conversationNodes().length;
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
+    if (submitRateLimitHit(preCount)) {
+      return { ok: false, code: "rate_limited", detail: "composer rejected the prompt under a provider send block" };
+    }
     return { ok: false, code: "submit-failed", detail: "composer rejected the prompt text" };
   }
-  const ready = await waitReadyToSubmit(composer, readyTimeoutMs);
+  const ready = await waitReadyToSubmit(composer, preCount, readyTimeoutMs);
   if (!ready.ok) {
+    if (ready.rateLimited || submitRateLimitHit(preCount)) {
+      return {
+        ok: false,
+        code: "rate_limited",
+        detail: `${ready.detail || "provider notice: messages too frequent"} (mode=${mode})`,
+      };
+    }
     return {
       ok: false,
       code: "send-button-disabled",
@@ -419,21 +468,26 @@ async function submitPrompt(composer, text, readyTimeoutMs) {
   }
   const baseCount = conversationNodes().length;
   const hadText = readComposer(composer).length > 0;
+  const rateLimitedResult = () => ({
+    ok: false,
+    code: "rate_limited",
+    detail: "provider notice: messages too frequent (submit rejected)",
+  });
   // Method A: the enabled send button.
-  if (clickSend(ready.btn) && (await verifySubmitted(composer, baseCount, hadText, 6000))) {
-    return { ok: true, mode };
-  }
+  const a = clickSend(ready.btn) ? await verifySubmitted(composer, baseCount, hadText, 6000) : false;
+  if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
+  if (a === true) return { ok: true, mode };
   // Method B: Enter on the composer.
   pressEnter(composer);
-  if (await verifySubmitted(composer, baseCount, hadText, 6000)) {
-    return { ok: true, mode };
-  }
+  const b = await verifySubmitted(composer, baseCount, hadText, 6000);
+  if (b === "rate-limited" || (b !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
+  if (b === true) return { ok: true, mode };
   // Last resort: re-find the button (the DOM may have re-rendered after the
   // attachment finished processing) and click it if it is now enabled.
   const btn2 = findSendButton(composer);
-  if (clickSend(btn2) && (await verifySubmitted(composer, baseCount, hadText, 6000))) {
-    return { ok: true, mode };
-  }
+  const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, hadText, 6000) : false;
+  if (c === "rate-limited" || (c !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
+  if (c === true) return { ok: true, mode };
   return {
     ok: false,
     code: "submit-failed",
@@ -461,7 +515,25 @@ function hookPost(msg) {
 function emitDelta(t, text) {
   if (!text) return;
   t.emitted += text;
+  if (!t.loggedFirst) {
+    t.loggedFirst = true;
+    dbg("first fragment for", t.reqId, `(mode=${t.mode}, ${text.length} chars)`);
+  }
   report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
+}
+
+/**
+ * Snapshot-oriented <think> stripper for DOM-sourced text (the MAIN-world
+ * hook filters the stream incrementally; the isolated world cannot reuse
+ * it). Removes complete blocks and a trailing unclosed block (generation
+ * still in flight). Applied to EVERY snapshot before diffing so lastSent
+ * and deltas stay mutually consistent.
+ */
+function stripThinkBlocks(text) {
+  if (!text || text.indexOf("<think") === -1) return text;
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<think>[\s\S]*$/gi, "");
 }
 
 /**
@@ -475,6 +547,7 @@ function finishTurn(ok, code, detail, aborted) {
   if (t.fallbackTimer) clearTimeout(t.fallbackTimer);
   if (t.watchdog) clearInterval(t.watchdog);
   if (t.domObserver) t.domObserver.disconnect();
+  if (t.domTick) clearInterval(t.domTick);
   hookPost({ type: "disarm" });
   turn = null;
   if (ok) {
@@ -496,7 +569,7 @@ function finishTurn(ok, code, detail, aborted) {
 /** Hand capture over to the DOM observer (only while nothing was emitted). */
 function fallbackToDom(t, why) {
   if (t.mode === "dom" || t.finished) return;
-  dbg("DOM fallback engaged:", why);
+  dbg("DOM fallback engaged:", why, `(hook ${sseHookPresent ? "present" : "ABSENT"})`);
   t.mode = "dom";
   if (t.fallbackTimer) {
     clearTimeout(t.fallbackTimer);
@@ -517,6 +590,12 @@ function startDomObserver(t) {
   let tickStableSince = 0;
 
   const emitText = (text) => {
+    // DOM scraping sees RENDERED markdown: the thinking block leaks as plain
+    // text (tags are elements, not text) and code fences lose their backticks.
+    // Strip thinking here so DOM fallback never emits Chain-of-Thought. Fence
+    // fidelity is unrecoverable from DOM — tool turns must ride SSE (the
+    // 1.2.6 boot-race fix); this is only a prose safety net.
+    text = stripThinkBlocks(text);
     if (text.startsWith(lastSent)) {
       const delta = text.slice(lastSent.length);
       if (delta) {
@@ -598,8 +677,17 @@ window.addEventListener("message", (ev) => {
   const d = ev.data;
   if (!d || d.source !== "tab-bridge-sse") return;
   if (d.type === "hello") {
+    const wasAbsent = !sseHookPresent;
     sseHookPresent = true;
-    dbg("SSE hook present (MAIN world)");
+    if (wasAbsent) dbg("SSE hook present (MAIN world)");
+    // Late-installing hook vs in-flight arm: if this turn armed before the
+    // hook's listener existed, the arm was lost. Re-arm while no stream has
+    // attached yet; once bytes flow (or DOM took over) leave it alone.
+    const t0 = turn;
+    if (t0 && !t0.finished && t0.mode === "sse-await" && !t0.lastSseAt) {
+      hookPost({ type: "arm", turnId: t0.reqId, timeoutMs: t0.opts.timeoutMs || 240000 });
+      dbg("re-armed late-installing hook for", t0.reqId);
+    }
     return;
   }
   if (d.type === "arm-ack") {
@@ -685,7 +773,7 @@ function startWatchdog(t) {
       return;
     }
     const now = Date.now();
-    const hit = noticeRateLimitHit();
+    const hit = submitRateLimitHit(t.submitCount);
     if (hit) {
       finishTurn(false, "rate_limited", "provider notice: messages too frequent");
       return;
@@ -750,13 +838,24 @@ async function handleTurn(msg) {
       return;
     }
     // Arm BEFORE the submit so the completion POST cannot slip past the hook.
+    // Fresh-tab race: this TURN can arrive while the page (and the
+    // MAIN-world hook) is still booting, so wait briefly for the hello
+    // instead of locking into DOM mode while the hook is on its way.
+    if (!sseHookPresent) {
+      hookPost({ type: "ping" });
+      const helloBy = Date.now() + 3000;
+      while (!sseHookPresent && Date.now() < helloBy) await sleep(100);
+      if (!sseHookPresent) dbg("SSE hook still absent after 3s — DOM-only capture");
+    }
     if (sseHookPresent) {
       hookPost({ type: "arm", turnId: msg.reqId, timeoutMs: opts.timeoutMs || 240000 });
       t.mode = "sse-await";
     } else {
       t.mode = "dom";
-      dbg("SSE hook absent — DOM-only capture");
     }
+    // Frozen BEFORE the submit: the submit-block scan only looks at nodes
+    // that appear after this point, so our own prompt echo can't match.
+    t.submitCount = conversationNodes().length;
     const submitted = await submitPrompt(
       composer,
       msg.text,

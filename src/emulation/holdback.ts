@@ -8,10 +8,23 @@ import { HOLDBACK_CEILING } from "./types.js";
 import type { HoldbackEvent } from "./types.js";
 
 const OPENER = "```tool_call";
+/**
+ * Deformed opener the model occasionally emits with the backticks dropped
+ * (`stop.tool_call\n{...}\n```` observed in the wild): the bare word
+ * `tool_call` at a word boundary, followed by a newline. Only a following
+ * valid JSON object + closing fence turns it into a call; anything else
+ * flushes as content with a warning (same as an invalid fenced block), so a
+ * prose mention can cost at most one repair round, never a lost call.
+ */
+const NAKED_OPEN_RE = /(^|[^\w])tool_call[ \t]*\r?\n/;
 
 export class HoldbackBuffer {
   private pending = "";
   private holding = false;
+  /** Byte length of the opener that started the current hold. */
+  private openLen = OPENER.length;
+  /** True when the hold began at a naked (backtick-less) marker. */
+  private nakedOpen = false;
   private readonly ceiling: number;
 
   constructor(ceiling = HOLDBACK_CEILING) {
@@ -40,8 +53,22 @@ export class HoldbackBuffer {
     for (;;) {
       if (!this.holding) {
         const idx = this.pending.indexOf(OPENER);
-        if (idx === -1) {
-          // Emit all but a possible partial opener tail (e.g. "``" / "```t").
+        NAKED_OPEN_RE.lastIndex = 0;
+        const naked = NAKED_OPEN_RE.exec(this.pending);
+        const nakedStart = naked ? naked.index + naked[1].length : -1;
+        let mStart = -1;
+        let openLen = OPENER.length;
+        let nakedOpen = false;
+        if (idx !== -1 && (nakedStart === -1 || idx <= nakedStart)) {
+          mStart = idx;
+        } else if (nakedStart !== -1 && naked) {
+          mStart = nakedStart;
+          openLen = naked[0].length - naked[1].length;
+          nakedOpen = true;
+        }
+        if (mStart === -1) {
+          // Emit all but a possible partial opener tail (e.g. "``" / "```t"
+          // or a word-boundary "tool_ca" still growing across fragments).
           const emitLen = safeEmitLength(this.pending);
           if (emitLen > 0) {
             events.push({ type: "content", text: this.pending.slice(0, emitLen) });
@@ -49,18 +76,23 @@ export class HoldbackBuffer {
           }
           return events;
         }
-        if (idx > 0) {
-          events.push({ type: "content", text: this.pending.slice(0, idx) });
-          this.pending = this.pending.slice(idx);
+        if (mStart > 0) {
+          events.push({ type: "content", text: this.pending.slice(0, mStart) });
+          this.pending = this.pending.slice(mStart);
         }
         this.holding = true;
+        this.openLen = openLen;
+        this.nakedOpen = nakedOpen;
       }
 
       // Holding: look for the closing fence.
-      const closeIdx = this.pending.indexOf("```", OPENER.length);
+      const closeIdx = this.pending.indexOf("```", this.openLen);
       if (closeIdx !== -1) {
-        const inner = this.pending.slice(OPENER.length, closeIdx).trim();
+        const inner = this.pending.slice(this.openLen, closeIdx).trim();
         const after = this.pending.slice(closeIdx + 3);
+        // Naked blocks flush back verbatim (no backticks to normalize);
+        // fenced blocks keep the historical normalized reconstruction.
+        const verbatim = this.pending.slice(0, closeIdx + 3);
         this.pending = "";
         this.holding = false;
         try {
@@ -79,14 +111,14 @@ export class HoldbackBuffer {
           } else {
             events.push({
               type: "invalid",
-              text: this.pendingText(OPENER + inner + "```"),
+              text: this.nakedOpen ? verbatim : this.pendingText(OPENER + inner + "```"),
               error: "block is not a JSON object with a string name",
             });
           }
         } catch (e) {
           events.push({
             type: "invalid",
-            text: this.pendingText(OPENER + inner + "```"),
+            text: this.nakedOpen ? verbatim : this.pendingText(OPENER + inner + "```"),
             error: (e as Error).message,
           });
         }
@@ -120,12 +152,37 @@ export class HoldbackBuffer {
 /**
  * Length we can emit from `s` without a suffix that could still grow into an
  * opener: hold back the longest suffix of s that is a (possibly full) prefix
- * of OPENER. Callers invoke this only when no complete opener was found.
+ * of OPENER, or a word-boundary prefix of the naked `tool_call` marker
+ * ("…tool_ca" + "ll\n" across a fragment boundary). Callers invoke this only
+ * when no complete opener was found.
  */
 export function safeEmitLength(s: string): number {
+  let hold = 0;
   const maxCheck = Math.min(OPENER.length, s.length);
   for (let keep = maxCheck; keep > 0; keep--) {
-    if (OPENER.startsWith(s.slice(s.length - keep))) return s.length - keep;
+    if (OPENER.startsWith(s.slice(s.length - keep))) {
+      hold = keep;
+      break;
+    }
   }
-  return s.length;
+  hold = Math.max(hold, nakedHoldLen(s));
+  return s.length - hold;
+}
+
+/**
+ * Longest trailing word-boundary run that could still grow into the naked
+ * `tool_call` opener. The run must start the string or follow a non-word
+ * char, otherwise mid-word prose ("stool_carrier") would stall emission.
+ */
+export function nakedHoldLen(s: string): number {
+  const maxCheck = Math.min(10, s.length); // 1 boundary char + 9 marker chars
+  for (let keep = maxCheck; keep > 0; keep--) {
+    const start = s.length - keep;
+    if (start > 0 && /[\w]/.test(s[start - 1])) continue;
+    const suf = s.slice(start);
+    if (!/^[^\w]?[A-Za-z_]*$/.test(suf)) continue;
+    const core = suf.replace(/^[^\w]/, "");
+    if (core.length > 0 && "tool_call".startsWith(core)) return keep;
+  }
+  return 0;
 }

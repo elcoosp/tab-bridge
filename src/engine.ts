@@ -212,6 +212,7 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
 
   // ---- tab + readiness ----------------------------------------------------
   const tab = await ensureTabAndReady(req, row);
+  log.info("turn.tab", { sessionId: row.sessionId, tabId: tab.tabId });
 
   // ---- execute plan -------------------------------------------------------
   // Any failure from here on happened after the tab was addressed: the tab may
@@ -239,6 +240,7 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     }
 
     await req.adapter.sendTurn(tab, promptText, optionsFor(req));
+    log.info("turn.accepted", { sessionId: row.sessionId, promptChars: promptText.length });
 
     // ---- observe (stream with holdback) -------------------------------------
     events.onStatus?.("submitting");

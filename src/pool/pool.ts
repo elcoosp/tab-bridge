@@ -9,6 +9,7 @@ import { randomId } from "../util/async.js";
 import type { WsConnection } from "../link/wsserver.js";
 import { parseWorkerMessage, encodeIntent, WORKER_PROTOCOL, type WorkerIntent, type WorkerObservation } from "../link/protocol.js";
 import type { HealthState } from "../adapter/types.js";
+import { log } from "../log.js";
 
 export interface PoolConfig {
   autoCreateTabs: boolean;
@@ -264,6 +265,7 @@ export class WorkerPool extends EventEmitter {
   private onMessage(raw: string): void {
     const o = parseWorkerMessage(raw);
     if (!o) return;
+    this.traceObservation(o);
     if (o.t === "HELLO") {
       const hello = o as unknown as { t: "HELLO"; v: number; ext: string };
       if (hello.v !== WORKER_PROTOCOL) {
@@ -274,6 +276,7 @@ export class WorkerPool extends EventEmitter {
         return;
       }
       this.info = { ext: hello.ext, connectedAt: Date.now() };
+      log.info("worker.up", { ext: hello.ext });
       this.emit("event", { type: "worker-up", info: this.info } satisfies PoolEvent);
     }
     if (o.t === "HEALTH") {
@@ -293,11 +296,68 @@ export class WorkerPool extends EventEmitter {
     this.emit("raw", raw);
   }
 
+  /**
+   * Worker-protocol trace. Failures (ERROR / BIND_FAILED) always log; the
+   * per-turn flow (BOUND / ACCEPTED / first FRAGMENT / STATUS) logs when
+   * TAB_BRIDGE_DEBUG is set — run with it to diagnose a stuck turn:
+   *   TAB_BRIDGE_DEBUG=1 node dist/src/index.js serve ...
+   */
+  private fragSeen = new Set<string>();
+  private traceObservation(o: WorkerObservation): void {
+    const debug = process.env.TAB_BRIDGE_DEBUG === "1" || process.env.TAB_BRIDGE_DEBUG === "true";
+    const rec = o as unknown as Record<string, unknown>;
+    const reqId = typeof rec.reqId === "string" ? rec.reqId : undefined;
+    switch (o.t) {
+      case "ERROR":
+      case "BIND_FAILED":
+        log.warn("worker.observation", {
+          t: o.t,
+          ...(reqId ? { reqId } : {}),
+          ...(("code" in rec) ? { code: rec.code } : {}),
+          ...(("sessionId" in rec) ? { sessionId: rec.sessionId } : {}),
+          ...(("detail" in rec && typeof rec.detail === "string") ? { detail: rec.detail.slice(0, 200) } : {}),
+        });
+        if (reqId) this.fragSeen.delete(reqId);
+        break;
+      case "BOUND":
+      case "ACCEPTED":
+      case "STATUS":
+        if (debug) {
+          log.info("worker.observation", {
+            t: o.t,
+            ...(reqId ? { reqId } : {}),
+            ...(("sessionId" in rec) ? { sessionId: rec.sessionId } : {}),
+            ...(("tabId" in rec) ? { tabId: rec.tabId } : {}),
+            ...(("code" in rec) ? { code: rec.code } : {}),
+          });
+        }
+        if (o.t === "STATUS" && reqId) this.fragSeen.delete(reqId);
+        break;
+      case "FRAGMENT":
+        if (reqId && !this.fragSeen.has(reqId)) {
+          this.fragSeen.add(reqId);
+          if (debug) {
+            const text = typeof rec.text === "string" ? rec.text : "";
+            log.info("worker.observation", {
+              t: "FRAGMENT",
+              reqId,
+              first_chars: text.length,
+              first_text: text.slice(0, 80),
+            });
+          }
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
   private onDown(): void {
     if (this.conn === null) return;
     this.conn = null;
     this.info = null;
     this.healthByTab.clear();
+    log.warn("worker.down", { reason: "socket closed" });
     this.failAllPending(new Error("worker link lost (socket closed)"));
     this.emit("event", { type: "worker-down" } satisfies PoolEvent);
   }

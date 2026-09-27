@@ -1,3 +1,5 @@
-{"sessionId":"manual-1","tabId":1069585871,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790528606106,"lastUsed":1790528846934,"pendingReset":true}
-{"sessionId":"big-1","tabId":1069585872,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790528777271,"lastUsed":1790529017986,"pendingReset":true}
-{"sessionId":"tools-1","tabId":1069585873,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790528880353,"lastUsed":1790529121128,"pendingReset":true}
+{"sessionId":"tools-1","tabId":1069585923,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790538014663,"lastUsed":1790538032152,"pendingReset":true}
+{"sessionId":"tools-1","tabId":1069585923,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790538014663,"lastUsed":1790538103393,"pendingReset":true}
+{"sessionId":"tools-1","tabId":1069585929,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790538014663,"lastUsed":1790538207973,"pendingReset":true}
+{"sessionId":"tools-1","tabId":1069585929,"chain":[],"tabHash":null,"turns":0,"state":"active","mode":"stateful","scheme":1,"createdAt":1790538014663,"lastUsed":1790538216836,"pendingReset":true}
+{"sessionId":"tools-2","tabId":1069585931,"chain":["b24882d917e56763206c1596b3031615"],"tabHash":"7f3179360d5186f9f5d0e7f9a30a38ca","turns":1,"state":"active","mode":"stateful","scheme":1,"createdAt":1790538234385,"lastUsed":1790538238303,"pendingReset":false}

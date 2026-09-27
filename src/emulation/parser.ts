@@ -7,6 +7,9 @@ import { synthCallId } from "./ids.js";
 import { canonJson } from "../util/json.js";
 
 const FENCE_OPEN = /^[ \t]*```tool_call[ \t]*\r?\n?/m;
+/** Deformed opener (backticks dropped by the model): bare `tool_call` at a
+ * word boundary + newline. Same rule as the streaming holdback. */
+const NAKED_FENCE_OPEN = /(^|[^\w])tool_call[ \t]*\r?\n/;
 
 interface RawBlock {
   inner: string;
@@ -42,6 +45,28 @@ function extractFences(text: string): RawBlock[] {
 }
 
 const LEGACY_LINE = /\[tool_call id=([^\]]*) name=([^\]]*)\]\s*([\s\S]*?)(?=\[tool_call |$)/g;
+
+function extractNaked(text: string): RawBlock[] {
+  if (!text.includes("tool_call")) return [];
+  const blocks: RawBlock[] = [];
+  let rest = text;
+  let offset = 0;
+  for (;;) {
+    NAKED_FENCE_OPEN.lastIndex = 0;
+    const open = NAKED_FENCE_OPEN.exec(rest);
+    if (!open || open.index === undefined) break;
+    const markerStart = open.index + open[1].length;
+    const innerStart = open.index + open[0].length;
+    const closeIdx = rest.indexOf("```", innerStart);
+    if (closeIdx === -1) break; // unterminated: tail stays content
+    const inner = rest.slice(innerStart, closeIdx);
+    blocks.push({ inner: inner.trim(), start: offset + markerStart, end: offset + closeIdx + 3 });
+    const consumed = closeIdx + 3;
+    offset += consumed;
+    rest = rest.slice(consumed);
+  }
+  return blocks;
+}
 
 function extractLegacy(text: string): RawBlock[] {
   if (!text.includes("[tool_call")) return [];
@@ -88,6 +113,9 @@ export function parseResponse(fullText: string, tools: ToolSpec[]): ParseOutcome
 
   let blocks = extractFences(fullText);
   let legacy = false;
+  if (blocks.length === 0) {
+    blocks = extractNaked(fullText);
+  }
   if (blocks.length === 0) {
     blocks = extractLegacy(fullText);
     legacy = blocks.length > 0;
