@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Bridge Worker (DeepSeek)",
+  "version": "1.0.0",
+  "description": "Chrome-side worker for Tab Bridge: drives a managed DeepSeek chat tab over the bridge worker-link protocol (BIND/SEND/RESET intents, FRAGMENT observations).",
+  "permissions": ["alarms", "storage", "tabs"],
+  "host_permissions": ["https://chat.deepseek.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["injector.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {}
+}
