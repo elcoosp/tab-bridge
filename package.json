@@ -4,12 +4,16 @@
   "description": "OpenAI-compatible facade over a stateful browser chat tab (DeepSeek v1). Bridge + Chrome extension + tests.",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=20" },
-  "bin": { "tab-bridge": "dist/src/index.js" },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "tab-bridge": "dist/src/index.js"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/*.test.js",
+    "test": "pnpm run build && node --test dist/test/*.test.js",
     "e2e": "node e2e/run-e2e.mjs",
     "start": "node dist/src/index.js"
   },

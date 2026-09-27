@@ -15,9 +15,9 @@ failure in a lower tier invalidates everything above it.
 ## Tier 0 — unit + contract tests (seconds)
 
 ```bash
-npm install
-npm run typecheck   # tsc --noEmit -> 0 errors
-npm test            # builds, then 89 tests
+pnpm install
+pnpm run typecheck   # tsc --noEmit -> 0 errors
+pnpm test            # builds, then 89 tests
 ```
 
 Covers: hash-chain math, the 4-plan classifier, prompt compilation, fenced
@@ -34,8 +34,8 @@ Spawns the **real built bridge binary** on a real port, connects a scripted
 v1), then drives the **real HTTP/SSE API** exactly like kod does.
 
 ```bash
-npm run build
-npm run e2e           # or: node e2e/run-e2e.mjs [--port 8977] [-v] [--print-log]
+pnpm run build
+pnpm run e2e           # or: node e2e/run-e2e.mjs [--port 8977] [-v] [--print-log]
 ```
 
 15 scenarios, each asserting wire-level behavior:
@@ -73,7 +73,7 @@ send-button enable wait, real SSE scraping, and live rate limits.
 ### 2.1 Start the bridge
 
 ```bash
-npm run build
+pnpm run build
 node dist/src/index.js serve \
   --port 8789 \
   --auto-create-tabs \

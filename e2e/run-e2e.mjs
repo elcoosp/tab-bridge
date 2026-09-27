@@ -94,7 +94,7 @@ async function sseChat(body, headers = {}) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
-  for (;;) {
+  for (; ;) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += dec.decode(value, { stream: true });
@@ -203,7 +203,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
   if (!existsSync(BRIDGE)) {
-    console.error("dist/src/index.js missing — run `npm run build` first.");
+    console.error("dist/src/index.js missing — run `pnpm run build` first.");
     process.exit(2);
   }
   dbPath = join(mkdtempSync(join(tmpdir(), "tab-bridge-e2e-")), "sessions.jsonl");

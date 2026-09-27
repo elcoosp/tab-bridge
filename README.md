@@ -33,15 +33,15 @@ kod harness ──HTTP/SSE──▶ L4 facade ──▶ L3 session engine ──
 ## Build & test (0-error guarantee)
 
 ```bash
-npm install          # dev deps only
-npm run typecheck    # tsc --noEmit  → 0 errors
-npm test             # build + node --test dist/test/*.test.js → 89 pass
-npm run e2e          # bridge E2E: real bridge binary + real WS worker + real HTTP/SSE → 15 scenarios
-npm start            # = node dist/src/index.js serve --help for flags
+pnpm install          # dev deps only
+pnpm run typecheck    # tsc --noEmit  → 0 errors
+pnpm test             # build + node --test dist/test/*.test.js → 89 pass
+pnpm run e2e          # bridge E2E: real bridge binary + real WS worker + real HTTP/SSE → 15 scenarios
+pnpm start            # = node dist/src/index.js serve --help for flags
 ```
 
 Requires Node ≥ 20 (tested on 24; E2E suite uses the global `WebSocket`, so
-≥ 22 recommended for Tier 1). `dist/` ships prebuilt; `npm test` rebuilds it.
+≥ 22 recommended for Tier 1). `dist/` ships prebuilt; `pnpm test` rebuilds it.
 
 **How to test everything end-to-end for real** — see **[TESTING.md](TESTING.md)**:
 four tiers from unit tests to the full real-browser drill (Chrome extension +
