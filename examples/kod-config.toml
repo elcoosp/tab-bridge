@@ -1,0 +1,15 @@
+# ~/.kod/config.toml — wire kod to Tab Bridge (spec 8.4)
+
+[[llm.endpoints]]
+name           = "tab-bridge"
+provider       = "openai-compatible"
+base_url       = "http://127.0.0.1:8789/v1"
+model          = "deepseek-web-think"     # or "deepseek-web-chat"
+api_key_env    = "TAB_BRIDGE_KEY"         # value ignored by the bridge unless --api-key-env is set
+context_window = 65536                    # sizes kod's memory budget
+timeout_secs   = 300
+
+# bridge side:
+# tab-bridge serve --port 8789 --api-key-env TAB_BRIDGE_KEY \
+#   --stateful=true --auto-create-tabs --managed-only \
+#   --ttl=30m --repair-rounds=1
