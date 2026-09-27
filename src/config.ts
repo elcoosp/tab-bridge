@@ -13,6 +13,9 @@ export interface Config {
   dbPath: string;
   turnTimeoutMs: number;
   bindTimeoutMs: number;
+  /** Refuse prompts longer than this (chars). No truncation ever: over-cap
+   * prompts fail fast with prompt-too-large so callers can compact. */
+  maxPromptChars: number;
 }
 
 export const DEFAULTS: Config = {
@@ -28,6 +31,7 @@ export const DEFAULTS: Config = {
   dbPath: "bridge-sessions.json",
   turnTimeoutMs: 240_000,
   bindTimeoutMs: 20_000,
+  maxPromptChars: 1_000_000,
 };
 
 export function parseDuration(s: string): number {
@@ -126,6 +130,12 @@ export function parseServeArgs(argv: string[]): Config {
       case "--bind-timeout-ms":
         cfg.bindTimeoutMs = Number(val());
         break;
+      case "--max-prompt-chars":
+        cfg.maxPromptChars = Number(val());
+        if (!Number.isInteger(cfg.maxPromptChars) || cfg.maxPromptChars <= 0) {
+          throw new Error("--max-prompt-chars must be a positive integer");
+        }
+        break;
       default:
         throw new Error(`unknown flag: ${flag}`);
     }
@@ -153,5 +163,6 @@ export function usage(): string {
     "  --db=<path>             session journal path (default ./bridge-sessions.json)",
     "  --turn-timeout-ms=<n>   per-turn observation deadline (default 240000)",
     "  --bind-timeout-ms=<n>   bind/readiness deadline (default 20000)",
+    "  --max-prompt-chars=<n>  refuse prompts over n chars, never truncate (default 1000000)",
   ].join("\n");
 }

@@ -18,12 +18,18 @@
  *  2. While armed, the first POST to the completion endpoint is intercepted.
  *     The response body is tee()-ed: the page receives an untouched branch
  *     (wrapped in a fresh Response), the hook parses the other branch.
- *  3. SSE frames are parsed defensively across several known wire shapes:
- *       - DeepSeek web:  data:{"v":"delta"} deltas, data:{"v":{...}} metadata,
- *         `event: hint` frames carrying provider errors
- *         (finish_reason:"rate_limit_reached"), `event: close` terminator
- *       - OpenAI-ish:    choices[0].delta.content / reasoning_content
- *       - generic:       {content}, {message:{content}}, [DONE]
+  *  3. SSE frames are parsed defensively across several known wire shapes:
+  *       - DeepSeek web:  data:{"v":"delta"} deltas, data:{"v":{...}} metadata,
+  *         `event: hint` frames carrying provider errors
+  *         (finish_reason:"rate_limit_reached"), `event: close` terminator
+  *       - DeepSeek typed fragments: full `{"v":{"response":{fragments:
+  *         [{id,type:THINK|RESPONSE,content}]}}}` snapshots plus JSON-patch
+  *         deltas (`response/fragments/-1/content` APPEND, `response/fragments`
+  *         APPEND, BATCH). THINK-typed text is suppressed outright — thinking
+  *         and answer share the {"v":"…"} shape and only fragment context
+  *         tells them apart.
+  *       - OpenAI-ish:    choices[0].delta.content / reasoning_content
+  *       - generic:       {content}, {message:{content}}, [DONE]
  *  4. Deltas are posted to the ISOLATED world (injector) via
  *     window.postMessage; reasoning (<think>…</think> regions and
  *     reasoning_content fields) is suppressed from the visible stream.
@@ -271,6 +277,118 @@
         }
       }
 
+      // Typed-fragment attribution (DeepSeek web protocol). The completion
+      // stream multiplexes thinking and answer in identical {"v": "..."}
+      // frames; only the surrounding fragment context (full snapshots and
+      // JSON-patch ops) says which is which. THINK text is suppressed outright
+      // (already classified — no <think> scan needed); everything else flows
+      // through the think filter as a second net. No fragment info seen yet
+      // (legacy shapes): every v-string stays visible (transparent default).
+      let fragId = null;
+      let fragType = null; // "THINK" | "RESPONSE" | null
+      const seenFragIds = new Set();
+      let thinkChars = 0;
+
+      /** Route already-classified text; returns the visible delta, if any. */
+      function routeFragText(text, type) {
+        if (!text) return null;
+        raw += text;
+        if (type === "THINK") {
+          thinkChars += text.length;
+          return null;
+        }
+        const visible = think.feed(text);
+        if (visible) {
+          emitted += visible;
+          return visible;
+        }
+        return null;
+      }
+
+      /** Emit snapshot/append-carried fragment content once per fragment id. */
+      function emitFragmentContent(fid, ftype, content, out) {
+        if (typeof content !== "string" || !content) return;
+        if (fid !== null) {
+          if (seenFragIds.has(fid)) return;
+          seenFragIds.add(fid);
+        }
+        const visible = routeFragText(content, ftype);
+        if (visible) out.deltas.push(visible);
+      }
+
+      function trackFragment(fid, ftype) {
+        if (fid !== null) {
+          fragId = fid;
+          fragType = ftype;
+        } else if (ftype) {
+          fragType = ftype;
+        }
+      }
+
+      function applyPatchOp(p, o, v, out) {
+        if (p === "response/fragments" && o === "APPEND" && Array.isArray(v)) {
+          for (const f of v) {
+            if (!f || typeof f !== "object") continue;
+            trackFragment(typeof f.id === "number" ? f.id : null, typeof f.type === "string" ? f.type : null);
+            emitFragmentContent(typeof f.id === "number" ? f.id : null, typeof f.type === "string" ? f.type : null, typeof f.content === "string" ? f.content : "", out);
+          }
+          return;
+        }
+        // -1/content appends usually omit "o" (default APPEND).
+        if (p === "response/fragments/-1/content" && typeof v === "string" && (o === "APPEND" || o === undefined)) {
+          const visible = routeFragText(v, fragType);
+          if (visible) out.deltas.push(visible);
+          return;
+        }
+        if ((p === "response/status" || p === "quasi_status") && (o === "SET" || o === undefined) && typeof v === "string" && /finish/i.test(v)) {
+          sawFinish = true;
+          out.done = true;
+          return;
+        }
+        if (p === "response" && o === "BATCH" && Array.isArray(v)) {
+          for (const sub of v) {
+            if (sub && typeof sub === "object" && !Array.isArray(sub) && typeof sub.p === "string") {
+              applyPatchOp(sub.p, sub.o, sub.v, out);
+            }
+          }
+          return;
+        }
+        // Other patch paths (elapsed_secs, token usage, session updates): ignore.
+      }
+
+      /**
+       * Consume one parsed frame when it belongs to the fragment protocol.
+       * Returns true when consumed (generic extractor must skip it).
+       */
+      function routeFragmentFrame(obj, out) {
+        if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return false;
+        if (typeof obj.p === "string") {
+          applyPatchOp(obj.p, obj.o, obj.v, out);
+          return true;
+        }
+        const rv = obj.v;
+        if (rv && typeof rv === "object" && !Array.isArray(rv) && rv.response && typeof rv.response === "object") {
+          const resp = rv.response;
+          if (typeof resp.status === "string" && /finish/i.test(resp.status)) sawFinish = true;
+          if (Array.isArray(resp.fragments)) {
+            for (const f of resp.fragments) {
+              if (!f || typeof f !== "object") continue;
+              trackFragment(typeof f.id === "number" ? f.id : null, typeof f.type === "string" ? f.type : null);
+              emitFragmentContent(typeof f.id === "number" ? f.id : null, typeof f.type === "string" ? f.type : null, typeof f.content === "string" ? f.content : "", out);
+            }
+          }
+          return true;
+        }
+        // Plain v-string: attributed to the current fragment (legacy streams
+        // carry no fragment info, so untyped text stays visible).
+        if ("v" in obj && typeof obj.v === "string") {
+          const visible = routeFragText(obj.v, fragType);
+          if (visible) out.deltas.push(visible);
+          return true;
+        }
+        return false;
+      }
+
       function feed(chunk) {
         let text = carry + chunk;
         carry = "";
@@ -314,6 +432,12 @@
             }
             continue;
           }
+
+          // DeepSeek typed-fragment protocol: thinking and answer share the
+          // {"v": "..."} shape but are attributed to the current fragment
+          // (THINK vs RESPONSE). Consumed here; anything else falls through
+          // to the generic extractor below.
+          if (routeFragmentFrame(obj, out)) continue;
 
           const r = extractFromFrame(obj);
           if (!r) {
@@ -361,6 +485,7 @@
           rawHead: raw.slice(0, 300),
           skipped,
           skippedHead: skippedSample,
+          thinkChars,
           sawAny: raw.length > 0,
           sawDoneMarker,
           sawFinish,
@@ -429,13 +554,17 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.10",
+    hookVersion: "1.2.15",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,
     fetchesSeenWhileArmed: 0,
     /** Most recent non-matching fetch URLs seen while armed (max 8). */
     lastFetchUrls: [],
+    /** Most recent non-matching XHR URLs seen while armed (max 8). */
+    lastXhrUrls: [],
+    /** All WebSocket URLs ever seen (max 8) — reveals a WS transport. */
+    lastWsUrls: [],
     /** One entry per captured stream (max 8). */
     captures: [],
     /** Passive transport census: completion-URL requests seen per transport,
@@ -497,6 +626,8 @@
       "visible in",
       deltaCount,
       "deltas,",
+      fin.thinkChars || 0,
+      "thinking chars suppressed,",
       fin.skipped,
       "frames skipped"
     );
@@ -509,6 +640,7 @@
       rawHead: fin.rawHead,
       skipped: fin.skipped,
       skippedHead: fin.skippedHead,
+      thinkChars: fin.thinkChars || 0,
       textHead: fin.text.slice(0, 120),
       doneMarker: fin.sawDoneMarker || fin.sawFinish,
     });
@@ -842,6 +974,18 @@
         try {
           const method = String(this.__tbMethod || "GET").toUpperCase();
           const url = this.__tbUrl || "";
+          censusNote("xhr", method, url);
+          if (!!armed && !armed.started) {
+            try {
+              const matched = method === "POST" && internals.COMPLETION_RE.test(url);
+              if (!matched) {
+                diag.lastXhrUrls.push(`${method} ${url.slice(0, 160)}`);
+                if (diag.lastXhrUrls.length > 8) diag.lastXhrUrls.shift();
+              }
+            } catch {
+              /* noop */
+            }
+          }
           if (!!armed && !armed.started && method === "POST" && internals.COMPLETION_RE.test(url)) {
             const turnId = armed.turnId;
             armed.started = true;
@@ -856,6 +1000,35 @@
     }
   } catch {
     /* XHR untappable — fetch tap still stands */
+  }
+
+  // -------------------------------------------------------------------------
+  // WebSocket census: if answers ever stream over a socket, the fetch/XHR/
+  // EventSource taps are all blind. Passive URL log only (no interception).
+  // -------------------------------------------------------------------------
+  try {
+    const OrigWS = window.WebSocket;
+    if (typeof OrigWS === "function") {
+      window.WebSocket = function (url, protocols) {
+        try {
+          diag.lastWsUrls.push(String(url).slice(0, 160));
+          if (diag.lastWsUrls.length > 8) diag.lastWsUrls.shift();
+        } catch {
+          /* noop */
+        }
+        return protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+      };
+      window.WebSocket.prototype = OrigWS.prototype;
+      for (const k of ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]) {
+        try {
+          window.WebSocket[k] = OrigWS[k];
+        } catch {
+          /* noop */
+        }
+      }
+    }
+  } catch {
+    /* WebSocket untappable */
   }
 
   // -------------------------------------------------------------------------

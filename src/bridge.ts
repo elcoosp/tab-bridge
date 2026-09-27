@@ -59,7 +59,7 @@ export class TabBridge {
       managedOnly: config.managedOnly,
       warmTabs: config.warmTabs,
     });
-    this.adapter = adapter ?? new DeepSeekAdapter(this.pool);
+    this.adapter = adapter ?? new DeepSeekAdapter(this.pool, { maxPromptChars: config.maxPromptChars });
     this.bindTabImpl = async (sessionId, timeoutMs) => {
       const anyAdapter = this.adapter as ChatProviderAdapter & {
         pool?: WorkerPool;

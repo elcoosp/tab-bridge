@@ -1,4 +1,13 @@
 # ~/.kod/config.toml — wire kod to Tab Bridge (spec 8.4)
+#
+# Backing model note: the DeepSeek web chat models served here run on
+# DeepSeek-V4.1-Flash: 1.0M input tokens / 393K output tokens. kod's
+# context_window below should stay within that; the bridge itself refuses
+# (never truncates) prompts over --max-prompt-chars (default 1M chars).
+#
+# Sessions: kod sends its transcript session id as the OpenAI `user` field,
+# which the bridge resolves to a managed tab (x-session-id equivalent).
+# Consecutive turns of one kod session reuse the same tab — no tab per turn.
 
 [[llm.endpoints]]
 name           = "tab-bridge"
@@ -6,10 +15,10 @@ provider       = "openai-compatible"
 base_url       = "http://127.0.0.1:8789/v1"
 model          = "deepseek-web-think"     # or "deepseek-web-chat"
 api_key_env    = "TAB_BRIDGE_KEY"         # value ignored by the bridge unless --api-key-env is set
-context_window = 65536                    # sizes kod's memory budget
+context_window = 1000000                  # DeepSeek-V4.1-Flash input limit (tokens)
 timeout_secs   = 300
 
 # bridge side:
 # tab-bridge serve --port 8789 --api-key-env TAB_BRIDGE_KEY \
 #   --stateful=true --auto-create-tabs --managed-only \
-#   --ttl=30m --repair-rounds=1
+#   --ttl=30m --repair-rounds=1 --max-prompt-chars=1000000

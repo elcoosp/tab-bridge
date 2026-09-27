@@ -18,7 +18,7 @@ const PROTOCOL_VERSION = 1;
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const PING_INTERVAL_MS = 25000;
-const RESET_TIMEOUT_MS = 15000;
+const RESET_TIMEOUT_MS = 45000;
 const START_URL = "https://chat.deepseek.com/";
 /**
  * DeepSeek "Messages too frequent. Try again later." cooldown. The provider
@@ -292,38 +292,70 @@ function handleSend(m) {
   send({ t: "ACCEPTED", reqId: m.reqId });
 }
 
+/**
+ * Pending resets by bridge reqId. Keyed independently of port objects:
+ * clicking "new chat" navigates the tab, killing the injector (and its
+ * port) mid-reset — the reply then arrives on the reconnected port, which
+ * the old per-port listener never saw (hence RESET_TIMEOUT on success).
+ */
+const resetStates = new Map(); // reqId -> { targets: Set<tabId>, timer, done }
+
 function handleReset(m) {
-  let done = false;
   const targets = [...sessionTab.values()];
   if (targets.length === 0) {
     send({ t: "RESET_OK", reqId: m.reqId }); // nothing bound: trivially reset
     return;
   }
-  const timer = setTimeout(() => {
-    if (!done) {
-      done = true;
-      send({ t: "RESET_TIMEOUT", reqId: m.reqId });
-    }
+  const st = { targets: new Set(targets), timer: null, done: false };
+  resetStates.set(m.reqId, st);
+  st.timer = setTimeout(() => {
+    if (st.done) return;
+    st.done = true;
+    resetStates.delete(m.reqId);
+    blog("RESET", m.reqId, "timed out waiting for injector reply");
+    send({ t: "RESET_TIMEOUT", reqId: m.reqId });
   }, RESET_TIMEOUT_MS);
+  blog("RESET", m.reqId, "-> tabs", targets.join(","));
   for (const tabId of targets) {
     const port = portByTab.get(tabId);
-    if (!port) continue;
-    const onMessage = (msg) => {
-      if (msg.t === "RESET_OK" || msg.t === "RESET_FAILED") {
-        port.onMessage.removeListener(onMessage);
-        if (!done) {
-          done = true;
-          clearTimeout(timer);
-          send(
-            msg.t === "RESET_OK"
-              ? { t: "RESET_OK", reqId: m.reqId }
-              : { t: "RESET_TIMEOUT", reqId: m.reqId }
-          );
+    if (port) port.postMessage({ t: "RESET" });
+    else blog("RESET", m.reqId, "no port for tab", tabId);
+  }
+}
+
+/** Route an injector reset reply to its reset state, whichever port it came on. */
+function onResetReply(tabId, msg) {
+  for (const [reqId, st] of resetStates) {
+    if (st.done || !st.targets.has(tabId)) continue;
+    if (msg.t === "RESET_OK" || msg.t === "RESET_FAILED") {
+      // No new-chat control (selector drift): navigate the tab home as the
+      // reset action itself, once per reset. The reconnect re-post carries
+      // fresh:true so the injector confirms by URL, no selectors involved.
+      if (
+        msg.t === "RESET_FAILED" &&
+        /new-chat control not found/i.test(msg.detail || "") &&
+        !st.navigatedOnce
+      ) {
+        st.navigatedOnce = true;
+        st.fresh = true;
+        blog("RESET", reqId, "no new-chat control — navigating tabs home as the reset");
+        for (const tid of st.targets) {
+          try {
+            chrome.tabs.update(tid, { url: START_URL });
+          } catch (e) {
+            blog("RESET", reqId, "navigate failed for tab", tid, String((e && e.message) || e));
+          }
         }
+        return; // keep pending; the reconnect re-post completes it
       }
-    };
-    port.onMessage.addListener(onMessage);
-    port.postMessage({ t: "RESET" });
+      st.done = true;
+      clearTimeout(st.timer);
+      resetStates.delete(reqId);
+      blog("RESET", reqId, msg.t === "RESET_OK" ? "ok" : `failed (${msg.detail || "no detail"})`);
+      send(
+        msg.t === "RESET_OK" ? { t: "RESET_OK", reqId } : { t: "RESET_TIMEOUT", reqId }
+      );
+    }
   }
 }
 
@@ -374,6 +406,19 @@ chrome.runtime.onConnect.addListener((port) => {
   const waiters = readyWaiters.get(tabId) || [];
   readyWaiters.set(tabId, []);
   waiters.forEach((fn) => fn(true));
+  // A reconnect mid-reset means the navigation killed the injector before it
+  // could reply: re-arm the fresh port so its reply completes the reset.
+  // After a navigate-home fallback the re-post carries fresh:true (URL check).
+  for (const [reqId, rst] of resetStates) {
+    if (!rst.done && rst.targets.has(tabId)) {
+      blog("re-posting RESET", reqId, "to reconnected tab", tabId, rst.fresh ? "(fresh)" : "");
+      try {
+        port.postMessage(rst.fresh ? { t: "RESET", fresh: true } : { t: "RESET" });
+      } catch {
+        /* port already gone */
+      }
+    }
+  }
 
   port.onMessage.addListener((msg) => {
     switch (msg.t) {
@@ -429,6 +474,10 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       case "HEALTH":
         markHealth(tabId, msg.state, msg.detail);
+        break;
+      case "RESET_OK":
+      case "RESET_FAILED":
+        onResetReply(tabId, msg);
         break;
       default:
         break;

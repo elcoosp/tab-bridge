@@ -215,7 +215,9 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
   async resetConversation(tab: ManagedTab): Promise<ResetOutcome> {
     const reqId = `reset_${randomId(6)}`;
     try {
-      return await this.pool.resetIntent(reqId, 15_000);
+      // 45s matches the worker RESET_TIMEOUT_MS: a control-not-found
+      // fallback navigates the tab home and waits out a full page load.
+      return await this.pool.resetIntent(reqId, 45_000);
     } catch {
       return "failed";
     }

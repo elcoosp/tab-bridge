@@ -49,6 +49,7 @@ function main(argv: string[]): void {
       warm_tabs: config.warmTabs,
       db: config.dbPath,
       auth: config.apiKey ? "bearer" : "none",
+      max_prompt_chars: config.maxPromptChars,
       worker_link: `ws://${config.host}:${config.port}/worker`,
     });
     process.stdout.write(

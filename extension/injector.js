@@ -423,6 +423,60 @@ function conversationNodes() {
   return document.querySelectorAll(SELECTORS.messageNodes.join(","));
 }
 
+/**
+ * Failure-path self-diagnosis: per-selector match counts plus the ancestor
+ * chain of the element actually holding our prompt text. When the selector
+ * bundle drifts, this output IS the corrected bundle — no browser spelunking
+ * needed. Runs only on submit failure, never on the hot path.
+ */
+function diagnoseSubmit(composer, sampleText) {
+  try {
+    const counts = {};
+    for (const sel of SELECTORS.messageNodes) {
+      try {
+        counts[`msg:${sel}`] = document.querySelectorAll(sel).length;
+      } catch {
+        counts[`msg:${sel}`] = -1;
+      }
+    }
+    for (const sel of SELECTORS.stopButton) {
+      try {
+        counts[`stop:${sel}`] = document.querySelectorAll(sel).length;
+      } catch {
+        counts[`stop:${sel}`] = -1;
+      }
+    }
+    counts.composerTextLen = readComposer(composer).length;
+    dbg("selector census:", JSON.stringify(counts));
+    const sample = (sampleText || "").slice(0, 24);
+    if (!sample) return;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    let scanned = 0;
+    while (node && scanned < 4000) {
+      scanned++;
+      if (node.nodeValue && node.nodeValue.includes(sample)) {
+        const chain = [];
+        let el = node.parentElement;
+        for (let i = 0; i < 4 && el; i++) {
+          const cls =
+            el.className && typeof el.className === "string"
+              ? "." + el.className.trim().split(/\s+/).slice(0, 4).join(".")
+              : "";
+          chain.push(`${el.tagName.toLowerCase()}${cls}${el.id ? "#" + el.id : ""}`);
+          el = el.parentElement;
+        }
+        dbg("bubble ancestor chain for prompt text:", chain.join(" < "));
+        return;
+      }
+      node = walker.nextNode();
+    }
+    dbg("prompt text not found in DOM text nodes");
+  } catch (e) {
+    dbg("diagnose failed:", String((e && e.message) || e));
+  }
+}
+
 /** Did the tab react to the submit? (composer cleared / stop shown / bubble).
  * Returns true, false, or "rate-limited" when the provider blocked the send
  * (the notice is transient, so it is scanned inside the poll loop). */
@@ -441,8 +495,16 @@ async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
 /**
  * Place the prompt, WAIT FOR THE SEND BUTTON TO BE ENABLED, submit and verify
  * the tab actually started the turn (one retry via the alternate method).
+ *
+ * `quickVerify` (SSE armed): DOM proof is only a hint — a background tab may
+ * not render for seconds while the network already streams. Verifies are
+ * short, and total DOM silence degrades to `unverified: true` instead of
+ * failing: the attaching completion stream is objective proof the submit
+ * landed, and the fallback timer fails the turn if neither ever appears.
+ * DOM-only turns keep the strict verifies (no second witness exists).
  */
-async function submitPrompt(composer, text, readyTimeoutMs) {
+async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
+  const verifyMs = quickVerify ? 2500 : 6000;
   const preCount = conversationNodes().length;
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
@@ -474,20 +536,25 @@ async function submitPrompt(composer, text, readyTimeoutMs) {
     detail: "provider notice: messages too frequent (submit rejected)",
   });
   // Method A: the enabled send button.
-  const a = clickSend(ready.btn) ? await verifySubmitted(composer, baseCount, hadText, 6000) : false;
+  const a = clickSend(ready.btn) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
   if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (a === true) return { ok: true, mode };
   // Method B: Enter on the composer.
   pressEnter(composer);
-  const b = await verifySubmitted(composer, baseCount, hadText, 6000);
+  const b = await verifySubmitted(composer, baseCount, hadText, verifyMs);
   if (b === "rate-limited" || (b !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (b === true) return { ok: true, mode };
   // Last resort: re-find the button (the DOM may have re-rendered after the
   // attachment finished processing) and click it if it is now enabled.
   const btn2 = findSendButton(composer);
-  const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, hadText, 6000) : false;
+  const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
   if (c === "rate-limited" || (c !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (c === true) return { ok: true, mode };
+  if (quickVerify) {
+    dbg("submit unverified by DOM (background tab?) — proceeding; the completion stream will confirm");
+    return { ok: true, mode, unverified: true };
+  }
+  diagnoseSubmit(composer, text);
   return {
     ok: false,
     code: "submit-failed",
@@ -796,7 +863,7 @@ function onPortMessage(msg) {
   if (msg.t === "TURN") {
     void handleTurn(msg);
   } else if (msg.t === "RESET") {
-    void handleReset();
+    void handleReset(msg);
   } else if (msg.t === "ABORT") {
     if (turn && !turn.finished && (!msg.reqId || msg.reqId === turn.reqId)) {
       finishTurn(false, null, null, true);
@@ -859,13 +926,15 @@ async function handleTurn(msg) {
     const submitted = await submitPrompt(
       composer,
       msg.text,
-      opts.submitWaitMs || SUBMIT_READY_TIMEOUT_MS
+      opts.submitWaitMs || SUBMIT_READY_TIMEOUT_MS,
+      t.mode === "sse-await"
     );
     if (!submitted.ok) {
       finishTurn(false, submitted.code || "submit-failed", submitted.detail);
       return;
     }
-    dbg("submitted (paste-mode=" + submitted.mode + ", capture=" + t.mode + ")");
+    t.unverified = submitted.unverified === true;
+    dbg("submitted (paste-mode=" + submitted.mode + ", capture=" + t.mode + (t.unverified ? ", unverified" : "") + ")");
     // Let the user bubble render before freezing the reply baseline.
     await sleep(REPLY_BASELINE_SETTLE_MS);
     t.baseCount = conversationNodes().length;
@@ -874,7 +943,22 @@ async function handleTurn(msg) {
     } else {
       t.fallbackTimer = setTimeout(() => {
         if (turn === t && !t.finished && t.mode === "sse-await") {
-          fallbackToDom(t, "no completion stream within 15s");
+          // SSE never attached: DOM evidence is the second witness. If even
+          // that is absent the submit genuinely failed — fail now rather
+          // than scraping an unrelated bubble.
+          const domEvidence =
+            findFirst(SELECTORS.stopButton) !== null ||
+            conversationNodes().length > t.submitCount;
+          if (domEvidence) {
+            fallbackToDom(t, "no completion stream within 15s");
+          } else {
+            diagnoseSubmit(composer, msg.text);
+            finishTurn(
+              false,
+              "submit-failed",
+              "submit not confirmed: no completion stream within 15s and no DOM evidence of submit"
+            );
+          }
         }
       }, SSE_FALLBACK_AFTER_MS);
     }
@@ -884,10 +968,21 @@ async function handleTurn(msg) {
   }
 }
 
-async function handleReset() {
+async function handleReset(msg) {
+  const fresh = !!(msg && msg.fresh);
   try {
     const link = findFirst(SELECTORS.newChat);
     if (!link) {
+      if (fresh && location.pathname === "/") {
+        // The worker navigated this tab home as the reset action itself
+        // (see background navigate-home fallback): the URL is the
+        // verification — no selectors involved, no lie possible, since the
+        // worker performed the navigation seconds ago on this tab.
+        dbg("reset confirmed: worker-navigated home, no control needed");
+        report("RESET_OK", {});
+        return;
+      }
+      diagnoseReset();
       report("RESET_FAILED", { detail: "new-chat control not found" });
       return;
     }
@@ -907,6 +1002,38 @@ async function handleReset() {
     report("RESET_FAILED", { detail: "conversation did not change" });
   } catch (e) {
     report("RESET_FAILED", { detail: String(e && e.message) });
+  }
+}
+
+/**
+ * Reset-path diagnosis: log visible new-chat-ish controls (links home,
+ * buttons mentioning new/start, plus-marked icon buttons) so the next paste
+ * yields the corrected newChat bundle. Failure path only.
+ */
+function diagnoseReset() {
+  try {
+    const cands = [];
+    const els = document.querySelectorAll("a, button, div[role='button']");
+    for (let i = 0; i < els.length && cands.length < 10; i++) {
+      const el = els[i];
+      if (!isVisible(el)) continue;
+      const text = (el.textContent || "").trim().slice(0, 24);
+      const href = el.getAttribute ? el.getAttribute("href") || "" : "";
+      if (
+        href === "/" ||
+        /new\s*chat|新对话|开始新|start/i.test(text) ||
+        (text.length <= 2 && el.querySelector("svg"))
+      ) {
+        const cls =
+          el.className && typeof el.className === "string"
+            ? "." + el.className.trim().split(/\s+/).slice(0, 3).join(".")
+            : "";
+        cands.push(`${el.tagName.toLowerCase()}${cls}${href ? `[href=${href}]` : ""} text=${JSON.stringify(text)}`);
+      }
+    }
+    dbg("new-chat candidates:", cands.length ? cands.join(" | ") : "(none)");
+  } catch (e) {
+    dbg("reset diagnose failed:", String((e && e.message) || e));
   }
 }
 

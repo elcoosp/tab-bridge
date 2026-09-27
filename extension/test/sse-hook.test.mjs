@@ -262,3 +262,35 @@ test("sse parser: multi-line data frames concatenate per SSE spec", () => {
   const fin = runStream('data: {"v":\ndata: "split"}\n\n', 6);
   assert.equal(fin.text, "split");
 });
+
+test("sse parser: typed fragments separate THINK from RESPONSE across chunkings", () => {
+  // Observed wire shape: full response snapshots plus JSON-patch deltas
+  // routed to the current fragment; plain v-strings inherit its type.
+  const t = [
+    'data: {"v":{"response":{"message_id":474,"status":"WIP","fragments":[{"id":2,"type":"THINK","content":"The"}]}}}\n\n',
+    'data: {"p":"response/fragments/-1/content","o":"APPEND","v":" user"}\n\n',
+    'data: {"v":" wants"}\n\n',
+    'data: {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"Let"}]}\n\n',
+    'data: {"v":" me"}\n\n',
+    'data: {"p":"response/fragments/-1/content","v":" wire"}\n\n',
+    'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+    'event: close\ndata: {"click_behavior":"none","auto_resume":false}\n\n',
+  ].join("");
+  for (const size of [1, 5, 37, 4096]) {
+    const fin = runStream(t, size);
+    assert.equal(fin.text, "Let me wire", `chunk size ${size}: only RESPONSE text visible`);
+    assert.equal(fin.thinkChars, 14, `chunk size ${size}: thinking counted, not emitted`);
+    assert.equal(fin.sawFinish, true, `chunk size ${size}: FINISHED status marks done`);
+  }
+});
+
+test("sse parser: BATCH ops recurse; repeated fragment content is not doubled", () => {
+  const t = [
+    'data: {"v":{"response":{"status":"WIP","fragments":[{"id":7,"type":"RESPONSE","content":"hi"}]}}}\n\n',
+    'data: {"v":{"response":{"status":"WIP","fragments":[{"id":7,"type":"RESPONSE","content":"hi"}]}}}\n\n',
+    'data: {"p":"response","o":"BATCH","v":[{"p":"response/fragments/-1/content","o":"APPEND","v":"!"},{"p":"quasi_status","v":"FINISHED"}]}\n\n',
+  ].join("");
+  const fin = runStream(t, 9);
+  assert.equal(fin.text, "hi!", "re-synced snapshot content emitted once, append after");
+  assert.equal(fin.sawFinish, true, "BATCH quasi_status FINISHED marks done");
+});
