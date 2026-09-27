@@ -36,10 +36,17 @@ kod harness ──HTTP/SSE──▶ L4 facade ──▶ L3 session engine ──
 npm install          # dev deps only
 npm run typecheck    # tsc --noEmit  → 0 errors
 npm test             # build + node --test dist/test/*.test.js → 89 pass
+npm run e2e          # bridge E2E: real bridge binary + real WS worker + real HTTP/SSE → 15 scenarios
 npm start            # = node dist/src/index.js serve --help for flags
 ```
 
-Requires Node ≥ 20 (tested on 24). `dist/` ships prebuilt; `npm test` rebuilds it.
+Requires Node ≥ 20 (tested on 24; E2E suite uses the global `WebSocket`, so
+≥ 22 recommended for Tier 1). `dist/` ships prebuilt; `npm test` rebuilds it.
+
+**How to test everything end-to-end for real** — see **[TESTING.md](TESTING.md)**:
+four tiers from unit tests to the full real-browser drill (Chrome extension +
+live DeepSeek: paste-to-file send gate, live rate limits, failure drills) up
+to a kod agent loop.
 
 ## Run
 
