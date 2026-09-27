@@ -1,13 +1,25 @@
 /**
- * Tab Bridge — DeepSeek injector content script (L0 DOM driver, spec 7.4).
+ * Tab Bridge — DeepSeek injector content script (L0 DOM driver, spec 7.4,
+ * v1.2.0 capture redesign).
  *
  * Responsibilities:
  *  - composer readiness polling, text placement, submit gating and verification
- *  - fragment scraping of the streaming reply (MutationObserver, UTF-8 safe:
- *    fragments are computed from JS strings, never raw bytes)
+ *  - reply capture via the MAIN-world SSE hook (extension/sse-hook.js):
+ *    the assistant answer is read from the completion network stream, which
+ *    works regardless of tab focus/visibility (MutationObserver + timers are
+ *    throttled in background tabs and were the v1.1 root cause of "message
+ *    sent but response never returns")
+ *  - DOM observation kept as a FALLBACK when the hook is absent or the
+ *    completion stream is not seen within 15 s of a verified submit
  *  - verifiable "New chat" reset (confirms the conversation actually changed)
- *  - provider rate-limit detection ("Messages too frequent" -> 429 + ~20 min)
+ *  - provider rate-limit detection (HTTP 429 / `event: hint` rate_limit_reached
+ *    on the SSE stream, plus the classic toast scan as a secondary net)
  *  - DS session-id observation (user-claimed-tab guard) and health sentinel
+ *
+ * Capture invariants (bridge-side holdback safety):
+ *  - fragments are exact, append-only deltas — a `full: true` resync is NEVER
+ *    sent once content has flowed (the bridge's holdback buffer cannot rewind)
+ *  - one capture mode owns the turn (sse or dom); modes never mix mid-turn
  *
  * DeepSeek composer quirks this driver explicitly handles (field-verified):
  *  1. Large pastes are converted into a file attachment named
@@ -16,10 +28,8 @@
  *     must wait for the button to become enabled (waitReadyToSubmit).
  *  2. The send control is a div[role=button]/button whose enabled state flips
  *     via aria-disabled / pointer-events, so "clickable" != "enabled".
- *  3. Rate limits surface as a short error bubble/toast AFTER the request is
- *     accepted (event: ready then hint finish_reason=rate_limit_reached), so
- *     the tab keeps an orphan user message — reported as code "rate_limited"
- *     and never mistaken for a normal completion.
+ *  3. Rate limits surface after the request is accepted (SSE hint frame or
+ *     toast) — reported as code "rate_limited", never a normal completion.
  *
  * Selector bundle version "ds-2": all DeepSeek-specific selectors live in
  * SELECTORS so a DOM drift is a one-bundle change (ADR-8 containment).
@@ -37,6 +47,12 @@ const SUBMIT_READY_TIMEOUT_MS = 90_000;
 const NO_BUTTON_FALLBACK_MS = 8000;
 /** Window granted to the provider to start rendering the reply bubble. */
 const REPLY_BASELINE_SETTLE_MS = 1000;
+/** If no completion stream attached this long after a verified submit,
+ * hand capture over to the DOM observer. */
+const SSE_FALLBACK_AFTER_MS = 15_000;
+/** SSE stream silence allowed before the turn errors out (bridge deadline
+ * remains the outer bound). */
+const SSE_IDLE_TIMEOUT_MS = 120_000;
 
 const RATE_LIMIT_RE =
   /(?:messages?\s*(?:are\s*)?too\s*frequent|too\s*many\s*messages|消息发送过于频繁|发送消息过于频繁|发送太频繁|操作过于频繁|请求过于频繁|频率过高)/i;
@@ -107,6 +123,14 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function dbg(...args) {
+  try {
+    console.debug("[tab-bridge]", ...args);
+  } catch {
+    /* noop */
+  }
+}
+
 function isVisible(el) {
   if (!el || !el.getBoundingClientRect) return false;
   const r = el.getBoundingClientRect();
@@ -130,15 +154,51 @@ function isEnabled(el) {
   return true;
 }
 
-const port = chrome.runtime.connect({ name: "injector" });
+// ---------------------------------------------------------------------------
+// port plumbing (with SW-restart reconnection)
+// ---------------------------------------------------------------------------
+
+let port = null;
 let seq = 0;
-let aborted = false;
+let portRetry = 0;
+
+function connectPort() {
+  let p;
+  try {
+    p = chrome.runtime.connect({ name: "injector" });
+  } catch (e) {
+    // Extension context invalidated (extension reloaded): keep a slow
+    // backoff; a fresh page load will get the new injector anyway.
+    dbg("runtime.connect failed:", String(e && e.message));
+    schedulePortReconnect();
+    return;
+  }
+  port = p;
+  portRetry = 0;
+  p.onMessage.addListener(onPortMessage);
+  p.onDisconnect.addListener(() => {
+    if (port !== p) return; // stale disconnect from a replaced port
+    port = null;
+    dbg("SW port lost — reconnecting");
+    schedulePortReconnect();
+  });
+  report("HEALTH", { state: "ok" });
+}
+
+function schedulePortReconnect() {
+  const delay = Math.min(1000 * Math.pow(2, portRetry++), 15000);
+  setTimeout(() => {
+    if (port === null) connectPort();
+  }, delay);
+}
 
 function report(t, extra) {
+  if (!port) return false;
   try {
     port.postMessage({ t, ...extra });
+    return true;
   } catch {
-    /* port closing */
+    return false;
   }
 }
 
@@ -163,7 +223,7 @@ function checkHealth() {
 }
 
 /** Rate-limit text visible in transient notice surfaces (never chat nodes —
- * error bubbles in the transcript are the turn observer's job). */
+ * error bubbles in the transcript are the watchdog's job). */
 function noticeRateLimitHit() {
   for (const el of findAll(SELECTORS.noticeRegions)) {
     const t = (el.textContent || "").trim();
@@ -181,7 +241,7 @@ checkHealth();
 
 async function waitComposer(timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (; ;) {
     const el = findFirst(SELECTORS.composer);
     if (el && !el.disabled) return el;
     if (Date.now() > deadline) return null;
@@ -234,7 +294,7 @@ async function waitReadyToSubmit(composer, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let sawButton = false;
   let lastDetail = "send control not found";
-  for (;;) {
+  for (; ;) {
     const btn = findSendButton(composer);
     if (btn) {
       sawButton = true;
@@ -331,7 +391,7 @@ function conversationNodes() {
 /** Did the tab react to the submit? (composer cleared / stop shown / bubble) */
 async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
+  for (; ;) {
     await sleep(250);
     if (findFirst(SELECTORS.stopButton)) return true;
     if (conversationNodes().length > baseCount) return true;
@@ -382,111 +442,137 @@ async function submitPrompt(composer, text, readyTimeoutMs) {
 }
 
 // ---------------------------------------------------------------------------
-// reply observation
+// reply capture (v1.2: SSE-primary, DOM fallback)
 // ---------------------------------------------------------------------------
 
+/** One active turn per tab. null when idle. */
+let turn = null;
+let sseHookPresent = false;
+
+/** Control-channel sender for the MAIN-world hook. */
+function hookPost(msg) {
+  try {
+    window.postMessage({ source: "tab-bridge-sse-control", ...msg }, window.location.origin);
+  } catch {
+    /* page navigating */
+  }
+}
+
+function emitDelta(t, text) {
+  if (!text) return;
+  t.emitted += text;
+  report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
+}
+
 /**
- * Stream the reply for one turn. `baseCount` is the message-node count right
- * after submission: our own prompt bubble is pre-baseline and never scraped,
- * which also keeps tool-result echoes in INJECT_RESULTS prompts out of the
- * rate-limit scan.
+ * Close the turn exactly once. Every path (SSE complete/error, DOM observer,
+ * watchdog, abort) funnels here; the first caller wins.
  */
-function observeReply(reqId, opts, baseCount) {
-  aborted = false;
-  let lastSent = ""; // resync baseline for FRAGMENT diffs
-  const timeoutMs = (opts && opts.timeoutMs) || 240000;
-  const deadline = Date.now() + timeoutMs;
-  let stableSince = 0;
+function finishTurn(ok, code, detail, aborted) {
+  const t = turn;
+  if (!t || t.finished) return;
+  t.finished = true;
+  if (t.fallbackTimer) clearTimeout(t.fallbackTimer);
+  if (t.watchdog) clearInterval(t.watchdog);
+  if (t.domObserver) t.domObserver.disconnect();
+  hookPost({ type: "disarm" });
+  turn = null;
+  if (ok) {
+    dbg("turn done:", t.reqId, `chars=${t.emitted.length}`, `mode=${t.mode}`);
+    report("TURN_DONE", { reqId: t.reqId });
+  } else if (aborted) {
+    dbg("turn aborted:", t.reqId);
+    report("TURN_ABORTED", { reqId: t.reqId });
+  } else {
+    dbg("turn error:", t.reqId, code, detail || "");
+    report("TURN_ERROR", {
+      reqId: t.reqId,
+      code: code || "dom-error",
+      ...(detail ? { detail } : {}),
+    });
+  }
+}
+
+/** Hand capture over to the DOM observer (only while nothing was emitted). */
+function fallbackToDom(t, why) {
+  if (t.mode === "dom" || t.finished) return;
+  dbg("DOM fallback engaged:", why);
+  t.mode = "dom";
+  if (t.fallbackTimer) {
+    clearTimeout(t.fallbackTimer);
+    t.fallbackTimer = null;
+  }
+  startDomObserver(t);
+}
+
+/** Legacy DOM capture (v1.1 logic): observer + stability tick. Used only
+ * when the SSE hook is absent or produced nothing. */
+function startDomObserver(t) {
+  if (t.domObserver) return;
   let lastLen = -1;
   let sawGrowth = false;
-  let lastRateScan = 0;
-  let finished = false;
+  let stableSince = 0;
+  let lastSent = "";
+  let tickLen = -1;
+  let tickStableSince = 0;
 
-  const finish = (ok, code, detail) => {
-    if (finished) return;
-    finished = true;
-    observer.disconnect();
-    clearInterval(tick);
-    if (ok) report("TURN_DONE", { reqId });
-    else report("TURN_ERROR", { reqId, code: code || "dom-error", ...(detail ? { detail } : {}) });
+  const emitText = (text) => {
+    if (text.startsWith(lastSent)) {
+      const delta = text.slice(lastSent.length);
+      if (delta) {
+        lastSent = text;
+        emitDelta(t, delta);
+      }
+    } else if (t.emitted.length === 0) {
+      // Non-prefix re-read before anything was emitted: safe to adopt.
+      lastSent = text;
+      emitDelta(t, text);
+    }
+    // After content has flowed a non-prefix re-read cannot be resynced
+    // without corrupting the bridge's holdback buffer — ignore it.
   };
 
   /** Reply text: only nodes that appeared AFTER our prompt was submitted. */
   function replyText() {
     const nodes = conversationNodes();
-    if (nodes.length > baseCount) {
+    if (nodes.length > t.baseCount) {
       return nodes[nodes.length - 1].textContent || "";
     }
     return null; // no reply bubble yet
   }
 
-  /** New-node + notice scan for the provider rate-limit bubble. */
-  function rateLimitHit() {
-    for (const el of findAll(SELECTORS.noticeRegions)) {
-      const t = (el.textContent || "").trim();
-      if (t && t.length < 300 && RATE_LIMIT_RE.test(t)) return t;
-    }
-    const nodes = conversationNodes();
-    for (let i = baseCount; i < nodes.length; i++) {
-      const t = (nodes[i].textContent || "").trim();
-      if (t && t.length < 400 && RATE_LIMIT_RE.test(t)) return t;
-    }
-    return null;
-  }
+  const domDone = () => {
+    const composer = findFirst(SELECTORS.composer);
+    const sendBtn = composer ? findSendButton(composer) : null;
+    const stopBtn = findFirst(SELECTORS.stopButton);
+    // done = generation over: stop control gone AND send enabled again
+    return !stopBtn && sendBtn && isEnabled(sendBtn);
+  };
 
   const observer = new MutationObserver(() => {
-    if (finished) return;
-    if (aborted) return finish(false, "aborted");
+    if (t.finished) return;
     const text = replyText();
     if (text === null) return;
     if (text.length > lastLen) {
       if (lastLen >= 0) sawGrowth = true;
       lastLen = text.length;
-      // emit only the suffix the bridge has not seen (prefix assumption),
-      // otherwise a full resync snapshot
-      if (text.startsWith(lastSent)) {
-        const delta = text.slice(lastSent.length);
-        if (delta) {
-          lastSent = text;
-          report("FRAGMENT", { reqId, seq: ++seq, text: delta });
-        }
-      } else {
-        lastSent = text;
-        report("FRAGMENT", { reqId, seq: ++seq, text, full: true });
-      }
+      emitText(text);
       stableSince = 0;
     } else if (text.length === lastLen && sawGrowth) {
       if (!stableSince) stableSince = Date.now();
-      else if (Date.now() - stableSince > 400) {
-        const composer = findFirst(SELECTORS.composer);
-        const sendBtn = composer ? findSendButton(composer) : null;
-        const stopBtn = findFirst(SELECTORS.stopButton);
-        // done = generation over: stop control gone AND send enabled again
-        if (!stopBtn && sendBtn && isEnabled(sendBtn)) finish(true);
-      }
-    }
-    const now = Date.now();
-    if (now - lastRateScan > 900) {
-      lastRateScan = now;
-      const hit = rateLimitHit();
-      if (hit) finish(false, "rate_limited", hit.slice(0, 200));
+      else if (Date.now() - stableSince > 400 && domDone()) finishTurn(true);
     }
   });
-
   observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
   // Secondary completion detector: a reply that finishes entirely inside the
   // baseline-settle window never shows growth to the observer, so the tick
   // checks "text settled + stop control gone + send enabled" on its own.
-  let tickLen = -1;
-  let tickStableSince = 0;
-
   const tick = setInterval(() => {
-    if (finished) return;
-    if (aborted) return finish(false, "aborted");
-    if (Date.now() > deadline) return finish(false, "timeout");
-    const hit = rateLimitHit();
-    if (hit) return finish(false, "rate_limited", hit.slice(0, 200));
+    if (t.finished) {
+      clearInterval(tick);
+      return;
+    }
     const text = replyText();
     if (text === null) return;
     if (text.length !== tickLen) {
@@ -494,74 +580,236 @@ function observeReply(reqId, opts, baseCount) {
       tickStableSince = Date.now();
       return;
     }
-    if (tickStableSince && Date.now() - tickStableSince > 600 && text.length > 0) {
-      const composer = findFirst(SELECTORS.composer);
-      const sendBtn = composer ? findSendButton(composer) : null;
-      const stopBtn = findFirst(SELECTORS.stopButton);
-      if (!stopBtn && sendBtn && isEnabled(sendBtn)) finish(true);
+    if (tickStableSince && Date.now() - tickStableSince > 600 && text.length > 0 && domDone()) {
+      finishTurn(true);
     }
   }, 1000);
+
+  t.domObserver = observer;
+  t.domTick = tick;
 }
 
 // ---------------------------------------------------------------------------
-// port protocol
+// MAIN-world hook observations (window messages)
 // ---------------------------------------------------------------------------
 
-port.onMessage.addListener(async (msg) => {
-  if (msg.t === "TURN") {
-    try {
-      const composer = await waitComposer(15000);
-      if (!composer) {
-        report("TURN_ERROR", { reqId: msg.reqId, code: "submit-failed", detail: "composer not ready" });
-        return;
-      }
-      const submitted = await submitPrompt(
-        composer,
-        msg.text,
-        (msg.opts && msg.opts.submitWaitMs) || SUBMIT_READY_TIMEOUT_MS
-      );
-      if (!submitted.ok) {
-        report("TURN_ERROR", {
-          reqId: msg.reqId,
-          code: submitted.code || "submit-failed",
-          ...(submitted.detail ? { detail: submitted.detail } : {}),
-        });
-        return;
-      }
-      // Let the user bubble render before freezing the reply baseline.
-      await sleep(REPLY_BASELINE_SETTLE_MS);
-      observeReply(msg.reqId, msg.opts, conversationNodes().length);
-    } catch (e) {
-      report("TURN_ERROR", { reqId: msg.reqId, code: "dom-error", detail: String(e && e.message) });
-    }
-  } else if (msg.t === "RESET") {
-    try {
-      const link = findFirst(SELECTORS.newChat);
-      if (!link) {
-        report("RESET_FAILED", { detail: "new-chat control not found" });
-        return;
-      }
-      link.click();
-      // verify the conversation actually changed (spec 7.4 contract obligation)
-      const deadline = Date.now() + 8000;
-      for (;;) {
-        await sleep(300);
-        const now = conversationNodes().length;
-        const onHome = location.pathname === "/";
-        if (now === 0 || onHome) {
-          report("RESET_OK", {});
-          return;
+window.addEventListener("message", (ev) => {
+  if (ev.source !== window) return;
+  const d = ev.data;
+  if (!d || d.source !== "tab-bridge-sse") return;
+  if (d.type === "hello") {
+    sseHookPresent = true;
+    dbg("SSE hook present (MAIN world)");
+    return;
+  }
+  if (d.type === "arm-ack") {
+    dbg("SSE hook armed");
+    return;
+  }
+  const t = turn;
+  if (!t || t.finished || d.turnId !== t.reqId) return;
+  switch (d.type) {
+    case "stream-start":
+      t.lastSseAt = Date.now();
+      if (t.mode === "sse-await") {
+        if (t.fallbackTimer) {
+          clearTimeout(t.fallbackTimer);
+          t.fallbackTimer = null;
         }
-        if (Date.now() > deadline) break;
+        t.mode = "sse";
+        dbg("SSE stream attached (status", d.status, String(d.contentType || "") + ")");
       }
-      report("RESET_FAILED", { detail: "conversation did not change" });
-    } catch (e) {
-      report("RESET_FAILED", { detail: String(e && e.message) });
+      break;
+    case "delta":
+      t.lastSseAt = Date.now();
+      if (t.mode !== "dom") emitDelta(t, d.text);
+      break;
+    case "hint-error":
+      t.lastSseAt = Date.now();
+      if (/rate_limit/i.test(d.finishReason || "")) {
+        finishTurn(false, "rate_limited", d.content || "provider rate limit (stream hint)");
+      }
+      // non-rate hints: keep waiting — stream close / complete decides
+      break;
+    case "complete": {
+      t.lastSseAt = Date.now();
+      if (t.mode === "dom") break;
+      const finalText = typeof d.text === "string" ? d.text : "";
+      // Belt & braces: emit any suffix the delta stream missed (the parser's
+      // think-filter guarantees finalText === emitted, so this is a no-op in
+      // practice; a prefix-mismatched tail is dropped, never resynced).
+      if (finalText.startsWith(t.emitted) && finalText.length > t.emitted.length) {
+        emitDelta(t, finalText.slice(t.emitted.length));
+      }
+      if (d.hintError && /rate_limit/i.test(d.hintError.finishReason || "")) {
+        finishTurn(false, "rate_limited", d.hintError.content || "provider rate limit");
+        break;
+      }
+      if (!finalText && t.emitted.length === 0) {
+        fallbackToDom(t, "completion stream closed without text");
+        break;
+      }
+      finishTurn(true);
+      break;
     }
-  } else if (msg.t === "ABORT") {
-    aborted = true;
+    case "http-error": {
+      const s = d.status | 0;
+      const detail = `completion HTTP ${s}${d.snippet ? ": " + d.snippet : ""}`;
+      if (s === 429) finishTurn(false, "rate_limited", detail);
+      else finishTurn(false, "dom-error", detail);
+      break;
+    }
+    case "stream-error":
+    case "hook-error":
+    case "fetch-rejected":
+      if (t.mode === "dom") break;
+      if (t.emitted.length > 0) {
+        finishTurn(false, "dom-error", "capture failed after partial stream: " + (d.error || d.type));
+      } else {
+        fallbackToDom(t, `${d.type}: ${d.error || "capture failed"}`);
+      }
+      break;
+    default:
+      break;
   }
 });
+
+// ---------------------------------------------------------------------------
+// watchdog: deadline + rate-limit toast scan + SSE idle detection
+// ---------------------------------------------------------------------------
+
+function startWatchdog(t) {
+  t.watchdog = setInterval(() => {
+    if (t.finished || turn !== t) {
+      clearInterval(t.watchdog);
+      return;
+    }
+    const now = Date.now();
+    const hit = noticeRateLimitHit();
+    if (hit) {
+      finishTurn(false, "rate_limited", "provider notice: messages too frequent");
+      return;
+    }
+    if (now > t.deadline) {
+      finishTurn(false, "timeout", `turn exceeded ${t.opts.timeoutMs || 240000}ms`);
+      return;
+    }
+    if (t.mode === "sse" && t.lastSseAt && now - t.lastSseAt > SSE_IDLE_TIMEOUT_MS) {
+      finishTurn(false, "timeout", "SSE stream idle >120s");
+    }
+  }, 2000);
+}
+
+// ---------------------------------------------------------------------------
+// port protocol (worker intents)
+// ---------------------------------------------------------------------------
+
+function onPortMessage(msg) {
+  if (msg.t === "TURN") {
+    void handleTurn(msg);
+  } else if (msg.t === "RESET") {
+    void handleReset();
+  } else if (msg.t === "ABORT") {
+    if (turn && !turn.finished && (!msg.reqId || msg.reqId === turn.reqId)) {
+      finishTurn(false, null, null, true);
+    }
+  }
+}
+
+async function handleTurn(msg) {
+  if (turn && !turn.finished) {
+    report("TURN_ERROR", {
+      reqId: msg.reqId,
+      code: "submit-failed",
+      detail: "another turn is still active in this tab",
+    });
+    return;
+  }
+  const opts = msg.opts || {};
+  const t = {
+    reqId: msg.reqId,
+    opts,
+    mode: "idle", // idle -> sse-await -> sse  |  idle -> dom
+    finished: false,
+    emitted: "",
+    startedAt: Date.now(),
+    deadline: Date.now() + (opts.timeoutMs || 240000),
+    lastSseAt: 0,
+    baseCount: -1,
+    fallbackTimer: null,
+    watchdog: null,
+    domObserver: null,
+    domTick: null,
+  };
+  turn = t;
+  dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
+  try {
+    const composer = await waitComposer(15000);
+    if (!composer) {
+      finishTurn(false, "submit-failed", "composer not ready");
+      return;
+    }
+    // Arm BEFORE the submit so the completion POST cannot slip past the hook.
+    if (sseHookPresent) {
+      hookPost({ type: "arm", turnId: msg.reqId, timeoutMs: opts.timeoutMs || 240000 });
+      t.mode = "sse-await";
+    } else {
+      t.mode = "dom";
+      dbg("SSE hook absent — DOM-only capture");
+    }
+    const submitted = await submitPrompt(
+      composer,
+      msg.text,
+      opts.submitWaitMs || SUBMIT_READY_TIMEOUT_MS
+    );
+    if (!submitted.ok) {
+      finishTurn(false, submitted.code || "submit-failed", submitted.detail);
+      return;
+    }
+    dbg("submitted (paste-mode=" + submitted.mode + ", capture=" + t.mode + ")");
+    // Let the user bubble render before freezing the reply baseline.
+    await sleep(REPLY_BASELINE_SETTLE_MS);
+    t.baseCount = conversationNodes().length;
+    if (t.mode === "dom") {
+      startDomObserver(t);
+    } else {
+      t.fallbackTimer = setTimeout(() => {
+        if (turn === t && !t.finished && t.mode === "sse-await") {
+          fallbackToDom(t, "no completion stream within 15s");
+        }
+      }, SSE_FALLBACK_AFTER_MS);
+    }
+    startWatchdog(t);
+  } catch (e) {
+    finishTurn(false, "dom-error", String(e && e.message));
+  }
+}
+
+async function handleReset() {
+  try {
+    const link = findFirst(SELECTORS.newChat);
+    if (!link) {
+      report("RESET_FAILED", { detail: "new-chat control not found" });
+      return;
+    }
+    link.click();
+    // verify the conversation actually changed (spec 7.4 contract obligation)
+    const deadline = Date.now() + 8000;
+    for (; ;) {
+      await sleep(300);
+      const now = conversationNodes().length;
+      const onHome = location.pathname === "/";
+      if (now === 0 || onHome) {
+        report("RESET_OK", {});
+        return;
+      }
+      if (Date.now() > deadline) break;
+    }
+    report("RESET_FAILED", { detail: "conversation did not change" });
+  } catch (e) {
+    report("RESET_FAILED", { detail: String(e && e.message) });
+  }
+}
 
 // DS session-id observation: powers the user-claimed-tab guard.
 let lastDsSession = null;
@@ -578,4 +826,11 @@ setInterval(() => {
   }
 }, 2000);
 
-report("HEALTH", { state: "ok" });
+connectPort();
+
+// Probe the MAIN-world hook. Its install-time "hello" was posted before this
+// script ran (document_start vs document_idle), so ask it to re-announce.
+hookPost({ type: "ping" });
+setTimeout(() => {
+  if (!sseHookPresent) dbg("SSE hook not detected — turns will use DOM capture");
+}, 2000);

@@ -76,8 +76,8 @@ send-button enable wait, real SSE scraping, and live rate limits.
 pnpm run build
 node dist/src/index.js serve \
   --port 8789 \
-  --auto-create-tabs \
-  --managed-only \
+  --auto-create-tabs true \
+  --managed-only true \
   --ttl 30m \
   --db ./bridge-sessions.json
 # add  --api-key-env TAB_BRIDGE_KEY  if you want a bearer token
