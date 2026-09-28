@@ -56,6 +56,15 @@ describe("mapTurnError: rate limits map to 429 with a ~20 min Retry-After", () =
     assert.equal(be.status, 429);
     assert.equal(be.retryAfter, 30);
   });
+
+  test("uses the worker retry-after hint when present", () => {
+    const be = mapTurnError(new Error("turn-error:rate_limited;retry-after=640"));
+    assert.equal(be.retryAfter, 640);
+  });
+  test("falls back to the 1200s default without a hint", () => {
+    const be = mapTurnError(new Error("turn-error:rate_limited"));
+    assert.equal(be.retryAfter, 1200);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -166,6 +175,7 @@ function baseConfig(db: string, over: Partial<Config> = {}): Config {
     turnTimeoutMs: 5_000,
     bindTimeoutMs: 2_000,
     maxPromptChars: 1_000_000,
+    holdbackCeiling: 65_536,
     ...over,
   };
 }
