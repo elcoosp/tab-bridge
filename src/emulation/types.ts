@@ -37,5 +37,5 @@ export type HoldbackEvent =
   | { type: "invalid"; text: string; error: string };
 
 export const TOOL_PROTOCOL_VERSION = 1;
-export const HOLDBACK_CEILING = 4000;
+export const HOLDBACK_CEILING = 65_536;
 export const TOOL_SCHEMA_BUDGET = 1200;
