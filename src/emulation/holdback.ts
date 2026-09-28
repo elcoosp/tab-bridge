@@ -131,8 +131,15 @@ export class HoldbackBuffer {
       // No close yet: ceiling check.
       if (this.pending.length > this.ceiling) {
         this.holding = false;
-        events.push({ type: "content", text: this.pending });
+        const flushed = this.pending;
         this.pending = "";
+        events.push({
+          type: "invalid",
+          text: flushed,
+          error:
+            `tool_call fence exceeded the holdback ceiling (${this.ceiling} chars); ` +
+            "flushed as content — the model likely tried to inline a very large payload",
+        });
         return events;
       }
       return events;
