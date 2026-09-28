@@ -54,13 +54,16 @@ to a kod agent loop.
 node dist/src/index.js serve --port 8789 \
   --api-key-env TAB_BRIDGE_KEY \
   --stateful=true --auto-create-tabs --managed-only \
-  --ttl=30m --repair-rounds=1
+  --ttl=30m --repair-rounds=1 --holdback-ceiling=65536
 ```
 
 Flags consolidate every ADR: `--stateful` (ADR-6 mode), `--auto-create-tabs` /
 `--managed-only` (pool policy), `--ttl` (idle sweep), `--repair-rounds`
-(ADR-5 budget), `--warm-tabs` (warm pool), `--db` (session journal path).
-`/healthz` echoes the effective configuration.
+(ADR-5 budget), `--warm-tabs` (warm pool), `--db` (session journal path),
+`--holdback-ceiling` (max chars buffered inside an open `tool_call` fence
+before it flushes as content with a warning — raise it when the model inlines
+large payloads, never below 1000). `/healthz` echoes the effective
+configuration.
 
 Load the extension: Chrome → `chrome://extensions` → Developer mode →
 **Load unpacked** → select `extension/`. It connects to
@@ -79,9 +82,10 @@ Load the extension: Chrome → `chrome://extensions` → Developer mode →
 | `GET /healthz` | Mode flags, session count, per-tab health (no auth) |
 
 Errors map to harness semantics (ADR-7): CF challenge → **429 + Retry-After 30s**;
-provider send-frequency limit ("Messages too frequent") → **429 + Retry-After 1200s**
-(~20 min, field-verified); pool exhaustion → **503 + Retry-After**; same-session
-overlap → **409**; malformed request / `n>1` / unsupported params → **400**
+provider send-frequency limit ("Messages too frequent") → **429 + Retry-After
+(remaining cooldown, 1200s when the worker reports no remainder)**
+(~20 min window, field-verified); pool exhaustion → **503 + Retry-After**;
+same-session overlap → **409**; malformed request / `n>1` / unsupported params → **400**
 with `X-Bridge-Ignored`; tab failure → **502**; never an HTML error page, and
 an empty successful stream is structurally impossible (SSE headers are sent
 lazily on the first real frame).
