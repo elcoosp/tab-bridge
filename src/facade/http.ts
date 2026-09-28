@@ -3,6 +3,7 @@
  * error taxonomy, /v1/sessions lifecycle, /healthz. JSON error bodies only.
  */
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { TabBridge, MODELS, MODEL_THINK, type ChatParams } from "../bridge.js";
 import type { ChatMessage, ToolCall } from "../core/canonical.js";
 import type { ToolSpec } from "../emulation/types.js";
@@ -72,7 +73,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers?: 
 function authOk(bridge: TabBridge, req: IncomingMessage): boolean {
   if (!bridge.config.apiKey) return true;
   const header = req.headers.authorization ?? "";
-  return header === `Bearer ${bridge.config.apiKey}`;
+  const expected = `Bearer ${bridge.config.apiKey}`;
+  const a = Buffer.from(header, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function ignoredHeader(ignored: string[]): Record<string, string> | undefined {
@@ -211,7 +215,7 @@ function parseTools(raw: unknown): ToolSpec[] {
   return out;
 }
 
-function resolveSessionKey(bridge: TabBridge, req: IncomingMessage, body: ChatRequestBody): string | null {
+function resolveSessionKey(req: IncomingMessage, body: ChatRequestBody): string | null {
   const header = req.headers["x-session-id"];
   if (typeof header === "string" && header.length > 0) return header;
   if (typeof body.user === "string" && body.user.length > 0) return body.user;
@@ -219,7 +223,6 @@ function resolveSessionKey(bridge: TabBridge, req: IncomingMessage, body: ChatRe
     const meta = body.metadata as Record<string, unknown>;
     if (typeof meta.session_id === "string" && meta.session_id.length > 0) return meta.session_id;
   }
-  void bridge;
   return null;
 }
 
@@ -260,7 +263,7 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
   const messages = parseMessages(body.messages);
   const tools = parseTools(body.tools);
   const stream = body.stream === true;
-  const sessionId = resolveSessionKey(bridge, req, body);
+  const sessionId = resolveSessionKey(req, body);
 
   const id = `chatcmpl-${randomId(12)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -364,9 +367,6 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
     // Preserve typed errors (409 session_busy, 429 rate_limited): flattening
     // them through mapTurnError turns a non-retryable 409 into a retryable
     // 500, and callers retry into their own running turn.
-    // Preserve typed errors (409 session_busy, 429 rate_limited): flattening
-    // them through mapTurnError turns a non-retryable 409 into a retryable
-    // 500, and callers retry into their own running turn.
     const be = e instanceof BridgeError ? e : mapTurnError(e);
     sse.fail(be.status, be.body(), be.retryAfter);
   }
@@ -386,20 +386,12 @@ async function handleSessions(
 ): Promise<void> {
   if (url === "/v1/sessions") {
     if (method === "POST") {
-      const poolBefore = bridge.pool.hasWorker;
       const force = query.get("force") === "true";
-      const sessionId = `sess-${randomId(8)}`;
-      bridge.createSession(sessionId);
-      if (!poolBefore && !bridge.pool.hasWorker) {
-        // Creation succeeds; the tab binds lazily on first turn. Refuse only
-        // when the caller explicitly wants capacity reserved and none exists.
-        if (force === false && !bridge.pool.hasWorker) {
-          // keep: lazy bind on first turn (documented behavior)
-        }
-      }
       if (force && bridge.registry.size > 64) {
         bridge.registry.evictOldestIdle();
       }
+      const sessionId = `sess-${randomId(8)}`;
+      bridge.createSession(sessionId);
       sendJson(res, 201, { session_id: sessionId });
       return;
     }
