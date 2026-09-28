@@ -29,7 +29,7 @@ parameter in the URL: `ws://127.0.0.1:8789/worker?token=…`.
 - `injector.js` — content script on `chat.deepseek.com`: composer readiness,
   text placement, **send-button enabled gating**, submit verification,
   streaming fragment scraping, verifiable New-chat reset, provider
-  rate-limit detection, DS session-id observer, CF/login/notice health
+  rate-limit detection, CF/login/notice health
   sentinel. All DeepSeek-specific selectors live in one versioned bundle
   (`ds-2`).
 
