@@ -10,15 +10,22 @@
 # Consecutive turns of one kod session reuse the same tab — no tab per turn.
 
 [[llm.endpoints]]
-name           = "tab-bridge"
-provider       = "openai-compatible"
-base_url       = "http://127.0.0.1:8789/v1"
-model          = "deepseek-web-think"     # or "deepseek-web-chat"
-api_key_env    = "TAB_BRIDGE_KEY"         # value ignored by the bridge unless --api-key-env is set
-context_window = 1000000                  # DeepSeek-V4.1-Flash input limit (tokens)
-timeout_secs   = 300
+name                = "tab-bridge"
+provider            = "openai-compatible"
+base_url            = "http://127.0.0.1:8789/v1"
+model               = "deepseek-web-think"   # or "deepseek-web-chat"
+api_key_env         = "TAB_BRIDGE_KEY"       # value ignored by the bridge unless --api-key-env is set
+context_window      = 200000                 # I3: chars/latency headroom, not the model's raw limit
+timeout_secs        = 300
+rate_limit_wait_secs = 1500                  # kod sleeps out the 20-min DeepSeek window once, then re-drives
+
+# Why 1500 and not 1200: the bridge's hint is precise (remaining cooldown),
+# but this config is static — 1500 covers the full 1200 s window plus margin
+# for queue/bind time, and the actual sleep is always min(hint, budget).
+# Set it to 0 to restore the legacy fail-fast behavior.
 
 # bridge side:
 # tab-bridge serve --port 8789 --api-key-env TAB_BRIDGE_KEY \
 #   --stateful=true --auto-create-tabs --managed-only \
-#   --ttl=30m --repair-rounds=1 --max-prompt-chars=1000000
+#   --ttl=30m --repair-rounds=1 --max-prompt-chars=1000000 \
+#   --holdback-ceiling=65536
