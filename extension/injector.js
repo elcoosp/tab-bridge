@@ -14,7 +14,7 @@
  *  - verifiable "New chat" reset (confirms the conversation actually changed)
  *  - provider rate-limit detection (HTTP 429 / `event: hint` rate_limit_reached
  *    on the SSE stream, plus the classic toast scan as a secondary net)
- *  - DS session-id observation (user-claimed-tab guard) and health sentinel
+ *  - health sentinel
  *
  * Capture invariants (bridge-side holdback safety):
  *  - fragments are exact, append-only deltas — a `full: true` resync is NEVER
@@ -1253,21 +1253,6 @@ function diagnoseReset() {
     dbg("reset diagnose failed:", String((e && e.message) || e));
   }
 }
-
-// DS session-id observation: powers the user-claimed-tab guard.
-let lastDsSession = null;
-setInterval(() => {
-  try {
-    const m = location.pathname.match(/\/a\/chat\/s\/([0-9a-f-]+)/i);
-    const dsSession = m ? m[1] : null;
-    if (dsSession && dsSession !== lastDsSession) {
-      lastDsSession = dsSession;
-      report("SESSION_OBSERVED", { dsSessionId: dsSession, selectorBundle: SELECTOR_BUNDLE });
-    }
-  } catch {
-    /* noop */
-  }
-}, 2000);
 
 connectPort();
 
