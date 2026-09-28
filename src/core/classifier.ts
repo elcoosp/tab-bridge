@@ -3,7 +3,7 @@
  * plans. Deterministic and total; pure logic over (row, incomingMessages).
  */
 import type { ChatMessage } from "./canonical.js";
-import { canonical, stripSystemPrefix } from "./canonical.js";
+import { canonical, stripSystemPrefix, textOf } from "./canonical.js";
 import { firstMismatch, hashCanonical, CHAIN_SCHEME } from "./hashchain.js";
 
 export type PlanName = "SEED" | "INJECT_TEXT" | "INJECT_RESULTS" | "RESET_RESEED";
@@ -80,10 +80,14 @@ function classifyBase(row: ClassifierRow, messages: readonly ChatMessage[]): Tur
 
   // Fast path 1: exactly one new user message.
   if (delta.length === 1 && delta[0].role === "user") {
+    const text = textOf(delta[0].content);
+    if (text.length === 0) {
+      return { plan: "RESET_RESEED", reason: "empty-user-delta" };
+    }
     return {
       plan: "INJECT_TEXT",
       reason: "single-user-delta",
-      injectText: delta[0].content as string,
+      injectText: text,
     };
   }
 
@@ -126,10 +130,14 @@ function classifyBase(row: ClassifierRow, messages: readonly ChatMessage[]): Tur
     !hasToolCalls(delta[0]) &&
     delta[1].role === "user"
   ) {
+    const text = textOf(delta[1].content);
+    if (text.length === 0) {
+      return { plan: "RESET_RESEED", reason: "empty-user-delta" };
+    }
     return {
       plan: "INJECT_TEXT",
       reason: "echo-skip-user-delta",
-      injectText: delta[1].content as string,
+      injectText: text,
     };
   }
 
