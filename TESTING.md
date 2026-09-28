@@ -47,7 +47,7 @@ pnpm run e2e           # or: node e2e/run-e2e.mjs [--port 8977] [-v] [--print-lo
 | S03 | GET /v1/models | both `deepseek-web-*` ids |
 | S04 | validation | 404 unknown model; 400 for `n>1`, empty messages, malformed JSON; 404 unknown session |
 | S05 | SEED turn (non-stream) | compiled prompt contains TOOL PROTOCOL + TRANSCRIPT + cue; `X-Bridge-Ignored`; usage = chars/4; chain committed |
-| S06 | delta turn | prompt is **only** the new user text (echo-skip); no RESET; chain 4 |
+| S06 | delta turn | prompt is **only** the new user text (echo-skip); no RESET; chain 3 (scheme v3: system never chained) |
 | S07 | streaming SSE | role frame first → content deltas reassemble → finish frame → usage chunk (empty choices) → `[DONE]` last |
 | S08 | tool round-trip | fenced tool_call → `tool_calls` + synthetic `call_…` id → tool message → `=== TOOL RESULTS ===` injected, **no reset** |
 | S09 | same-session overlap | second request → **409** `session_busy`, first completes |
@@ -185,7 +185,9 @@ the tab console) with the final answer coming back.
 Fire several turns in quick succession until DeepSeek answers
 "Messages too frequent". Expected behavior on the wire and in the consoles:
 
-- bridge returns **429** with `retry-after: 1200`;
+- bridge returns **429** with `retry-after: 1200` on a fresh limit; a
+  `BIND_FAILED{rate-limited-cooldown}` carries the *remaining* cooldown as
+  `retryAfterSec`, so mid-window retries get the time actually left (T4);
 - the tab enters a ~20-minute cooldown (`healthz` → tabs show the tab cooling;
   new binds fail with `rate-limited-cooldown` → also 429);
 - the SW console logs the `rate_limited` ERROR;
