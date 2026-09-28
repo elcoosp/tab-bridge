@@ -172,6 +172,29 @@ test("re-rendered system prompt does not break continuity (scheme v3)", () => {
 test("foldAll ignores a leading system message", () => {
   assert.deepEqual(foldAll([S, U1]), foldAll([U1]));
 });
+test("coerces ContentPart-array user content and rejects empty text", () => {
+  const chain = foldAll([
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+  ]);
+  const rowObj = row({ chain, tabHash: null });
+  const plan = classify(rowObj, [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+    { role: "user", content: [{ type: "text", text: "next step" }] },
+  ]);
+  assert.equal(plan.plan, "INJECT_TEXT");
+  assert.equal(plan.injectText, "next step");
+
+  const empty = classify(rowObj, [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+    { role: "user", content: null },
+  ]);
+  assert.equal(empty.plan, "RESET_RESEED");
+});
+
+
 
 test("commit adopts the current scheme or migration reseeds forever", () => {
   // Regression: commit() wrote the new-scheme chain but left row.scheme at
