@@ -554,7 +554,7 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.27",
+    hookVersion: "1.2.28",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,
@@ -1130,15 +1130,15 @@
         const snooping =
           typeof listener === "function"
             ? (ev) => {
-                try {
-                  if (type === "message") feedData(ev && ev.data !== undefined ? ev.data : "");
-                  else if (type === "hint") feedHint(ev && ev.data);
-                  else if (type === "close" || type === "done" || type === "finish") finish();
-                } catch {
-                  /* snoop never breaks the page */
-                }
-                listener(ev);
+              try {
+                if (type === "message") feedData(ev && ev.data !== undefined ? ev.data : "");
+                else if (type === "hint") feedHint(ev && ev.data);
+                else if (type === "close" || type === "done" || type === "finish") finish();
+              } catch {
+                /* snoop never breaks the page */
               }
+              listener(ev);
+            }
             : listener;
         return origAdd(type, snooping, opts);
       };
@@ -1154,13 +1154,13 @@
               current =
                 typeof v === "function"
                   ? (ev) => {
-                      try {
-                        fn(ev);
-                      } catch {
-                        /* noop */
-                      }
-                      v(ev);
+                    try {
+                      fn(ev);
+                    } catch {
+                      /* noop */
                     }
+                    v(ev);
+                  }
                   : v;
             },
           });

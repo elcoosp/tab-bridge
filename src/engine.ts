@@ -413,17 +413,24 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       repairRoundsUsed: repairsUsed,
     };
   } catch (e) {
-    req.registry.markFailed(row);
-    // Tag the error so the facade can distinguish post-submission
-    // failures (tab state unknown) from bind/readiness failures (tab
-    // untouched — dropping tabHash here would force needless reseeds).
-    if (e instanceof Error) {
-      (e as Error & { postSubmit?: boolean }).postSubmit = true;
+    // A submit that never placed a user bubble leaves the tab state
+    // untouched. Marking the row failed here would set pendingReset and
+    // null tabHash, forcing a full RESET_RESEED on the very next turn
+    // (RCA stage 2 — the poisoned-session loop).
+    const err = e as Error & { userBubbleRendered?: boolean; postSubmit?: boolean };
+    const submitNoBubble = err.userBubbleRendered === false;
+    if (!submitNoBubble) {
+      req.registry.markFailed(row);
+      // Tag the error so the facade can distinguish post-submission
+      // failures (tab state unknown) from bind/readiness failures (tab
+      // untouched — dropping tabHash here would force needless reseeds).
+      err.postSubmit = true;
     }
     log.audit("turn.failed", {
       sessionId: row.sessionId,
       plan: plan.plan,
-      error: e instanceof Error ? e.message : String(e),
+      error: err.message || String(e),
+      ...(submitNoBubble ? { submit_no_bubble: true } : {}),
     });
     throw e;
   }

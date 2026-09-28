@@ -145,7 +145,7 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
         ]);
         if (ev === null) throw new Error("timeout waiting for ACCEPTED");
         if (ev.t === "ACCEPTED") return;
-        if (ev.t === "ERROR") throw new Error(errText(ev));
+        if (ev.t === "ERROR") throw errorFromObservation(ev);
         // STATUS submitting / stray FRAGMENTs before ACCEPTED: keep waiting.
       }
     })();
@@ -207,7 +207,7 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
             sink.onUsage?.(ev.meta);
             break;
           case "ERROR":
-            throw new Error(errText(ev));
+            throw errorFromObservation(ev);
           default:
             break;
         }
@@ -257,4 +257,16 @@ function errText(ev: Extract<WorkerObservation, { t: "ERROR" }>): string {
       ? `;retry-after=${ev.retryAfterSec}`
       : "";
   return `${base}${detail}${retry}`;
+}
+
+/** Build the Error thrown for an ERROR observation, carrying the
+ * userBubbleRendered flag (a submit that never placed a user bubble leaves
+ * the tab state untouched and must not poison the session — RCA stage 2). */
+function errorFromObservation(ev: Extract<WorkerObservation, { t: "ERROR" }>): Error {
+  const err = new Error(errText(ev));
+  if (typeof ev.userBubbleRendered === "boolean") {
+    (err as Error & { userBubbleRendered?: boolean }).userBubbleRendered =
+      ev.userBubbleRendered;
+  }
+  return err;
 }

@@ -3,3 +3,5 @@ dist
 node_modules
 .hermes
 bridge-sessions.json
+dump.txt
+wr.sh

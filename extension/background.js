@@ -173,7 +173,18 @@ function connect() {
       // fails spuriously with no-tab-available despite autoCreateTabs).
       // Capped: without a handshake these would pile up unboundedly.
       const queued = helloQueue.splice(0, 20);
-      for (const q of queued) routeIntent(q);
+      for (const q of queued) {
+        // routeIntent can throw synchronously (a sync intent handler hitting
+        // a dead port, a bad state); an uncaught throw here terminates the
+        // whole service worker, which the bridge reads as ECONNRESET ~1 s
+        // after every connect — the metronome the RCA traced through every
+        // RESET -> reseed cycle.
+        try {
+          routeIntent(q);
+        } catch (e) {
+          blog("queued intent dispatch failed:", String((e && e.message) || e));
+        }
+      }
       return;
     }
     if (m && m.t === "HELLO_REFUSED") {
@@ -737,6 +748,13 @@ function handleInjectorConnect(port, tabId) {
           code: msg.code || "dom-error",
           ...(msg.detail ? { detail: msg.detail } : {}),
           ...(msg.code === "rate_limited" ? { retryAfterSec: 1200 } : {}),
+          // Report whether a user bubble actually rendered. A submit that
+          // never placed one leaves the tab state untouched and must NOT
+          // poison the session with a pendingReset + null tabHash (RCA
+          // stage 2 — the poisoned-session loop).
+          ...(typeof msg.userBubbleRendered === "boolean"
+            ? { userBubbleRendered: msg.userBubbleRendered }
+            : {}),
         });
         break;
       }

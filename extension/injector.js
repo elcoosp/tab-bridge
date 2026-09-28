@@ -220,7 +220,15 @@ function isEnabled(el) {
   if (el.tagName === "BUTTON" && el.disabled) return false;
   if (el.getAttribute && el.getAttribute("aria-disabled") === "true") return false;
   const cls = typeof el.className === "string" ? el.className : "";
-  if (/(^|\s)disabled(\s|$)/.test(cls)) return false;
+  // Match a "disabled" class token in any form: bare "disabled", BEM
+  // modifier "ds-button--disabled", or kebab "btn-disabled". The old
+  // /(^|\s)disabled(\s|$)/ regex missed the BEM shape, letting a still-
+  // disabled DeepSeek send button pass the gate and swallow the click.
+  if (cls) {
+    for (const tok of cls.split(/\s+/)) {
+      if (tok && (tok === "disabled" || tok.endsWith("-disabled"))) return false;
+    }
+  }
   const st = getComputedStyle(el);
   if (st.pointerEvents === "none") return false;
   if (st.visibility === "hidden" || st.display === "none") return false;
@@ -488,7 +496,10 @@ async function placeText(composer, text) {
 }
 
 function clickSend(btn) {
-  if (btn && isEnabled(btn)) {
+  // Require the button to be CONNECTED and enabled at click time. A
+  // reference captured by an earlier poll can point at a node React has
+  // already swapped out; clicking it is a silent no-op.
+  if (btn && btn.isConnected && isEnabled(btn)) {
     try {
       btn.click();
       return true;
@@ -514,6 +525,19 @@ function pressEnter(composer) {
 
 function conversationNodes() {
   return document.querySelectorAll(SELECTORS.messageNodes.join(","));
+}
+
+/** Count of the field-verified DeepSeek bubble container (div.ds-message).
+ * This is the only reliable "a message landed" signal for a background tab:
+ * button[class*="stop"] and div[class*="markdown"] both false-positive on
+ * unrelated UI (dev panels, code previews), which silently masked no-op
+ * submits as "slow replies". */
+function dsMessageCount() {
+  try {
+    return document.querySelectorAll("div.ds-message").length;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -586,6 +610,32 @@ async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
 }
 
 /**
+ * Wait until the composer is genuinely ready to accept a fresh submit: the
+ * stop control is gone AND the send button is enabled AND both stay that way
+ * for ~1s. Guards the window right after a previous generation where the UI
+ * swaps stop -> send asynchronously — without this the submit can fire into
+ * a still-disabled button 15 ms after the prior stream closed and be
+ * swallowed silently.
+ */
+async function waitStableSend(composer, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let stableSince = 0;
+  for (; ;) {
+    const stopBtn = findFirst(SELECTORS.stopButton);
+    const btn = findSendButton(composer);
+    const ok = !stopBtn && btn && isEnabled(btn);
+    if (ok) {
+      if (!stableSince) stableSince = Date.now();
+      else if (Date.now() - stableSince >= 1000) return true;
+    } else {
+      stableSince = 0;
+    }
+    if (Date.now() > deadline) return false;
+    await sleep(100);
+  }
+}
+
+/**
  * Place the prompt, WAIT FOR THE SEND BUTTON TO BE ENABLED, submit and verify
  * the tab actually started the turn (one retry via the alternate method).
  *
@@ -599,6 +649,9 @@ async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
 async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   const verifyMs = quickVerify ? 2500 : 6000;
   const preCount = conversationNodes().length;
+  // Guard against the window right after a previous generation where the
+  // UI swaps stop -> send asynchronously.
+  await waitStableSend(composer, 8000);
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
     if (submitRateLimitHit(preCount)) {
@@ -607,7 +660,12 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     if (submitConcurrencyHit(preCount)) {
       return { ok: false, code: "concurrency_blocked", detail: "composer rejected the prompt: another message is generating" };
     }
-    return { ok: false, code: "submit-failed", detail: "composer rejected the prompt text" };
+    return {
+      ok: false,
+      code: "submit-failed",
+      detail: "composer rejected the prompt text",
+      userBubbleRendered: conversationNodes().length > preCount,
+    };
   }
   const ready = await waitReadyToSubmit(composer, preCount, readyTimeoutMs);
   if (!ready.ok) {
@@ -629,6 +687,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
       ok: false,
       code: "send-button-disabled",
       detail: `${ready.detail} (mode=${mode})`,
+      userBubbleRendered: conversationNodes().length > preCount,
     };
   }
   const baseCount = conversationNodes().length;
@@ -643,8 +702,11 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     code: "concurrency_blocked",
     detail: "provider notice: another message is generating (submit rejected)",
   });
-  // Method A: the enabled send button.
-  const a = clickSend(ready.btn) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
+  // Method A: re-find and re-check right before clicking — a stale
+  // reference survives React re-renders, and isEnabled() must read the
+  // LIVE class list (BEM "--disabled" included).
+  const btnA = findSendButton(composer);
+  const a = clickSend(btnA) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
   if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (a !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (a === true) return { ok: true, mode };
@@ -670,6 +732,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     ok: false,
     code: "submit-failed",
     detail: "submit not confirmed: no stop button, no new bubble, composer not cleared",
+    userBubbleRendered: conversationNodes().length > preCount,
   };
 }
 
@@ -718,7 +781,7 @@ function stripThinkBlocks(text) {
  * Close the turn exactly once. Every path (SSE complete/error, DOM observer,
  * watchdog, abort) funnels here; the first caller wins.
  */
-function finishTurn(ok, code, detail, aborted) {
+function finishTurn(ok, code, detail, aborted, extra) {
   const t = turn;
   if (!t || t.finished) return;
   t.finished = true;
@@ -740,6 +803,7 @@ function finishTurn(ok, code, detail, aborted) {
       reqId: t.reqId,
       code: code || "dom-error",
       ...(detail ? { detail } : {}),
+      ...(extra || {}),
     });
   }
 }
@@ -903,8 +967,19 @@ function startDomObserver(t) {
     const text = replyText();
     if (text === null) {
       if (!nullSince) nullSince = Date.now();
-      else if (Date.now() - nullSince > 60000) {
-        finishTurn(false, "submit-failed", "reply bubble never appeared within 60s of submit");
+      else {
+        // No user bubble ever appeared (baseCount === submitCount) means the
+        // submit never landed — fail fast instead of riding the full 60 s.
+        const limit = t.baseCount === t.submitCount ? 5000 : 60000;
+        if (Date.now() - nullSince > limit) {
+          finishTurn(
+            false,
+            "submit-failed",
+            `reply bubble never appeared within ${limit / 1000}s of submit`,
+            false,
+            { userBubbleRendered: conversationNodes().length > t.submitCount }
+          );
+        }
       }
       return;
     }
@@ -1160,6 +1235,7 @@ async function handleTurn(msg) {
     // Frozen BEFORE the submit: the submit-block scan only looks at nodes
     // that appear after this point, so our own prompt echo can't match.
     t.submitCount = conversationNodes().length;
+    t.dsMessageBase = dsMessageCount();
     const submitted = await submitPrompt(
       composer,
       msg.text,
@@ -1167,7 +1243,11 @@ async function handleTurn(msg) {
       t.mode === "sse-await"
     );
     if (!submitted.ok) {
-      finishTurn(false, submitted.code || "submit-failed", submitted.detail);
+      finishTurn(false, submitted.code || "submit-failed", submitted.detail, false, {
+        ...(typeof submitted.userBubbleRendered === "boolean"
+          ? { userBubbleRendered: submitted.userBubbleRendered }
+          : {}),
+      });
       return;
     }
     t.unverified = submitted.unverified === true;
@@ -1180,12 +1260,12 @@ async function handleTurn(msg) {
     } else {
       t.fallbackTimer = setTimeout(() => {
         if (turn === t && !t.finished && t.mode === "sse-await") {
-          // SSE never attached: DOM evidence is the second witness. If even
-          // that is absent the submit genuinely failed — fail now rather
-          // than scraping an unrelated bubble.
-          const domEvidence =
-            findFirst(SELECTORS.stopButton) !== null ||
-            conversationNodes().length > t.submitCount;
+          // SSE never attached: the field-verified witness is growth of the
+          // real bubble container (div.ds-message). Loose selectors like
+          // button[class*="stop"] / div[class*="markdown"] false-positive on
+          // unrelated UI, so they must not be used here — a genuine no-op
+          // click then reads as a slow submit and hangs for 60 s.
+          const domEvidence = dsMessageCount() > (t.dsMessageBase ?? t.submitCount);
           if (domEvidence) {
             fallbackToDom(t, "no completion stream within 15s");
           } else {
@@ -1193,7 +1273,9 @@ async function handleTurn(msg) {
             finishTurn(
               false,
               "submit-failed",
-              "submit not confirmed: no completion stream within 15s and no DOM evidence of submit"
+              "submit not confirmed: no completion stream within 15s and no ds-message growth",
+              false,
+              { userBubbleRendered: false }
             );
           }
         }

@@ -666,7 +666,7 @@ export interface PersistStore {
 ```
 2. **Duplicated comment** — `handleChat`'s streaming catch contains the same 3-line comment twice. Delete one copy.
 3. **`resolveSessionKey`** — drop the unused `bridge` parameter and the `void bridge;` line; update the single caller (`resolveSessionKey(req, body)`).
-4. **`--version`** hardcodes `1.0.0` while `package.json` says `1.2.x` and the SSE hook diag hardcodes `hookVersion: "1.2.27"`. Single-source the CLI:
+4. **`--version`** hardcodes `1.0.0` while `package.json` says `1.2.x` and the SSE hook diag hardcodes `hookVersion: "1.2.28"`. Single-source the CLI:
 ```ts
 // src/index.ts — add near the top
 import { createRequire } from "node:module";
@@ -1260,4 +1260,3 @@ kod:
   second 429 in the same turn → fail (never park twice)
   eventual success → bridge RESET_RESEED (orphan cleaned) → INJECT flow resumes
 ```
-

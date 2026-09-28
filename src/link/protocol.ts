@@ -28,10 +28,21 @@ export type WorkerObservation =
   | {
       t: "ERROR";
       reqId: string;
-      code: "submit-failed" | "port-lost" | "timeout" | "dom-error" | "rate_limited" | "send-button-disabled";
+      code:
+        | "submit-failed"
+        | "port-lost"
+        | "timeout"
+        | "dom-error"
+        | "rate_limited"
+        | "send-button-disabled"
+        | "concurrency_blocked";
       detail?: string;
       /** Suggested cooldown seconds (rate_limited carries ~1200s / 20 min). */
       retryAfterSec?: number;
+      /** For submit-phase failures: whether a user bubble actually rendered.
+       * false means the tab state is untouched — the bridge must not
+       * pendingReset / null tabHash (RCA stage 2). */
+      userBubbleRendered?: boolean;
     }
   | { t: "RESET_OK"; reqId: string }
   | { t: "RESET_TIMEOUT"; reqId: string }
