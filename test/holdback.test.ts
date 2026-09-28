@@ -63,12 +63,29 @@ test("backticks that never form a tool_call opener pass through", () => {
   assert.equal(e.content + fin.content, "use ```js\nconsole.log(1);\n``` in your answer");
 });
 
-test("ceiling overflow flushes held text as content", () => {
+test("ceiling overflow flushes held text as content with warning", () => {
   const h = new HoldbackBuffer(50);
   const evs = h.push("```tool_call\n" + "x".repeat(80));
   const { content } = join(evs);
   assert.ok(content.startsWith("```tool_call"));
   assert.ok(content.includes("xxxx"));
+  assert.ok(evs.some((e) => e.type === "invalid"), "must emit an invalid/warning event");
+});
+test("a fence larger than a small custom ceiling flushes as content WITH a warning", () => {
+  const hb = new HoldbackBuffer(50);
+  // No closing fence: buffer exceeds the ceiling while still holding.
+  const events = hb.push('```tool_call\n{"name":"write_file","arguments":{"path":"a.txt","content":"' +
+    "x".repeat(80));
+  const evs = [...events, ...hb.finish()];
+  assert.ok(evs.some((e) => e.type === "invalid"), "must emit an invalid/warning event");
+});
+test("a 10KB tool_call survives the default ceiling as a call", () => {
+  const hb = new HoldbackBuffer(); // default 65536
+  const big = "y".repeat(10_000);
+  const events = hb.push('```tool_call\n{"name":"write_file","arguments":{"content":"' + big + '"}}\n```');
+  const evs = [...events, ...hb.finish()];
+  const call = evs.find((e) => e.type === "call");
+  assert.ok(call, "large call must parse");
 });
 
 test("two sequential fences produce two calls", () => {
