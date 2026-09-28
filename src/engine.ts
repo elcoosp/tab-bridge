@@ -17,6 +17,7 @@ import {
   compileRepair,
 } from "./emulation/compiler.js";
 import { HoldbackBuffer } from "./emulation/holdback.js";
+import { HOLDBACK_CEILING } from "./emulation/types.js";
 import type { ParsedCall, ToolSpec } from "./emulation/types.js";
 import { synthCallId } from "./emulation/ids.js";
 import { canonJson } from "./util/json.js";
@@ -34,6 +35,8 @@ export interface TurnRequest {
   repairRounds: number;
   turnTimeoutMs: number;
   bindTimeoutMs: number;
+  /** Holdback ceiling override (0/unset = library default). */
+  holdbackCeiling?: number;
   /** Binds a session to a managed tab (pool-backed deployments). */
   bindTab: (sessionId: string, timeoutMs: number) => Promise<number>;
 }
@@ -62,7 +65,8 @@ export function validateCallEvent(
   name: string,
   argsJson: string,
   tools: ToolSpec[],
-  suppliedId?: string
+  suppliedId?: string,
+  occurrence = 0
 ): { ok: true; call: ParsedCall } | { ok: false; error: string } {
   const spec = tools.find((t) => t.function.name === name);
   if (!spec) return { ok: false, error: `unknown tool "${name}"` };
@@ -84,7 +88,7 @@ export function validateCallEvent(
     call: {
       name,
       arguments: canonicalArgs,
-      id: suppliedId ?? synthCallId(name, JSON.stringify(argsObj)),
+      id: suppliedId ?? synthCallId(name, JSON.stringify(argsObj), occurrence),
       errors: [],
     },
   };
@@ -157,8 +161,15 @@ async function observePass(
   events: TurnEvents,
   tools: ToolSpec[]
 ): Promise<{ text: string; calls: ParsedCall[]; invalidText: string[]; passWarnings: string[]; stopReason: string }> {
-  const holdback = new HoldbackBuffer();
+  const holdback = new HoldbackBuffer(req.holdbackCeiling ?? HOLDBACK_CEILING);
   const calls: ParsedCall[] = [];
+  const callOccurrence = new Map<string, number>();
+  const nextOccurrence = (name: string, argsJson: string): number => {
+    const key = `${name}\u0000${argsJson}`;
+    const n = callOccurrence.get(key) ?? 0;
+    callOccurrence.set(key, n + 1);
+    return n;
+  };
   const invalidText: string[] = [];
   const passWarnings: string[] = [];
   let text = "";
@@ -174,7 +185,13 @@ async function observePass(
       passWarnings.push(ev.error);
       events.onContent?.(ev.text);
     } else {
-      const v = validateCallEvent(ev.name, ev.argsJson, tools, ev.id);
+      const v = validateCallEvent(
+        ev.name,
+        ev.argsJson,
+        tools,
+        ev.id,
+        ev.id === undefined ? nextOccurrence(ev.name, ev.argsJson) : 0
+      );
       if (v.ok) {
         calls.push(v.call);
         events.onCall?.(v.call);
@@ -291,6 +308,12 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       throw new Error(`prompt-too-large:${promptText.length}>${maxChars}`);
     }
 
+    // A fully empty compiled prompt would submit nothing (or an empty
+    // bubble) into the tab. Fail with a typed, caller-actionable error.
+    if (promptText.trim().length === 0) {
+      throw new Error("empty-prompt");
+    }
+
     await req.adapter.sendTurn(tab, promptText, optionsFor(req));
     log.info("turn.accepted", { sessionId: row.sessionId, promptChars: promptText.length });
 
@@ -387,6 +410,12 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     };
   } catch (e) {
     req.registry.markFailed(row);
+    // Tag the error so the facade can distinguish post-submission
+    // failures (tab state unknown) from bind/readiness failures (tab
+    // untouched — dropping tabHash here would force needless reseeds).
+    if (e instanceof Error) {
+      (e as Error & { postSubmit?: boolean }).postSubmit = true;
+    }
     log.audit("turn.failed", {
       sessionId: row.sessionId,
       plan: plan.plan,
