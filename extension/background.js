@@ -362,6 +362,17 @@ function tabInCooldown(tabId, st) {
   return true;
 }
 
+/** Longest remaining rate-limit cooldown across known tabs, in seconds. */
+function maxCooldownRemainingSecs() {
+  let max = 0;
+  for (const st of tabState.values()) {
+    if (st.rateLimitedUntil && st.rateLimitedUntil > Date.now()) {
+      max = Math.max(max, st.rateLimitedUntil - Date.now());
+    }
+  }
+  return Math.ceil(max / 1000);
+}
+
 /**
  * Crash-proof port send. postMessage on a dead port THROWS synchronously,
  * and an uncaught throw inside the WS message handler terminates the whole
@@ -405,7 +416,12 @@ async function handleBind(m) {
   const tabId = await allocateTab(m.sessionId);
   if (tabId === "rate-limited-cooldown") {
     blog("BIND", m.sessionId, "-> rate-limited-cooldown");
-    send({ t: "BIND_FAILED", sessionId: m.sessionId, code: "rate-limited-cooldown" });
+    send({
+      t: "BIND_FAILED",
+      sessionId: m.sessionId,
+      code: "rate-limited-cooldown",
+      retryAfterSec: Math.max(30, maxCooldownRemainingSecs()),
+    });
     return;
   }
   if (tabId === null || tabId === undefined) {
@@ -740,6 +756,18 @@ function handleInjectorConnect(port, tabId) {
     if (portByTab.get(tabId) === port) portByTab.delete(tabId);
     blog("injector disconnected (tab", tabId + ")");
     markHealth(tabId, "degraded", "port-disconnected");
+    // Fail every in-flight turn on this tab now — the injector can no
+    // longer answer, and letting them ride to the deadline turns a tab
+    // crash into a 4-minute hang.
+    for (const [reqId, rec] of [...turnByReq]) {
+      if (rec.tabId === tabId && !rec.finished) {
+        rec.finished = true;
+        clearTimeout(rec.timer);
+        if (rec.quietTimer) clearTimeout(rec.quietTimer);
+        turnByReq.delete(reqId);
+        send({ t: "ERROR", reqId, code: "port-lost", detail: "injector port disconnected mid-turn" });
+      }
+    }
   });
 }
 
