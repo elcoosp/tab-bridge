@@ -63,6 +63,20 @@ export function poolExhausted(retryAfter: number, message: string): BridgeError 
   return new BridgeError({ status: 503, code: "pool_exhausted", message, retryAfter });
 }
 
+export function queueFull(retryAfterSec: number, message: string): BridgeError {
+  return new BridgeError({ status: 503, code: "queue_full", message, retryAfter: retryAfterSec });
+}
+
+export function queueTimeout(retryAfterSec: number, message: string): BridgeError {
+  return new BridgeError({ status: 503, code: "queue_timeout", message, retryAfter: retryAfterSec });
+}
+
+/** 499 (nginx convention): the client closed the connection while its turn
+ * was queued. Never reaches the wire — the response socket is already gone. */
+export function clientGone(message: string): BridgeError {
+  return new BridgeError({ status: 499, code: "client_gone", message });
+}
+
 export function badGateway(message: string): BridgeError {
   return new BridgeError({ status: 502, code: "upstream_failure", message });
 }
@@ -81,6 +95,11 @@ export function internal(message: string): BridgeError {
  */
 export const RATE_LIMIT_COOLDOWN_SEC = 1200;
 
+/** A send refused because another generation is still running clears within
+ * seconds-to-minutes (unlike the ~20-minute send-frequency window), so the
+ * Retry-After for the defensive 429 is short. */
+export const CONCURRENCY_RETRY_AFTER_SEC = 15;
+
 /** Map adapter/worker failures onto the taxonomy. */
 export function mapTurnError(err: unknown): BridgeError {
   const msg = err instanceof Error ? err.message : String(err);
@@ -97,6 +116,28 @@ export function mapTurnError(err: unknown): BridgeError {
     return rateLimited(
       retryAfterSec,
       `provider reports rate limiting (Messages too frequent); wait ~${Math.ceil(retryAfterSec / 60)} minutes before retrying`
+    );
+  }
+  // DeepSeek refuses a send while the account already has the maximum number
+  // of concurrent generations running ("Another message is being generated").
+  // The turn gate (src/core/turngate.ts) makes this unreachable for bridge
+  // traffic; when it does surface anyway (a human driving the same account in
+  // a parallel window), give callers a retryable 429 with a short window,
+  // never a dead-end 502.
+  if (msg.startsWith("turn-error:concurrency_blocked")) {
+    return rateLimited(
+      CONCURRENCY_RETRY_AFTER_SEC,
+      "provider is already generating the maximum number of concurrent replies; retry shortly"
+    );
+  }
+  if (
+    /another\s+(?:message|response|reply|request|generation)|already\s+being\s+generated|正在生成|已有一条消息/i.test(
+      msg
+    )
+  ) {
+    return rateLimited(
+      CONCURRENCY_RETRY_AFTER_SEC,
+      `provider rejected the send: another message is still generating (${msg})`
     );
   }
   if (msg.startsWith("not-ready:") || msg.startsWith("reset failed")) {

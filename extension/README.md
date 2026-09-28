@@ -67,6 +67,11 @@ Observations (worker → bridge): `BOUND`/`BIND_FAILED`, `ACCEPTED` (sent as
 soon as the worker takes the turn),
 `FRAGMENT{reqId,seq,text,full?}`, `STATUS`, `USAGE`, `HEALTH`, `ERROR`
 (`code`: `submit-failed` | `port-lost` | `timeout` | `dom-error` |
-`rate_limited` | `send-button-disabled`; `rate_limited` carries
-`retryAfterSec: 1200`),
+`rate_limited` | `concurrency_blocked` | `send-button-disabled`;
+`rate_limited` carries `retryAfterSec: 1200`),
 `RESET_OK`/`RESET_TIMEOUT`, `PONG`, `RELEASED`.
+
+| `code` | Meaning |
+|---|---|
+| `rate_limited` | DeepSeek send-frequency window hit ("Messages too frequent"). Carries `retryAfterSec: 1200`; the bridge cools the tab down ~20 min and answers 429 + `Retry-After: 1200`. |
+| `concurrency_blocked` | DeepSeek refused the send because another generation is still running (observed limit: 2 concurrent per account). The bridge's turn gate makes this unreachable for bridge traffic; it can surface when a human drives the same account in a parallel window. Mapped to HTTP 429 + `Retry-After: 15`. Deliberately NO cooldown. |

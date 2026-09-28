@@ -16,7 +16,13 @@ base_url            = "http://127.0.0.1:8789/v1"
 model               = "deepseek-web-think"   # or "deepseek-web-chat"
 api_key_env         = "TAB_BRIDGE_KEY"       # value ignored by the bridge unless --api-key-env is set
 context_window      = 200000                 # I3: chars/latency headroom, not the model's raw limit
-timeout_secs        = 300
+# kod's reqwest timeout is a TOTAL request budget (connect + queue wait +
+# generation). The bridge may legally hold a request in its generation queue
+# for up to --queue-timeout-ms (default 600s) before the turn even starts.
+# Size this above max queue wait + 2x worst-case turn time:
+#   timeout_secs > queue_timeout_ms/1000 + 2 * turn_timeout_ms/1000
+# 900s covers the defaults (600s queue + 2x240s turns) with margin.
+timeout_secs        = 900
 rate_limit_wait_secs = 1500                  # kod sleeps out the 20-min DeepSeek window once, then re-drives
 
 # Why 1500 and not 1200: the bridge's hint is precise (remaining cooldown),

@@ -321,6 +321,10 @@ Streaming responses follow OpenAI's chunk shape exactly: a first delta carrying 
 |---|---|---|
 | CF challenge / provider rate limit | **429** + Retry-After | kod backs off and retries — the desired behavior; tab cools down |
 | No allocatable tab (pool exhausted) | **503** + Retry-After | retryable; pairs with `?force=true` on session creation |
+| `503` | `queue_full` | All `max-concurrent-turns` slots busy and the queue is at `--queue-capacity`. Retry-After: 5. Transient — retry the same request. |
+| `503` | `queue_timeout` | Queued longer than `--queue-timeout-ms`. Retry-After: 5. Transient. |
+| `499` | `client_gone` | Internal only (nginx convention): the client disconnected while queued; the queued entry is cancelled and no turn is run. Never written to the wire. |
+| `429` | `rate_limited` (concurrency variant) | The provider refused the send because another generation is running (`concurrency_blocked` upstream). Retry-After: 15. |
 | Same-session overlap (caller bug) | **409** | permanent — surfaces swarm/logic bugs immediately |
 | Malformed request, n>1, unsupported params | **400** | permanent; body names the offending field |
 | Bridge auth failure (when `--api-key` set) | **401** | permanent; misconfiguration, not transient |

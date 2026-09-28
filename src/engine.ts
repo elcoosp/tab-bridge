@@ -58,6 +58,10 @@ export interface TurnOutput {
   sessionId: string;
   promptChars: number;
   repairRoundsUsed: number;
+  /** Ms the turn spent waiting in the generation gate before starting.
+   * Present only when it actually waited (> 0). Surfaced as the
+   * x-bridge-queued-ms response header on the JSON path. */
+  gateWaitMs?: number;
 }
 
 /** Validate a holdback call event against the declared tools. */

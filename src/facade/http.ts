@@ -265,11 +265,32 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
   const stream = body.stream === true;
   const sessionId = resolveSessionKey(req, body);
 
+  // 'close' fires on premature disconnect AND after a normal finish; the
+  // generation gate only consults the signal while the request is queued,
+  // so a late abort is a harmless no-op.
+  const ac = new AbortController();
+  res.on("close", () => ac.abort());
+
   const id = `chatcmpl-${randomId(12)}`;
   const created = Math.floor(Date.now() / 1000);
 
   if (!stream) {
-    const out = await bridge.handleChat({ messages, tools, think, sessionId } satisfies ChatParams);
+    let out: Awaited<ReturnType<TabBridge["handleChat"]>>;
+    try {
+      out = await bridge.handleChat({
+        messages,
+        tools,
+        think,
+        sessionId,
+        signal: ac.signal,
+      } satisfies ChatParams);
+    } catch (e) {
+      if (e instanceof BridgeError && e.code === "client_gone") {
+        log.info("http.client-gone", { id, stream: false });
+        return;
+      }
+      throw e;
+    }
     const message: Record<string, unknown> = { role: "assistant" };
     message.content = out.content || null;
     if (out.calls.length > 0) {
@@ -298,7 +319,7 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
         usage: out.usage,
         ...(warnings.length > 0 ? { x_bridge_warning: warnings } : {}),
       },
-      headers
+      { ...headers, "x-bridge-queued-ms": String(out.gateWaitMs ?? 0) }
     );
     return;
   }
@@ -343,7 +364,14 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
         );
       },
     };
-    const out = await bridge.handleChat({ messages, tools, think, sessionId, events } satisfies ChatParams);
+    const out = await bridge.handleChat({
+      messages,
+      tools,
+      think,
+      sessionId,
+      events,
+      signal: ac.signal,
+    } satisfies ChatParams);
     // Final frames: usage chunk with empty choices, then finish_reason, [DONE].
     sse.sendChoice(
       {
@@ -364,6 +392,10 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
     sse.done();
     sse.close();
   } catch (e) {
+    if (e instanceof BridgeError && e.code === "client_gone") {
+      log.info("http.client-gone", { id, stream: true });
+      return;
+    }
     // Preserve typed errors (409 session_busy, 429 rate_limited): flattening
     // them through mapTurnError turns a non-retryable 409 into a retryable
     // 500, and callers retry into their own running turn.

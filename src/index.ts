@@ -68,6 +68,9 @@ function main(argv: string[]): void {
       db: config.dbPath,
       auth: config.apiKey ? "bearer" : "none",
       max_prompt_chars: config.maxPromptChars,
+      max_concurrent_turns: config.maxConcurrentTurns,
+      queue_capacity: config.queueCapacity,
+      queue_timeout_ms: config.queueTimeoutMs,
       worker_link: `ws://${config.host}:${config.port}/worker`,
     });
     process.stdout.write(

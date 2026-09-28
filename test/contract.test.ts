@@ -27,6 +27,9 @@ function baseConfig(db: string, over: Partial<Config> = {}): Config {
     bindTimeoutMs: 2_000,
     maxPromptChars: 1_000_000,
     holdbackCeiling: 65_536,
+    maxConcurrentTurns: 2,
+    queueCapacity: 32,
+    queueTimeoutMs: 600_000,
     ...over,
   };
 }

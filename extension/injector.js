@@ -67,6 +67,13 @@ const SSE_IDLE_TIMEOUT_MS = 120_000;
 const RATE_LIMIT_RE =
   /(?:messages?\s*(?:are\s*)?too\s*frequent|too\s*many\s*messages|too\s*many\s*requests|rate[\s_-]*limits?(?:\s*(?:reached|exceeded|hit))?|消息发送过于频繁|发送消息过于频繁|发送太频繁|操作过于频繁|请求过于频繁|频率过高)/i;
 
+/** DeepSeek concurrency refusal: a send is refused because the account
+ * already has the maximum number of concurrent generations running
+ * ("Another message is being generated"; observed limit: 2). Disjoint from
+ * RATE_LIMIT_RE by construction. */
+const CONCURRENCY_RE =
+  /(?:another\s+(?:message|response|reply|request|generation)|already\s+(?:being\s+)?generated|generat\w*\s+(?:already\s+)?in\s+progress|one\s+(?:conversation|chat)\s+at\s+a\s+time|please\s+wait[^.\n]{0,40}(?:finish|complete)|已有一条消息|消息正在生成|正在生成中|请等待.{0,20}(?:完成|结束))/i;
+
 /** Labeled action buttons: role=button with a ds-button__content label span. */
 const CONTINUE_RE = /^\s*(continue|继续|继续生成)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
@@ -312,6 +319,30 @@ function submitRateLimitHit(preCount) {
   for (let i = Math.max(0, preCount); i < nodes.length; i++) {
     const t = (nodes[i].textContent || "").trim();
     if (t && t.length < 400 && RATE_LIMIT_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/** Concurrency-refusal text visible in transient notice surfaces (mirrors
+ * noticeRateLimitHit). */
+function noticeConcurrencyHit() {
+  for (const el of findAll(SELECTORS.noticeRegions)) {
+    const t = (el.textContent || "").trim();
+    if (t && t.length < 300 && CONCURRENCY_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/** Broad submit-block scan for the concurrency refusal — notice surfaces AND
+ * chat nodes that appeared after `preCount` (same shapes as
+ * submitRateLimitHit: inline bubble, toast, or nothing at all when the send
+ * is rejected server-side before render). */
+function submitConcurrencyHit(preCount) {
+  if (noticeConcurrencyHit()) return true;
+  const nodes = conversationNodes();
+  for (let i = Math.max(0, preCount); i < nodes.length; i++) {
+    const t = (nodes[i].textContent || "").trim();
+    if (t && t.length < 400 && CONCURRENCY_RE.test(t)) return true;
   }
   return false;
 }
@@ -573,10 +604,20 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     if (submitRateLimitHit(preCount)) {
       return { ok: false, code: "rate_limited", detail: "composer rejected the prompt under a provider send block" };
     }
+    if (submitConcurrencyHit(preCount)) {
+      return { ok: false, code: "concurrency_blocked", detail: "composer rejected the prompt: another message is generating" };
+    }
     return { ok: false, code: "submit-failed", detail: "composer rejected the prompt text" };
   }
   const ready = await waitReadyToSubmit(composer, preCount, readyTimeoutMs);
   if (!ready.ok) {
+    if (submitConcurrencyHit(preCount)) {
+      return {
+        ok: false,
+        code: "concurrency_blocked",
+        detail: `${ready.detail || "provider notice: another message is generating"} (mode=${mode})`,
+      };
+    }
     if (ready.rateLimited || submitRateLimitHit(preCount)) {
       return {
         ok: false,
@@ -597,20 +638,28 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     code: "rate_limited",
     detail: "provider notice: messages too frequent (submit rejected)",
   });
+  const concurrencyBlockedResult = () => ({
+    ok: false,
+    code: "concurrency_blocked",
+    detail: "provider notice: another message is generating (submit rejected)",
+  });
   // Method A: the enabled send button.
   const a = clickSend(ready.btn) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
   if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
+  if (a !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (a === true) return { ok: true, mode };
   // Method B: Enter on the composer.
   pressEnter(composer);
   const b = await verifySubmitted(composer, baseCount, hadText, verifyMs);
   if (b === "rate-limited" || (b !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
+  if (b !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (b === true) return { ok: true, mode };
   // Last resort: re-find the button (the DOM may have re-rendered after the
   // attachment finished processing) and click it if it is now enabled.
   const btn2 = findSendButton(composer);
   const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
   if (c === "rate-limited" || (c !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
+  if (c !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (c === true) return { ok: true, mode };
   if (quickVerify) {
     dbg("submit unverified by DOM (background tab?) — proceeding; the completion stream will confirm");
@@ -922,6 +971,8 @@ window.addEventListener("message", (ev) => {
       t.lastSseAt = Date.now();
       if (/rate_limit/i.test(d.finishReason || "")) {
         finishTurn(false, "rate_limited", d.content || "provider rate limit (stream hint)");
+      } else if (CONCURRENCY_RE.test(d.finishReason || "") || CONCURRENCY_RE.test(d.content || "")) {
+        finishTurn(false, "concurrency_blocked", d.content || "provider: another message is being generated");
       }
       // non-rate hints: keep waiting — stream close / complete decides
       break;
@@ -939,9 +990,21 @@ window.addEventListener("message", (ev) => {
         finishTurn(false, "rate_limited", d.hintError.content || "provider rate limit");
         break;
       }
+      if (
+        d.hintError &&
+        (CONCURRENCY_RE.test(d.hintError.finishReason || "") ||
+          CONCURRENCY_RE.test(d.hintError.content || ""))
+      ) {
+        finishTurn(false, "concurrency_blocked", d.hintError.content || "provider: another message is being generated");
+        break;
+      }
       if (!finalText && t.emitted.length === 0) {
         if (serverDownVisible()) {
           finishTurn(false, "dom-error", "provider: server temporarily unavailable");
+          break;
+        }
+        if (submitConcurrencyHit(t.submitCount)) {
+          finishTurn(false, "concurrency_blocked", "provider notice: another message is generating");
           break;
         }
         fallbackToDom(t, "completion stream closed without text");
@@ -996,6 +1059,10 @@ function startWatchdog(t) {
     const hit = submitRateLimitHit(t.submitCount);
     if (hit) {
       finishTurn(false, "rate_limited", "provider notice: messages too frequent");
+      return;
+    }
+    if (submitConcurrencyHit(t.submitCount)) {
+      finishTurn(false, "concurrency_blocked", "provider notice: another message is generating");
       return;
     }
     if (now > t.deadline) {

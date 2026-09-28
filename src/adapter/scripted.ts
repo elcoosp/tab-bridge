@@ -18,8 +18,10 @@ import type {
 } from "./types.js";
 
 export interface ScriptedReply {
-  /** Full reply text; emitted as 1-3 fragments. */
-  text: string;
+  /** Full reply text; emitted as 1-3 fragments. Optional when the reply
+   * only fails (failText / failWith) — streamResponse throws before
+   * touching the text. */
+  text?: string;
   stopReason?: StopReason;
   /** Split into fragments of this size (default 7, to force multi-fragment). */
   fragmentSize?: number;
@@ -103,12 +105,13 @@ export class ScriptedAdapter implements ChatProviderAdapter {
     if (reply.failWith) throw new Error(reply.failWith);
     const size = reply.fragmentSize ?? 7;
     sink.onStatus("streaming");
-    for (let i = 0; i < reply.text.length; i += size) {
-      sink.onFragment(reply.text.slice(i, i + size));
+    const text = reply.text ?? "";
+    for (let i = 0; i < text.length; i += size) {
+      sink.onFragment(text.slice(i, i + size));
     }
     sink.onStatus("done");
     return {
-      text: reply.text,
+      text,
       stopReason: reply.stopReason ?? "stop",
     };
   }

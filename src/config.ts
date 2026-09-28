@@ -19,6 +19,17 @@ export interface Config {
   /** Refuse prompts longer than this (chars). No truncation ever: over-cap
    * prompts fail fast with prompt-too-large so callers can compact. */
   maxPromptChars: number;
+  /** Max turns generating against the provider account at once. DeepSeek
+   * rejects a 3rd concurrent generation with "Another message is being
+   * generated"; the bridge queues extra turns FIFO instead (0 disables the
+   * gate). */
+  maxConcurrentTurns: number;
+  /** Max turns waiting in the generation queue. Overflow fails fast with
+   * 503 queue_full + Retry-After. */
+  queueCapacity: number;
+  /** Max ms a turn may sit in the generation queue before failing with 503
+   * queue_timeout + Retry-After. 0 waits forever. */
+  queueTimeoutMs: number;
 }
 
 export const DEFAULTS: Config = {
@@ -36,6 +47,9 @@ export const DEFAULTS: Config = {
   bindTimeoutMs: 20_000,
   holdbackCeiling: 65_536,
   maxPromptChars: 1_000_000,
+  maxConcurrentTurns: 2,
+  queueCapacity: 32,
+  queueTimeoutMs: 600_000,
 };
 
 export function parseDuration(s: string): number {
@@ -146,6 +160,24 @@ export function parseServeArgs(argv: string[]): Config {
           throw new Error("--max-prompt-chars must be a positive integer");
         }
         break;
+      case "--max-concurrent-turns":
+        cfg.maxConcurrentTurns = Number(val());
+        if (!Number.isInteger(cfg.maxConcurrentTurns) || cfg.maxConcurrentTurns < 0) {
+          throw new Error("--max-concurrent-turns must be an integer >= 0 (0 disables the gate)");
+        }
+        break;
+      case "--queue-capacity":
+        cfg.queueCapacity = Number(val());
+        if (!Number.isInteger(cfg.queueCapacity) || cfg.queueCapacity < 1 || cfg.queueCapacity > 4096) {
+          throw new Error("--queue-capacity must be an integer 1-4096");
+        }
+        break;
+      case "--queue-timeout-ms":
+        cfg.queueTimeoutMs = Number(val());
+        if (!Number.isInteger(cfg.queueTimeoutMs) || cfg.queueTimeoutMs < 0) {
+          throw new Error("--queue-timeout-ms must be an integer >= 0 (0 waits forever)");
+        }
+        break;
       default:
         throw new Error(`unknown flag: ${flag}`);
     }
@@ -175,5 +207,8 @@ export function usage(): string {
     "  --turn-timeout-ms=<n>   per-turn observation deadline (default 240000)",
     "  --bind-timeout-ms=<n>   bind/readiness deadline (default 20000)",
     "  --max-prompt-chars=<n>  refuse prompts over n chars, never truncate (default 1000000)",
+    "  --max-concurrent-turns=<n>  provider generations in flight at once, 0 disables the gate (default 2)",
+    "  --queue-capacity=<n>        max turns waiting in the generation queue (default 32)",
+    "  --queue-timeout-ms=<n>      max queue wait before 503 queue_timeout, 0 waits forever (default 600000)",
   ].join("\n");
 }

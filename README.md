@@ -117,6 +117,33 @@ Two provider behaviors are explicitly modeled by the injector and the bridge:
 Health-visible: cooling tabs report `rate_limited` via `HEALTH` and appear in
 `/healthz` `tabs[]` until the cooldown lapses.
 
+## Generation gate (max concurrent DeepSeek generations)
+
+DeepSeek refuses a send while the account already has ~2 concurrent
+generations running ("Another message is being generated"). The bridge turns
+that server-side refusal into client-side queueing:
+
+- `--max-concurrent-turns=<n>` (default 2): turns holding a generation slot
+  at once. `0` disables the gate.
+- `--queue-capacity=<n>` (default 32): max queued turns; overflow fails fast
+  with `503 queue_full` + `Retry-After: 5`.
+- `--queue-timeout-ms=<n>` (default 600000): max queue wait; starvation fails
+  with `503 queue_timeout` + `Retry-After: 5`. `0` waits forever.
+
+Queued turns are invisible to callers: a client (kod included) just observes
+a longer time-to-first-byte — in kod's TUI that reads as a longer "thinking"
+phase. No client-side special casing is needed. If your DeepSeek account
+turns out to allow only one concurrent generation, run
+`--max-concurrent-turns=1`.
+
+Observability: `/healthz` exposes `turn_gate` (active/waiting/capacity);
+non-streaming responses carry `x-bridge-queued-ms`; audit logs emit
+`turn.gate.wait|admit|full|timeout|client-gone`. Same-session overlap still
+returns `409 session_busy` — the gate is cross-session provider capacity
+only. If the refusal ever surfaces (parallel human use of the account), the
+injector reports `concurrency_blocked` and the bridge answers a retryable
+`429` + `Retry-After: 15`.
+
 ## Tool-call emulation
 
 Tools are negotiated in-prompt (`tool-protocol: 1` block) and parsed from
