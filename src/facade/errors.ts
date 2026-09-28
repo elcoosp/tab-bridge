@@ -84,6 +84,8 @@ export const RATE_LIMIT_COOLDOWN_SEC = 1200;
 /** Map adapter/worker failures onto the taxonomy. */
 export function mapTurnError(err: unknown): BridgeError {
   const msg = err instanceof Error ? err.message : String(err);
+  const retryHint = /retry-after=(\d+)/.exec(msg);
+  const retryAfterSec = retryHint ? Number(retryHint[1]) : RATE_LIMIT_COOLDOWN_SEC;
   if (msg === "cf-challenge") {
     return rateLimited(30, "Cloudflare challenge active on the provider tab");
   }
@@ -93,8 +95,8 @@ export function mapTurnError(err: unknown): BridgeError {
     msg.startsWith("turn-error:rate_limited")
   ) {
     return rateLimited(
-      RATE_LIMIT_COOLDOWN_SEC,
-      "provider reports rate limiting (Messages too frequent); wait ~20 minutes before retrying"
+      retryAfterSec,
+      `provider reports rate limiting (Messages too frequent); wait ~${Math.ceil(retryAfterSec / 60)} minutes before retrying`
     );
   }
   if (msg.startsWith("not-ready:") || msg.startsWith("reset failed")) {
@@ -105,12 +107,16 @@ export function mapTurnError(err: unknown): BridgeError {
   if (msg.startsWith("dom-error")) return badGateway(`DOM automation error: ${msg}`);
   if (msg.startsWith("port-lost")) return badGateway("tab port lost mid-turn");
   if (msg.startsWith("prompt-too-large")) return badRequest(`prompt exceeds adapter limit (${msg})`);
+  if (msg === "empty-prompt") {
+    return badRequest("compiled prompt is empty (message content resolved to no text)");
+  }
+
   if (msg.startsWith("bind-failed")) {
     const detail = msg.slice("bind-failed:".length).trim();
     if (detail.includes("rate-limited")) {
       return rateLimited(
-        RATE_LIMIT_COOLDOWN_SEC,
-        "every managed tab is cooling down from a provider rate limit; wait ~20 minutes"
+        retryAfterSec,
+        `every managed tab is cooling down from a provider rate limit; wait ~${Math.ceil(retryAfterSec / 60)} minutes`
       );
     }
     if (detail.includes("no-tab") || detail.includes("exhaust")) {
