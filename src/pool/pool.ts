@@ -35,6 +35,8 @@ interface Inflight {
 export class WorkerPool extends EventEmitter {
   private conn: WsConnection | null = null;
   private info: WorkerInfo | null = null;
+  private lastPongAt = Date.now();
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   private inflight = new Set<Inflight>();
   private seq = 0;
   private healthByTab = new Map<number, HealthState>();
@@ -118,6 +120,10 @@ export class WorkerPool extends EventEmitter {
     }
     this.detach("replaced");
     this.conn = conn;
+    conn.on("pong", () => {
+      this.lastPongAt = Date.now();
+    });
+    this.startHeartbeat();
     this.activeSerial = ++this.connSerial;
     log.info("worker.attach", { serial: this.activeSerial, remote: conn.remoteAddress });
     conn.on("message", (raw: string) => this.onMessage(raw));
@@ -125,7 +131,34 @@ export class WorkerPool extends EventEmitter {
     this.send({ t: "HELLO_OK", v: WORKER_PROTOCOL, config: this.config } as unknown as WorkerIntent);
   }
 
+  /** Detect half-open worker sockets: ping on an interval, detach when
+   * pongs go stale. `WsConnection` emits "pong" for control frames. */
+  startHeartbeat(intervalMs = 25_000, staleAfterMs = 75_000): void {
+    this.stopHeartbeat();
+    this.lastPongAt = Date.now();
+    this.heartbeatTimer = setInterval(() => {
+      const conn = this.conn;
+      if (!conn || !conn.isOpen) return;
+      if (Date.now() - this.lastPongAt > staleAfterMs) {
+        log.warn("worker.heartbeat-timeout", { staleMs: Date.now() - this.lastPongAt });
+        this.detach("heartbeat-timeout");
+        return;
+      }
+      try {
+        conn.sendPing(Buffer.from("hb"));
+      } catch {
+        /* send failure surfaces via the socket close path */
+      }
+    }, intervalMs);
+  }
+
+  stopHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
   detach(reason: string): void {
+    this.stopHeartbeat();
     if (this.conn) {
       try {
         this.conn.close(1001);
@@ -428,6 +461,7 @@ export class WorkerPool extends EventEmitter {
   }
 
   private onDown(info?: WsCloseInfo): void {
+    this.stopHeartbeat();
     if (this.conn === null) return;
     const serial = this.activeSerial;
     this.conn = null;
