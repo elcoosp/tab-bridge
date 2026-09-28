@@ -4,7 +4,7 @@
  * Pure with respect to the adapter: contract tests drive it via ScriptedAdapter.
  */
 import type { ChatMessage, ToolCall } from "./core/canonical.js";
-import { normalizeMessages, canonical } from "./core/canonical.js";
+import { normalizeMessages, canonical, stripSystemPrefix } from "./core/canonical.js";
 import { foldAll, hashCanonical } from "./core/hashchain.js";
 import { messageHash, classify, type PlanName } from "./core/classifier.js";
 import type { SessionRegistry, SessionRow } from "./core/registry.js";
@@ -92,6 +92,29 @@ export function validateCallEvent(
 
 function tabOf(tabId: number): ManagedTab {
   return { tabId, state: "ready" };
+}
+
+/**
+ * Compact one-line-per-message shape summary for mismatch diagnosis
+ * (TAB_BRIDGE_DEBUG only): role, content length + head, and per call
+ * name/args-length/id-presence. Never logs full text.
+ */
+export function summarizeMessages(messages: readonly ChatMessage[]): string {
+  return messages
+    .map((m) => {
+      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const head = (text ?? "").slice(0, 40).replace(/\s+/g, " ");
+      const calls = Array.isArray(m.tool_calls)
+        ? m.tool_calls
+            .map(
+              (c) =>
+                `${c.function.name}(argsLen=${(c.function.arguments || "").length},id=${typeof c.id === "string" ? c.id.slice(0, 12) : "∅"})`
+            )
+            .join(";")
+        : "";
+      return `${m.role}[len=${(text ?? "").length},head=${JSON.stringify(head)}]${calls ? `{${calls}}` : ""}`;
+    })
+    .join(" | ");
 }
 
 async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<ManagedTab> {
@@ -209,9 +232,38 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     historyLen: messages.length,
     chainLen: row.chain.length,
   });
+  if (
+    process.env.TAB_BRIDGE_DEBUG &&
+    (/^divergence|^fabricated/.test(plan.reason) || plan.plan === "RESET_RESEED")
+  ) {
+    const histForRoles = stripSystemPrefix(messages);
+    log.info("turn.shapes", {
+      sessionId: row.sessionId,
+      reason: plan.reason,
+      chainLen: row.chain.length,
+      tabHash: row.tabHash,
+      deltaRoles: histForRoles.slice(row.chain.length, row.chain.length + 6).map((m) => m.role),
+      shapes: summarizeMessages(messages).slice(0, 2000),
+    });
+  }
 
   // ---- tab + readiness ----------------------------------------------------
-  const tab = await ensureTabAndReady(req, row);
+  // Failures here (bind timeout, worker down during readiness) never touch
+  // the tab: no prompt was placed, no navigation issued. They must NOT mark
+  // the row — otherwise every outage poisons the session and forces resets
+  // forever after (pending-reset storm).
+  let tab: ManagedTab;
+  try {
+    tab = await ensureTabAndReady(req, row);
+  } catch (e) {
+    log.audit("turn.failed", {
+      sessionId: row.sessionId,
+      plan: plan.plan,
+      error: e instanceof Error ? e.message : String(e),
+      phase: "bind-ready",
+    });
+    throw e;
+  }
   log.info("turn.tab", { sessionId: row.sessionId, tabId: tab.tabId });
 
   // ---- execute plan -------------------------------------------------------
@@ -311,6 +363,12 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       calls: calls.length,
       repairs: repairsUsed,
     });
+    if (process.env.TAB_BRIDGE_DEBUG) {
+      log.info("turn.emitted", {
+        sessionId: row.sessionId,
+        shapes: summarizeMessages([emitted]).slice(0, 1000),
+      });
+    }
 
     return {
       content: text,
@@ -344,10 +402,11 @@ function foldDelta(
   messages: readonly ChatMessage[],
   storedLen: number
 ): string[] {
+  const hist = stripSystemPrefix(messages);
   const out = [...storedChain];
   let head: string | null = storedChain.length > 0 ? storedChain[storedChain.length - 1] : null;
-  for (let i = storedLen; i < messages.length; i++) {
-    head = hashCanonical(head, canonical(messages[i]));
+  for (let i = storedLen; i < hist.length; i++) {
+    head = hashCanonical(head, canonical(hist[i]));
     out.push(head);
   }
   return out;

@@ -2,11 +2,11 @@
  * OpenAI message model, canonicalization (spec 5.1) and legacy text-convention
  * rewriting (kod H-P1 tolerance, R3).
  *
- * canonical(msg) forms (scheme v1):
- *   system    : "S|" + text
+ * canonical(msg) forms (scheme v3):
+ *   system    : "S|" + text            (hashed for tabHash only, never chained)
  *   user      : "U|" + text
  *   assistant : "A|" + text                         (no calls)
- *             | "A|" + text + "=> call name(args)#id ; call ..."  (with calls)
+ *             | "A|=> call name(args)#id ; call ..." (with calls, prose excluded)
  *   tool      : "T#" + tool_call_id + "|" + text
  */
 import { canonJson } from "../util/json.js";
@@ -54,6 +54,19 @@ export function renderCalls(calls: ToolCall[]): string {
     .join(" ; ");
 }
 
+/**
+ * Chain continuity starts after an optional leading system message. Clients
+ * legitimately re-render the system prompt every turn (timestamps, memory,
+ * tool inventory), so hashing it would force a reseed on every follow-up.
+ * The system text still reaches the tab on SEED compiles; it is simply not
+ * part of the continuity proof. Only ONE leading message is skipped — a
+ * system role anywhere else is hashed normally.
+ */
+export function stripSystemPrefix(messages: readonly ChatMessage[]): ChatMessage[] {
+  if (messages.length > 0 && messages[0].role === "system") return messages.slice(1);
+  return [...messages];
+}
+
 export function canonical(msg: ChatMessage): string {
   const text = textOf(msg.content);
   switch (msg.role) {
@@ -65,11 +78,14 @@ export function canonical(msg: ChatMessage): string {
     case "tool":
       return `T#${msg.tool_call_id ?? "-"}|${text}`;
     case "assistant": {
-      const base = `A|${text}`;
+      // Scheme v2: prose is excluded when tool calls are present. OpenAI
+      // clients legally replay assistant turns as {content: null, tool_calls}
+      // while the tab produced prose + calls — hashing prose flags every
+      // such replay as fabricated. Call identity (name/args/id) still binds.
       if (msg.tool_calls && msg.tool_calls.length > 0) {
-        return `${base}=> ${renderCalls(msg.tool_calls)}`;
+        return `A|=> ${renderCalls(msg.tool_calls)}`;
       }
-      return base;
+      return `A|${text}`;
     }
     default:
       return `S|${text}`;

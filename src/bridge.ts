@@ -133,6 +133,11 @@ export class TabBridge {
       this.registry.dropLock(row.sessionId);
       if (ephemeral) {
         this.registry.delete(row.sessionId);
+        // Free the worker-side binding so the tab returns to the allocatable
+        // pool instead of leaking one tab per sessionless request.
+        if (row.tabId !== null) {
+          this.pool.release(row.sessionId, 3_000).catch(() => {});
+        }
       }
     }
   }

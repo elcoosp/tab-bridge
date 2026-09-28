@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classify, messageHash, type ClassifierRow } from "../src/core/classifier.js";
-import { foldAll } from "../src/core/hashchain.js";
+import { foldAll, CHAIN_SCHEME } from "../src/core/hashchain.js";
+import { SessionRegistry } from "../src/core/registry.js";
 import type { ChatMessage } from "../src/core/canonical.js";
 
 function row(partial: Partial<ClassifierRow> & { chain?: string[] }): ClassifierRow {
   return {
     hasRow: true,
-    scheme: 1,
+    scheme: CHAIN_SCHEME,
     mode: "stateful",
     chain: partial.chain ?? [],
     tabHash: partial.tabHash ?? null,
@@ -25,7 +26,7 @@ const U2: ChatMessage = { role: "user", content: "u2" };
 
 test("no row / scheme mismatch / stateless -> SEED", () => {
   assert.equal(classify(row({ hasRow: false, chain: [] }), [S, U1]).plan, "SEED");
-  assert.equal(classify(row({ scheme: 2, chain: [] }), [S, U1]).plan, "SEED");
+  assert.equal(classify(row({ scheme: 1, chain: [] }), [S, U1]).plan, "SEED");
   assert.equal(classify(row({ mode: "always-reset", chain: [] }), [S, U1]).plan, "SEED");
 });
 
@@ -133,13 +134,67 @@ test("text-echo continuation: [assistant(text)=tab, user] -> INJECT_TEXT(user)",
 });
 
 test("unsupported multi-message delta -> RESET_RESEED", () => {
+  // NOTE: [assistant-text, user] is intentionally NOT here — plain-text
+  // echoes inject without verification (scheme v3+). Two back-to-back user
+  // messages match no fast path.
   const chain = foldAll([S, U1]);
   const p = classify(row({ chain, tabHash: null }), [
     S,
     U1,
-    { role: "assistant", content: "ghost" },
+    { role: "user", content: "again" },
     { role: "user", content: "next" },
   ]);
   assert.equal(p.plan, "RESET_RESEED");
   assert.equal(p.reason, "unsupported-delta-shape");
+});
+
+test("text-echo mismatch still injects (tab is append-only truth)", () => {
+  // The client replayed a stale/different assistant text before the new user
+  // message. Appending user text stays coherent (unlike misattached tool
+  // results), so this must not reseed.
+  const hist: ChatMessage[] = [S, U1];
+  const chain = foldAll(hist);
+  const staleEcho: ChatMessage = { role: "assistant", content: "something else entirely" };
+  const next: ChatMessage[] = [...hist, staleEcho, U2];
+  const p = classify(row({ chain, tabHash: "unrelated-tab-output-hash" }), next);
+  assert.equal(p.plan, "INJECT_TEXT");
+  assert.equal(p.injectText, "u2");
+});
+
+test("re-rendered system prompt does not break continuity (scheme v3)", () => {
+  const S2: ChatMessage = { role: "system", content: "sys re-rendered with fresh memory" };
+  const chain = foldAll([S, U1]);
+  const p = classify(row({ chain, tabHash: null }), [S2, U1, U2]);
+  assert.equal(p.plan, "INJECT_TEXT");
+  assert.equal(p.injectText, "u2");
+});
+
+test("foldAll ignores a leading system message", () => {
+  assert.deepEqual(foldAll([S, U1]), foldAll([U1]));
+});
+
+test("commit adopts the current scheme or migration reseeds forever", () => {
+  // Regression: commit() wrote the new-scheme chain but left row.scheme at
+  // the persisted value, so every later turn hit scheme-mismatch again.
+  const reg = new SessionRegistry({ mode: "stateful", ttlMs: 30 * 60_000 });
+  reg.restore({
+    sessionId: "old",
+    tabId: 1,
+    chain: ["deadbeef".repeat(4)],
+    tabHash: null,
+    turns: 3,
+    state: "active",
+    mode: "stateful",
+    scheme: 1,
+    createdAt: 1,
+    lastUsed: 1,
+  });
+  const sessRow = reg.getOrCreate("old");
+  assert.equal(classify(row({ scheme: sessRow.scheme, chain: sessRow.chain }), [S, U1]).plan, "SEED");
+  reg.commit(sessRow, foldAll([U1, U2]), null);
+  assert.equal(sessRow.scheme, CHAIN_SCHEME);
+  const U3: ChatMessage = { role: "user", content: "u3" };
+  const p = classify(row({ scheme: sessRow.scheme, chain: sessRow.chain }), [S, U1, U2, U3]);
+  assert.equal(p.plan, "INJECT_TEXT");
+  assert.equal(p.injectText, "u3");
 });

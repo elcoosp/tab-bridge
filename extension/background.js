@@ -31,6 +31,12 @@ let ws = null;
 let wsUrl = DEFAULT_WS_URL;
 let backoff = RECONNECT_MIN_MS;
 let poolConfig = { autoCreateTabs: false, managedOnly: true, warmTabs: 0 };
+let helloOk = false;
+// Stable per-profile identity (loaded from storage.local at boot, default
+// while the async load is in flight). Sent in HELLO so the bridge log can
+// distinguish one looping worker from several live duplicates.
+let instanceId = "w-booting";
+const helloQueue = []; // intents arriving before HELLO_OK (never handle on defaults)
 let seq = 0;
 
 // Visible-by-default SW log (console.debug is hidden unless Verbose is on).
@@ -61,9 +67,65 @@ const portByTab = new Map(); // tabId -> Port
 const readyWaiters = new Map(); // tabId -> [resolve]
 const turnByReq = new Map(); // reqId -> { tabId, timer }
 
+/**
+ * Tabs this worker created (persisted across service-worker restarts).
+ * ONLY these are ever allocated to bridge sessions. Foreign tabs — the
+ * user's own DeepSeek tabs — also connect injectors, but their ports are
+ * ignored entirely: allocating one would drive the user's personal
+ * conversation with bridge prompts.
+ */
+const managedTabs = new Set();
+let managedLoaded = false;
+const pendingPorts = []; // injector ports arriving before the managed set loads
+
+function saveManaged() {
+  try {
+    chrome.storage.local.set({ managedTabs: [...managedTabs] });
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+chrome.storage.local.get({ managedTabs: [], workerInstance: null }, (res) => {
+  try {
+    for (const id of res.managedTabs || []) {
+      if (typeof id === "number") managedTabs.add(id);
+    }
+  } catch {
+    /* corrupted entry — start empty */
+  }
+  // Stable per-profile worker identity, shared with the bridge in HELLO.
+  // Successive log lines with DIFFERENT ids prove distinct live workers
+  // (profiles/browsers); the SAME id repeating proves one worker looping.
+  try {
+    instanceId =
+      typeof res.workerInstance === "string" && res.workerInstance
+        ? res.workerInstance
+        : "w-" + Math.random().toString(36).slice(2, 10);
+    chrome.storage.local.set({ workerInstance: instanceId });
+  } catch {
+    instanceId = "w-ephemeral";
+  }
+  managedLoaded = true;
+  for (const p of pendingPorts.splice(0)) handleInjectorConnect(p.port, p.tabId);
+});
+
 // ---------------------------------------------------------------------------
 // websocket link
 // ---------------------------------------------------------------------------
+
+try {
+  self.addEventListener("unhandledrejection", (ev) => {
+    try {
+      const r = ev && ev.reason;
+      console.error("[tab-bridge-worker] unhandled rejection:", String((r && (r.stack || r.message)) || r));
+    } catch {
+      /* noop */
+    }
+  });
+} catch {
+  /* noop */
+}
 
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -81,9 +143,17 @@ function connect() {
     return;
   }
   ws.addEventListener("open", () => {
-    backoff = RECONNECT_MIN_MS;
+    // NOTE: backoff resets only on HELLO_OK below. Resetting it here made a
+    // refused duplicate reconnect metronomically every 1s forever (open fires
+    // before the refusal arrives).
     blog("worker link open ->", wsUrl);
-    send({ t: "HELLO", v: PROTOCOL_VERSION, ext: "deepseek-web" });
+    let extVersion = "unknown";
+    try {
+      extVersion = chrome.runtime.getManifest().version || "unknown";
+    } catch {
+      /* noop */
+    }
+    send({ t: "HELLO", v: PROTOCOL_VERSION, ext: "deepseek-web", extVersion, instance: instanceId });
     startPingLoop();
   });
   ws.addEventListener("message", (ev) => {
@@ -94,20 +164,46 @@ function connect() {
       return;
     }
     if (m && m.t === "HELLO_OK") {
+      backoff = RECONNECT_MIN_MS;
+      helloOk = true;
       poolConfig = m.config || poolConfig;
       blog("bridge HELLO_OK", JSON.stringify(poolConfig));
+      // Flush intents that arrived during the handshake: they must run under
+      // the real pool config, never the default-deny one (otherwise BIND
+      // fails spuriously with no-tab-available despite autoCreateTabs).
+      // Capped: without a handshake these would pile up unboundedly.
+      const queued = helloQueue.splice(0, 20);
+      for (const q of queued) routeIntent(q);
       return;
     }
     if (m && m.t === "HELLO_REFUSED") {
-      console.warn("[tab-bridge-worker] refused:", m.reason);
+      // Another worker holds the bridge link (duplicate extension install:
+      // second profile, second Chrome channel). Retrying fast only spams;
+      // back off hard so a transient duplicate resolves itself, and say
+      // loudly which end must be disabled.
+      backoff = 60_000;
+      blog(
+        "bridge refused this worker:",
+        m.reason,
+        "— disable the Tab Bridge Worker extension in every OTHER Chrome profile/channel; this copy will retry in 60s"
+      );
       return;
     }
-    if (m && m.t === "BIND") handleBind(m);
-    else if (m && m.t === "SEND") handleSend(m);
-    else if (m && m.t === "RESET") handleReset(m);
-    else if (m && m.t === "ABORT") handleAbort(m);
-    else if (m && m.t === "PING") handlePing(m);
-    else if (m && m.t === "RELEASE") handleRelease(m);
+    // Every intent handler below can throw (dead ports, closed tabs, racing
+    // disconnects). An uncaught throw here terminates the whole service
+    // worker, which the bridge reads as ECONNRESET ~1s after connect.
+    // Intents arriving before HELLO_OK are parked, never handled under the
+    // default-deny pool config.
+    try {
+      if (!helloOk && m && ["BIND", "SEND", "RESET", "ABORT", "RELEASE", "PING"].includes(m.t)) {
+        if (helloQueue.length < 20) helloQueue.push(m);
+        else blog("dropping pre-handshake intent (queue full):", m.t);
+        return;
+      }
+      if (m) routeIntent(m);
+    } catch (e) {
+      blog("intent dispatch failed:", String((e && e.message) || e));
+    }
   });
   ws.addEventListener("close", () => {
     blog("worker link closed — reconnecting in", backoff, "ms");
@@ -119,6 +215,24 @@ function connect() {
       ws.close();
     } catch {}
   });
+}
+
+function routeIntent(m) {
+  if (m.t === "BIND") {
+    void handleBind(m).catch((e) => {
+      // A failed BIND must still answer: otherwise the bridge hangs the full
+      // bind timeout. Include a stack — mystery throwers like "No SW" get
+      // exactly one more chance to stay anonymous.
+      const err = String((e && e.stack) || (e && e.message) || e);
+      blog("BIND failed:", err.split("\n").slice(0, 4).join(" | "));
+      send({ t: "BIND_FAILED", sessionId: m.sessionId, code: "worker-error", detail: err.slice(0, 300) });
+    });
+  }
+  else if (m.t === "SEND") handleSend(m);
+  else if (m.t === "RESET") handleReset(m);
+  else if (m.t === "ABORT") handleAbort(m);
+  else if (m.t === "PING") handlePing(m);
+  else if (m.t === "RELEASE") handleRelease(m);
 }
 
 function scheduleReconnect() {
@@ -157,9 +271,17 @@ function markHealth(tabId, health, detail) {
 }
 
 async function allocateTab(sessionId) {
-  // 1) re-use a free managed tab (skipping rate-limit cooldowns)
+  // 1) re-use a free managed tab (skipping rate-limit cooldowns).
+  // Foreign tabs are never in tabState, and the managedTabs check below is
+  // belt-and-braces for the same invariant.
   for (const [tabId, st] of tabState) {
-    if (st.state === "ready" && !st.sessionId && !tabInCooldown(tabId, st)) return tabId;
+    if (
+      st.state === "ready" &&
+      !st.sessionId &&
+      !tabInCooldown(tabId, st) &&
+      managedTabs.has(tabId)
+    )
+      return tabId;
   }
   // 2) every free tab is cooling down -> tell the bridge it is a rate-limit,
   //    not a generic capacity miss (maps to 429 + Retry-After ~20 min)
@@ -173,8 +295,30 @@ async function allocateTab(sessionId) {
     return null;
   }
   blog("BIND", "(allocate) creating managed tab...");
-  const created = await chrome.tabs.create({ url: START_URL, active: false });
+  let created;
+  try {
+    created = await chrome.tabs.create({ url: START_URL, active: false });
+  } catch (e) {
+    blog("BIND", "(allocate) chrome.tabs.create threw:", String((e && e.message) || e));
+    throw e;
+  }
+  if (!created || typeof created.id !== "number") {
+    blog("BIND", "(allocate) chrome.tabs.create returned no tab id");
+    throw new Error("tab-create returned no usable tab");
+  }
+  blog("BIND", "(allocate) created tab", created.id, "— waiting for load");
+  managedTabs.add(created.id);
+  saveManaged();
   tabState.set(created.id, { state: "connecting", health: "ok" });
+  // Cold-tab grace: the injector port connects before the SPA finishes
+  // booting, and submits into a half-loaded app silently go nowhere (first
+  // turn fails, retry succeeds). Wait for the document load first.
+  const loaded = await waitForLoaded(created.id, 30000);
+  if (!loaded) {
+    blog("BIND", "(allocate) tab", created.id, "document never finished loading within 30s");
+    tabState.set(created.id, { state: "dead", health: "degraded" });
+    return null;
+  }
   const ok = await waitForReady(created.id, 20000);
   if (!ok) {
     blog("BIND", "(allocate) tab", created.id, "injector never connected within 20s");
@@ -184,6 +328,26 @@ async function allocateTab(sessionId) {
   tabState.get(created.id).state = "ready";
   blog("BIND", "(allocate) tab", created.id, "ready");
   return created.id;
+}
+
+/** Resolve when the tab's document reaches complete status (or timeout). */
+function waitForLoaded(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = () => {
+      try {
+        chrome.tabs.get(tabId, (tab) => {
+          if (chrome.runtime.lastError || !tab) return resolve(false);
+          if (tab.status === "complete") return resolve(true);
+          if (Date.now() > deadline) return resolve(false);
+          setTimeout(poll, 500);
+        });
+      } catch {
+        return resolve(false);
+      }
+    };
+    poll();
+  });
 }
 
 function tabInCooldown(tabId, st) {
@@ -196,6 +360,24 @@ function tabInCooldown(tabId, st) {
     return false;
   }
   return true;
+}
+
+/**
+ * Crash-proof port send. postMessage on a dead port THROWS synchronously,
+ * and an uncaught throw inside the WS message handler terminates the whole
+ * service worker — which reads on the bridge as ECONNRESET ~1s after every
+ * connect (the metronome). Returns false and drops the stale port instead.
+ */
+function safePost(tabId, msg) {
+  const port = portByTab.get(tabId);
+  if (!port) return false;
+  try {
+    port.postMessage(msg);
+    return true;
+  } catch {
+    if (portByTab.get(tabId) === port) portByTab.delete(tabId);
+    return false;
+  }
 }
 
 function waitForReady(tabId, timeoutMs) {
@@ -286,7 +468,19 @@ function handleSend(m) {
     }
   }, 30000);
   blog("SEND", m.reqId, "-> tab", useTab, `(${(m.text || "").length} chars)`);
-  port.postMessage({ t: "TURN", reqId: m.reqId, text: m.text, opts: m.opts || {} });
+  if (!safePost(useTab, { t: "TURN", reqId: m.reqId, text: m.text, opts: m.opts || {} })) {
+    blog("SEND", m.reqId, "-> port died between lookup and send (tab", useTab, ")");
+    send({ t: "ERROR", reqId: m.reqId, code: "port-lost", detail: "injector port died on send" });
+    markHealth(useTab, "degraded", "port-died-on-send");
+    const rec0 = turnByReq.get(m.reqId);
+    if (rec0) {
+      rec0.finished = true;
+      clearTimeout(rec0.timer);
+      if (rec0.quietTimer) clearTimeout(rec0.quietTimer);
+      turnByReq.delete(m.reqId);
+    }
+    return;
+  }
   // Ack the take-over: the bridge's adapter blocks until ACCEPTED/ERROR, so
   // this must arrive even though the injector is still working.
   send({ t: "ACCEPTED", reqId: m.reqId });
@@ -298,15 +492,25 @@ function handleSend(m) {
  * port) mid-reset — the reply then arrives on the reconnected port, which
  * the old per-port listener never saw (hence RESET_TIMEOUT on success).
  */
-const resetStates = new Map(); // reqId -> { targets: Set<tabId>, timer, done }
+const resetStates = new Map(); // reqId -> { targets: Set<tabId>, pending: Set<tabId>, navigated: Set<tabId>, fresh, timer, done }
 
 function handleReset(m) {
-  const targets = [...sessionTab.values()];
+  // A session-scoped reset addresses its own tab; the legacy broadcast form
+  // (no tabId) still fans out to all bound tabs.
+  const targets =
+    typeof m.tabId === "number" ? [m.tabId] : [...sessionTab.values()];
   if (targets.length === 0) {
     send({ t: "RESET_OK", reqId: m.reqId }); // nothing bound: trivially reset
     return;
   }
-  const st = { targets: new Set(targets), timer: null, done: false };
+  const st = {
+    targets: new Set(targets),
+    pending: new Set(targets),
+    navigated: new Set(),
+    fresh: false,
+    timer: null,
+    done: false,
+  };
   resetStates.set(m.reqId, st);
   st.timer = setTimeout(() => {
     if (st.done) return;
@@ -316,54 +520,83 @@ function handleReset(m) {
     send({ t: "RESET_TIMEOUT", reqId: m.reqId });
   }, RESET_TIMEOUT_MS);
   blog("RESET", m.reqId, "-> tabs", targets.join(","));
+  let posted = 0;
   for (const tabId of targets) {
-    const port = portByTab.get(tabId);
-    if (port) port.postMessage({ t: "RESET" });
-    else blog("RESET", m.reqId, "no port for tab", tabId);
+    if (safePost(tabId, { t: "RESET" })) {
+      posted++;
+    } else {
+      blog("RESET", m.reqId, "no live port for tab", tabId);
+    }
   }
+  if (posted === 0) {
+    // Nothing will ever reply (no ports, no reconnects to re-arm): fail fast
+    // instead of hanging the bridge on the full reset timeout.
+    finishResetFailed(m.reqId, "no live injector ports for reset targets");
+  }
+}
+
+/** First OK wins (historical semantics); failures resolve per tab below. */
+function finishResetOk(reqId) {
+  const st = resetStates.get(reqId);
+  if (!st || st.done) return;
+  st.done = true;
+  clearTimeout(st.timer);
+  resetStates.delete(reqId);
+  blog("RESET", reqId, "ok");
+  send({ t: "RESET_OK", reqId });
+}
+
+function finishResetFailed(reqId, detail) {
+  const st = resetStates.get(reqId);
+  if (!st || st.done) return;
+  st.done = true;
+  clearTimeout(st.timer);
+  resetStates.delete(reqId);
+  blog("RESET", reqId, `failed (${detail || "no detail"})`);
+  send({ t: "RESET_TIMEOUT", reqId });
 }
 
 /** Route an injector reset reply to its reset state, whichever port it came on. */
 function onResetReply(tabId, msg) {
   for (const [reqId, st] of resetStates) {
     if (st.done || !st.targets.has(tabId)) continue;
-    if (msg.t === "RESET_OK" || msg.t === "RESET_FAILED") {
-      // No new-chat control (selector drift): navigate the tab home as the
-      // reset action itself, once per reset. The reconnect re-post carries
-      // fresh:true so the injector confirms by URL, no selectors involved.
-      if (
-        msg.t === "RESET_FAILED" &&
-        /new-chat control not found/i.test(msg.detail || "") &&
-        !st.navigatedOnce
-      ) {
-        st.navigatedOnce = true;
-        st.fresh = true;
-        blog("RESET", reqId, "no new-chat control — navigating tabs home as the reset");
-        for (const tid of st.targets) {
-          try {
-            chrome.tabs.update(tid, { url: START_URL });
-          } catch (e) {
-            blog("RESET", reqId, "navigate failed for tab", tid, String((e && e.message) || e));
-          }
-        }
-        return; // keep pending; the reconnect re-post completes it
-      }
-      st.done = true;
-      clearTimeout(st.timer);
-      resetStates.delete(reqId);
-      blog("RESET", reqId, msg.t === "RESET_OK" ? "ok" : `failed (${msg.detail || "no detail"})`);
-      send(
-        msg.t === "RESET_OK" ? { t: "RESET_OK", reqId } : { t: "RESET_TIMEOUT", reqId }
-      );
+    if (msg.t !== "RESET_OK" && msg.t !== "RESET_FAILED") continue;
+    if (msg.t === "RESET_OK") {
+      finishResetOk(reqId);
+      return;
     }
+    // No new-chat control (selector drift): navigate this tab home as the
+    // reset action itself, once per tab. The reconnect re-post carries
+    // fresh:true so the injector confirms by URL, no selectors involved.
+    // Other tabs keep their own pending replies; only the last outstanding
+    // failure without recovery ends the reset.
+    if (/new-chat control not found/i.test(msg.detail || "") && !st.navigated.has(tabId)) {
+      st.navigated.add(tabId);
+      st.fresh = true;
+      blog("RESET", reqId, "no new-chat control — navigating tab", tabId, "home as the reset");
+      try {
+        // Floating this promise kills the worker: an unhandled tabs.update
+        // rejection terminates the whole service worker, which the bridge
+        // reads as ECONNRESET ~1s after connect — the metronome.
+        const r = chrome.tabs.update(tabId, { url: START_URL });
+        if (r && typeof r.catch === "function") {
+          r.catch((e) => blog("RESET", reqId, "navigate failed for tab", tabId, String((e && e.message) || e)));
+        }
+      } catch (e) {
+        blog("RESET", reqId, "navigate failed for tab", tabId, String((e && e.message) || e));
+      }
+      return; // keep pending; the reconnect re-post completes it
+    }
+    st.pending.delete(tabId);
+    if (st.pending.size === 0) finishResetFailed(reqId, msg.detail);
+    else blog("RESET", reqId, `tab ${tabId} failed, still waiting for ${[...st.pending].join(",")}`);
   }
 }
 
 function handleAbort(m) {
   const rec = turnByReq.get(m.reqId);
   if (rec) {
-    const port = portByTab.get(rec.tabId);
-    if (port) port.postMessage({ t: "ABORT", reqId: m.reqId });
+    safePost(rec.tabId, { t: "ABORT", reqId: m.reqId });
   }
 }
 
@@ -391,17 +624,34 @@ function handleRelease(m) {
 chrome.runtime.onConnect.addListener((port) => {
   const tabId = port.sender && port.sender.tab ? port.sender.tab.id : null;
   if (tabId === null || port.name !== "injector") return;
+  if (!managedLoaded) {
+    // Storage hasn't delivered the managed set yet: park the port, decide
+    // once we know (prevents a foreign tab winning a race at boot).
+    pendingPorts.push({ port, tabId });
+    return;
+  }
+  handleInjectorConnect(port, tabId);
+});
+
+function handleInjectorConnect(port, tabId) {
+  if (!managedTabs.has(tabId)) {
+    // Foreign tab (the user's own DeepSeek tab, or a managed tab from
+    // before the registry existed): never tracked, never allocated. Its
+    // injector keeps the page untouched.
+    blog("ignoring foreign tab", tabId, "(not worker-created; never allocated)");
+    return;
+  }
   blog("injector connected (tab", tabId + ")");
   portByTab.set(tabId, port);
   const st = tabState.get(tabId);
   if (st && st.state === "connecting") st.state = "ready";
   else if (!st) {
-    // Service-worker restart wipes our tables while tabs (and their
-    // injectors) survive: re-register the tab so PONG snapshots — and
-    // therefore the bridge's ensureReady — see it again. Session affinity
-    // is re-established by the bridge's next BIND.
+    // Service-worker restart wiped our tables while a managed tab (and its
+    // injector) survived: re-register it so PONG snapshots — and therefore
+    // the bridge's ensureReady — see it again. Session affinity is
+    // re-established by the bridge's next BIND.
     tabState.set(tabId, { state: "ready", health: "ok" });
-    blog("injector reconnected unknown tab", tabId, "— re-registered as ready");
+    blog("injector reconnected managed tab", tabId);
   }
   const waiters = readyWaiters.get(tabId) || [];
   readyWaiters.set(tabId, []);
@@ -409,14 +659,11 @@ chrome.runtime.onConnect.addListener((port) => {
   // A reconnect mid-reset means the navigation killed the injector before it
   // could reply: re-arm the fresh port so its reply completes the reset.
   // After a navigate-home fallback the re-post carries fresh:true (URL check).
+  // Only tabs still awaiting a reply are re-armed — never already-resolved ones.
   for (const [reqId, rst] of resetStates) {
-    if (!rst.done && rst.targets.has(tabId)) {
+    if (!rst.done && rst.pending.has(tabId)) {
       blog("re-posting RESET", reqId, "to reconnected tab", tabId, rst.fresh ? "(fresh)" : "");
-      try {
-        port.postMessage(rst.fresh ? { t: "RESET", fresh: true } : { t: "RESET" });
-      } catch {
-        /* port already gone */
-      }
+      safePost(tabId, rst.fresh ? { t: "RESET", fresh: true } : { t: "RESET" });
     }
   }
 
@@ -443,6 +690,8 @@ chrome.runtime.onConnect.addListener((port) => {
           if (rec.quietTimer) clearTimeout(rec.quietTimer);
           turnByReq.delete(msg.reqId);
         }
+        const st = tabState.get(tabId);
+        if (st) st.submitFails = 0; // healthy turn clears the wedge counter
         const s = fragStats.get(msg.reqId);
         blog(msg.t, msg.reqId, s ? `(${s.n} fragments, ${s.chars} chars)` : "(no fragments)");
         fragStats.delete(msg.reqId);
@@ -459,6 +708,9 @@ chrome.runtime.onConnect.addListener((port) => {
         }
         if (msg.code === "rate_limited") {
           applyRateLimitCooldown(tabId);
+        }
+        if (msg.code === "submit-failed" || msg.code === "send-button-disabled") {
+          noteSubmitFail(tabId, msg.code);
         }
         const s = fragStats.get(msg.reqId);
         blog("TURN_ERROR", msg.reqId, msg.code, msg.detail || "", s ? `(${s.n} frags, ${s.chars} chars)` : "(no fragments)");
@@ -489,11 +741,12 @@ chrome.runtime.onConnect.addListener((port) => {
     blog("injector disconnected (tab", tabId + ")");
     markHealth(tabId, "degraded", "port-disconnected");
   });
-});
+}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabState.delete(tabId);
   portByTab.delete(tabId);
+  if (managedTabs.delete(tabId)) saveManaged();
   for (const [sid, tid] of sessionTab) {
     if (tid === tabId) sessionTab.delete(sid);
   }
@@ -506,6 +759,40 @@ function applyRateLimitCooldown(tabId) {
   st.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
   st.health = "rate_limited";
   send({ t: "HEALTH", tabId, state: "rate_limited", detail: "messages-too-frequent cooldown ~20min" });
+}
+
+/**
+ * Wedged-tab recycling: consecutive submit-phase failures (button never
+ * sendable, submits never landing) mean the tab's composer/DOM is degraded —
+ * usually after many turns in one tab. Healthy turns reset the counter; at
+ * the threshold the tab is closed outright. The bridge notices the unknown
+ * tab on its next ensureReady and re-binds a fresh one; its chain is
+ * untouched, so the next turn reseeds cleanly.
+ */
+const SUBMIT_FAIL_THRESHOLD = 3;
+
+function noteSubmitFail(tabId, code) {
+  const st = tabState.get(tabId);
+  if (!st) return;
+  st.submitFails = (st.submitFails || 0) + 1;
+  blog(`submit failure ${st.submitFails}/${SUBMIT_FAIL_THRESHOLD} on tab`, tabId, `(${code})`);
+  if (st.submitFails >= SUBMIT_FAIL_THRESHOLD) recycleTab(tabId, code);
+}
+
+function recycleTab(tabId, why) {
+  blog("recycling wedged tab", tabId, `(${why}; bridge will re-bind fresh)`);
+  tabState.delete(tabId);
+  portByTab.delete(tabId);
+  for (const [sid, tid] of sessionTab) {
+    if (tid === tabId) sessionTab.delete(sid);
+  }
+  try {
+    const r = chrome.tabs.remove(tabId);
+    if (r && typeof r.catch === "function") r.catch(() => {});
+  } catch {
+    /* already gone */
+  }
+  send({ t: "HEALTH", tabId, state: "degraded", detail: `tab recycled after repeated submit failures (${why})` });
 }
 
 // ---------------------------------------------------------------------------

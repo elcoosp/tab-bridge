@@ -61,7 +61,7 @@ parameter in the URL: `ws://127.0.0.1:8789/worker?token=…`.
 
 ## Protocol (v1)
 
-Intents (bridge → worker): `BIND`, `SEND{reqId,text,opts,tabId?}`, `RESET`,
+Intents (bridge → worker): `BIND`, `SEND{reqId,text,opts,tabId?}`, `RESET{reqId,tabId?}`,
 `ABORT`, `PING`, `RELEASE`.
 Observations (worker → bridge): `BOUND`/`BIND_FAILED`, `ACCEPTED` (sent as
 soon as the worker takes the turn),

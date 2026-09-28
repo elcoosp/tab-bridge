@@ -6,16 +6,16 @@
 export const WORKER_PROTOCOL = 1;
 
 export type WorkerIntent =
-  | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown> }
+  | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown>; extVersion?: string; instance?: string }
   | { t: "BIND"; sessionId: string }
   | { t: "SEND"; reqId: string; text: string; opts: { timeoutMs: number; think: boolean }; tabId?: number }
-  | { t: "RESET"; reqId: string }
+  | { t: "RESET"; reqId: string; tabId?: number }
   | { t: "ABORT"; reqId: string }
   | { t: "PING"; seq: number }
   | { t: "RELEASE"; sessionId: string };
 
 export type WorkerObservation =
-  | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown> }
+  | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown>; extVersion?: string; instance?: string }
   | { t: "HELLO_OK"; v: number; config: { autoCreateTabs: boolean; managedOnly: boolean; warmTabs: number } }
   | { t: "HELLO_REFUSED"; reason: string }
   | { t: "BOUND"; sessionId: string; tabId: number; state: string }

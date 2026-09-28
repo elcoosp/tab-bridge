@@ -397,6 +397,58 @@ test("same-session overlap -> 409, never queued (R6/ADR-7)", async () => {
   }
 });
 
+test("streaming overlap -> 409 session_busy, never flattened to 500", async () => {
+  // Regression: the streaming catch re-mapped BridgeErrors through
+  // mapTurnError, turning non-retryable 409s into retryable 500s — callers
+  // then retried into their own running turn and cascaded.
+  const slow = new ScriptedAdapter();
+  const orig = slow.streamResponse.bind(slow);
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  slow.push({ text: "slow" });
+  slow.streamResponse = async (tab, sink) => {
+    await gate;
+    return orig(tab, sink);
+  };
+  const b2 = new TabBridge(baseConfig(join(dir, "s4.json")), slow);
+  const s2 = createHttpServer({ bridge: b2 });
+  await new Promise<void>((resolve) => s2.listen(0, "127.0.0.1", resolve));
+  const a2 = s2.address() as AddressInfo;
+  const b2u = `http://127.0.0.1:${a2.port}`;
+  try {
+    const p1 = fetch(`${b2u}/v1/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web-chat",
+        stream: true,
+        messages: [{ role: "user", content: "one" }],
+      }),
+      headers: { "x-session-id": "overlap-sse", "content-type": "application/json" },
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    const r2 = await fetch(`${b2u}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "x-session-id": "overlap-sse", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-web-chat",
+        stream: true,
+        messages: [{ role: "user", content: "two" }],
+      }),
+    });
+    assert.equal(r2.status, 409);
+    const j = (await r2.json()) as { error: { code: string } };
+    assert.equal(j.error.code, "session_busy");
+    (release as () => void)();
+    const r1 = await p1;
+    assert.equal(r1.status, 200);
+  } finally {
+    b2.dispose();
+    s2.close();
+  }
+});
+
 test("sessions lifecycle: create, list, delete(204), 404 after delete", async () => {
   const created = await fetch(`${base}/v1/sessions`, { method: "POST" });
   assert.equal(created.status, 201);

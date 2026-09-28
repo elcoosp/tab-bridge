@@ -35,7 +35,7 @@
  * SELECTORS so a DOM drift is a one-bundle change (ADR-8 containment).
  */
 
-const SELECTOR_BUNDLE = "ds-2";
+const SELECTOR_BUNDLE = "ds-3";
 
 /** Extension version, read live from the manifest so the tab console always
  * shows which code is actually running (stale-tab confusion burner). */
@@ -67,6 +67,13 @@ const SSE_IDLE_TIMEOUT_MS = 120_000;
 const RATE_LIMIT_RE =
   /(?:messages?\s*(?:are\s*)?too\s*frequent|too\s*many\s*messages|too\s*many\s*requests|rate[\s_-]*limits?(?:\s*(?:reached|exceeded|hit))?|消息发送过于频繁|发送消息过于频繁|发送太频繁|操作过于频繁|请求过于频繁|频率过高)/i;
 
+/** Labeled action buttons: role=button with a ds-button__content label span. */
+const CONTINUE_RE = /^\s*(continue|继续|继续生成)\s*$/i;
+/** Provider-side halt: clicking Continue resumes the same answer. */
+const MAX_CONTINUES = 5;
+/** Provider outage banner text (exact). */
+const SERVER_DOWN_TEXT = "Server is temporarily unavailable.";
+
 const SELECTORS = {
   composer: [
     'textarea#chat-input',
@@ -90,6 +97,9 @@ const SELECTORS = {
     'button[class*="new-chat"]',
   ],
   messageNodes: [
+    // Field-verified (ds-3): every chat bubble is div.ds-message inside the
+    // virtual list. Legacy fragment selectors kept as fallback.
+    'div.ds-message',
     'div[class*="message-content"]',
     'div[class*="markdown"]',
   ],
@@ -127,6 +137,50 @@ function findAll(selectorList) {
     }
   }
   return out;
+}
+
+/**
+ * The provider's Continue button (answer stopped mid-response):
+ * div[role=button] whose ds-button__content label reads Continue.
+ * Only one is ever present; invisible matches don't count.
+ */
+function findContinueButton() {
+  let els;
+  try {
+    els = document.querySelectorAll('div[role="button"], button');
+  } catch {
+    return null;
+  }
+  for (const el of els) {
+    if (!isVisible(el)) continue;
+    let label = "";
+    try {
+      const span = el.querySelector("span.ds-button__content");
+      label = ((span || el).textContent || "").trim();
+    } catch {
+      continue;
+    }
+    if (label && CONTINUE_RE.test(label)) return el;
+  }
+  return null;
+}
+
+/** Exact provider outage banner (checked only on completion paths, not per tick). */
+function serverDownVisible() {
+  let spans;
+  try {
+    spans = document.querySelectorAll("span");
+  } catch {
+    return false;
+  }
+  for (const el of spans) {
+    try {
+      if ((el.textContent || "").trim() === SERVER_DOWN_TEXT) return true;
+    } catch {
+      /* noop */
+    }
+  }
+  return false;
 }
 
 function sleep(ms) {
@@ -358,6 +412,14 @@ function setComposerValue(el, text) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
   } else {
     el.focus();
+    try {
+      // Clear stale content first: insertText appends, so a left-over
+      // composer would double the prompt (setComposerValue replaces).
+      document.execCommand("selectAll", false, null);
+      document.execCommand("delete", false, null);
+    } catch {
+      /* selection API unavailable — insert anyway */
+    }
     document.execCommand("insertText", false, text);
     el.dispatchEvent(new Event("input", { bubbles: true }));
   }
@@ -645,6 +707,31 @@ function fallbackToDom(t, why) {
   startDomObserver(t);
 }
 
+/**
+ * Provider stopped mid-answer with a Continue button on screen: click it and
+ * keep the SAME turn going (same reqId, append-only deltas). The continuation
+ * is a fresh completion POST, so the hook is re-armed to catch it. Bounded:
+ * returns false when no button is present or the budget is spent.
+ */
+function maybeContinue(t, why) {
+  if (!t || t.finished || (t.continues | 0) >= MAX_CONTINUES) return false;
+  const btn = findContinueButton();
+  if (!btn) return false;
+  t.continues = (t.continues | 0) + 1;
+  t.awaitContinue = Date.now();
+  dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
+  try {
+    btn.click();
+  } catch {
+    /* click-through fallback below */
+  }
+  // Re-arm: the continuation POST must be captured even though this arm
+  // already spent its single capture. Async delivery is fine — DeepSeek
+  // takes well over an event-loop turn to fire the request.
+  hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
+  return true;
+}
+
 /** Legacy DOM capture (v1.1 logic): observer + stability tick. Used only
  * when the SSE hook is absent or produced nothing. */
 function startDomObserver(t) {
@@ -678,21 +765,62 @@ function startDomObserver(t) {
     // without corrupting the bridge's holdback buffer — ignore it.
   };
 
-  /** Reply text: only nodes that appeared AFTER our prompt was submitted. */
+  /** Reply text: only nodes that appeared AFTER our prompt was submitted.
+   * Prefers the dedicated answer node (thinking excluded structurally);
+   * otherwise strips thinking subtrees from a clone (never mutates the page).
+   * Our own injected prompt (TOOL RESULTS / ASSISTANT CUE block) is never a
+   * reply, even when it renders after the baseline. */
   function replyText() {
     const nodes = conversationNodes();
-    if (nodes.length > t.baseCount) {
-      return nodes[nodes.length - 1].textContent || "";
+    if (nodes.length <= t.baseCount) return null; // no reply bubble yet
+    const last = nodes[nodes.length - 1];
+    let text = "";
+    try {
+      const main =
+        last.querySelector && last.querySelector("div.ds-assistant-message-main-content");
+      if (main) {
+        text = main.textContent || "";
+      } else {
+        const clone = last.cloneNode(true);
+        const thinkers = clone.querySelectorAll("div.ds-think-content");
+        thinkers.forEach((n) => {
+          try {
+            n.remove();
+          } catch {
+            /* noop */
+          }
+        });
+        text = clone.textContent || "";
+      }
+    } catch {
+      return null;
     }
-    return null; // no reply bubble yet
+    if (text.startsWith("=== TOOL RESULTS ===")) return null; // our own echo
+    return text;
   }
 
   const domDone = () => {
     const composer = findFirst(SELECTORS.composer);
     const sendBtn = composer ? findSendButton(composer) : null;
     const stopBtn = findFirst(SELECTORS.stopButton);
-    // done = generation over: stop control gone AND send enabled again
+    // done = generation over: stop control gone AND send enabled again.
+    // A Continue button means halted, not done (handled before this).
+    if (findContinueButton()) return false;
     return !stopBtn && sendBtn && isEnabled(sendBtn);
+  };
+
+  /** Stable text + done controls: Continue first, server-down next, else done. */
+  const settleTurn = () => {
+    if (maybeContinue(t, "dom-settled")) {
+      stableSince = 0;
+      tickStableSince = 0;
+      return;
+    }
+    if (serverDownVisible()) {
+      finishTurn(false, "dom-error", "provider: server temporarily unavailable");
+      return;
+    }
+    finishTurn(true);
   };
 
   const observer = new MutationObserver(() => {
@@ -706,7 +834,7 @@ function startDomObserver(t) {
       stableSince = 0;
     } else if (text.length === lastLen && sawGrowth) {
       if (!stableSince) stableSince = Date.now();
-      else if (Date.now() - stableSince > 400 && domDone()) finishTurn(true);
+      else if (Date.now() - stableSince > 400 && domDone()) settleTurn();
     }
   });
   observer.observe(document.body, { childList: true, subtree: true, characterData: true });
@@ -714,20 +842,31 @@ function startDomObserver(t) {
   // Secondary completion detector: a reply that finishes entirely inside the
   // baseline-settle window never shows growth to the observer, so the tick
   // checks "text settled + stop control gone + send enabled" on its own.
+  // It also bounds the silent case: a reply bubble that never appears at all
+  // (submitted but the provider never rendered) fails here within 60s
+  // instead of hanging to the turn deadline.
+  let nullSince = 0;
   const tick = setInterval(() => {
     if (t.finished) {
       clearInterval(tick);
       return;
     }
     const text = replyText();
-    if (text === null) return;
+    if (text === null) {
+      if (!nullSince) nullSince = Date.now();
+      else if (Date.now() - nullSince > 60000) {
+        finishTurn(false, "submit-failed", "reply bubble never appeared within 60s of submit");
+      }
+      return;
+    }
+    nullSince = 0;
     if (text.length !== tickLen) {
       tickLen = text.length;
       tickStableSince = Date.now();
       return;
     }
     if (tickStableSince && Date.now() - tickStableSince > 600 && text.length > 0 && domDone()) {
-      finishTurn(true);
+      settleTurn();
     }
   }, 1000);
 
@@ -801,7 +940,21 @@ window.addEventListener("message", (ev) => {
         break;
       }
       if (!finalText && t.emitted.length === 0) {
+        if (serverDownVisible()) {
+          finishTurn(false, "dom-error", "provider: server temporarily unavailable");
+          break;
+        }
         fallbackToDom(t, "completion stream closed without text");
+        break;
+      }
+      // Provider halted mid-answer with more available: resume in this turn.
+      if (maybeContinue(t, "sse-complete")) break;
+      if (d.hintError && /length|max_tokens|truncat|too_long/i.test(d.hintError.finishReason || "")) {
+        // Length halt but no button on screen yet (it renders late): hold the
+        // turn open briefly. Backdated so the watchdog re-checks in ~10s —
+        // clicks if it appeared, else finishes with the partial answer.
+        dbg("length halt, waiting for Continue button");
+        t.awaitContinue = Date.now() - 20000;
         break;
       }
       finishTurn(true);
@@ -850,7 +1003,22 @@ function startWatchdog(t) {
       return;
     }
     if (t.mode === "sse" && t.lastSseAt && now - t.lastSseAt > SSE_IDLE_TIMEOUT_MS) {
-      finishTurn(false, "timeout", "SSE stream idle >120s");
+      // A visible Continue means halted, not dead: resume instead of timing out.
+      if (!maybeContinue(t, "sse-idle")) {
+        finishTurn(false, "timeout", "SSE stream idle >120s");
+      }
+      return;
+    }
+    // A Continue click that produced no stream within 30s: the click either
+    // missed the hook window or the provider stalled. Button back: try again
+    // (bounded); button gone with nothing new: end with what we captured.
+    // Stream activity after the click disarms this entirely.
+    if (t.awaitContinue && t.lastSseAt < t.awaitContinue && now - t.awaitContinue > 30000) {
+      t.awaitContinue = 0;
+      if (!maybeContinue(t, "continue-no-stream")) {
+        if (t.emitted.length > 0) finishTurn(true);
+        else fallbackToDom(t, "continuation produced no stream");
+      }
     }
   }, 2000);
 }
@@ -895,6 +1063,8 @@ async function handleTurn(msg) {
     watchdog: null,
     domObserver: null,
     domTick: null,
+    continues: 0, // provider Continue clicks this turn (bounded)
+    awaitContinue: 0, // timestamp of the last Continue click awaiting stream
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
@@ -982,6 +1152,12 @@ async function handleReset(msg) {
         report("RESET_OK", {});
         return;
       }
+      // No control: try the app's new-chat keyboard shortcut before giving
+      // up. A successful shortcut resets in place — no navigation, no tab
+      // reload, no bfcache churn (navigation churn correlates 1:1 with
+      // worker-link deaths). Verified exactly like a click; on failure the
+      // worker falls back to navigate-home as before.
+      if (await tryShortcutReset()) return;
       diagnoseReset();
       report("RESET_FAILED", { detail: "new-chat control not found" });
       return;
@@ -1003,6 +1179,47 @@ async function handleReset(msg) {
   } catch (e) {
     report("RESET_FAILED", { detail: String(e && e.message) });
   }
+}
+
+/**
+ * New-chat via the app's keyboard shortcut (Ctrl+Shift+O on DeepSeek web).
+ * Synthetic key events only reach page listeners, never browser UI, so the
+ * worst case is a no-op — and the verify loop below rejects anything but an
+ * actually-emptied conversation. Returns true on verified reset.
+ */
+async function tryShortcutReset() {
+  try {
+    const target = document.activeElement || document.body;
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "O",
+        code: "KeyO",
+        ctrlKey: true,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    await sleep(300);
+    try {
+      const now = conversationNodes().length;
+      const onHome = location.pathname === "/";
+      if (now === 0 || onHome) {
+        dbg("reset confirmed via keyboard shortcut");
+        report("RESET_OK", {});
+        return true;
+      }
+    } catch {
+      /* DOM in flux — keep waiting */
+    }
+    if (Date.now() > deadline) break;
+  }
+  return false;
 }
 
 /**

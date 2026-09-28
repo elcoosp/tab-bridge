@@ -3,7 +3,7 @@
  * plans. Deterministic and total; pure logic over (row, incomingMessages).
  */
 import type { ChatMessage } from "./canonical.js";
-import { canonical } from "./canonical.js";
+import { canonical, stripSystemPrefix } from "./canonical.js";
 import { firstMismatch, hashCanonical, CHAIN_SCHEME } from "./hashchain.js";
 
 export type PlanName = "SEED" | "INJECT_TEXT" | "INJECT_RESULTS" | "RESET_RESEED";
@@ -48,6 +48,11 @@ export function classify(row: ClassifierRow, messages: readonly ChatMessage[]): 
 }
 
 function classifyBase(row: ClassifierRow, messages: readonly ChatMessage[]): TurnPlan {
+  // Continuity starts after an optional leading system message (spec 5.1 /
+  // scheme v3): clients re-render system context every turn, so it is
+  // verified nowhere and injected nowhere — only user/assistant/tool deltas
+  // drive plans.
+  messages = stripSystemPrefix(messages);
   // -- trivial leaves -------------------------------------------------------
   if (!row.hasRow) return { plan: "SEED", reason: "no-session-row" };
   if (row.scheme !== CHAIN_SCHEME) return { plan: "SEED", reason: "scheme-mismatch" };
@@ -108,15 +113,17 @@ function classifyBase(row: ClassifierRow, messages: readonly ChatMessage[]): Tur
     return { plan: "RESET_RESEED", reason: "mixed-delta-shape" };
   }
 
-  // Fast path 3: text-echo continuation — the delta starts with the assistant
-  // message the tab itself produced (plain text, no calls) followed by exactly
-  // one new user message. The echo is skipped; only the user text is injected.
+  // Fast path 3: text-echo continuation — the delta starts with a plain-text
+  // assistant message followed by exactly one new user message. The echo is
+  // skipped; only the user text is injected. Unlike tool echoes, the text is
+  // NOT verified against tabHash: the tab is append-only ground truth, so
+  // appending user text is coherent even when the client's echo copy differs
+  // (reworded/stale transcript, compaction). The strict check only guards
+  // tool calls, where misattachment corrupts semantics.
   if (
     delta.length === 2 &&
     delta[0].role === "assistant" &&
     !hasToolCalls(delta[0]) &&
-    row.tabHash !== null &&
-    messageHash(delta[0]) === row.tabHash &&
     delta[1].role === "user"
   ) {
     return {

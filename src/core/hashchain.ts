@@ -5,9 +5,9 @@
  */
 import { createHash } from "node:crypto";
 import type { ChatMessage } from "./canonical.js";
-import { canonical } from "./canonical.js";
+import { canonical, stripSystemPrefix } from "./canonical.js";
 
-export const CHAIN_SCHEME = 1;
+export const CHAIN_SCHEME = 3;
 export const HASH_HEX_LEN = 32; // 16 bytes
 
 export function blake2b16(data: string): Buffer {
@@ -72,7 +72,7 @@ export function firstMismatch(
 export function foldAll(messages: readonly ChatMessage[]): string[] {
   const chain: string[] = [];
   let prev: string | null = null;
-  for (const m of messages) {
+  for (const m of stripSystemPrefix(messages)) {
     prev = hashCanonical(prev, canonical(m));
     chain.push(prev);
   }

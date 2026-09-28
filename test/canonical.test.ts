@@ -32,6 +32,19 @@ test("assistant with tool_calls renders wire-independently", () => {
   assert.equal(canonical(m), 'A|=> call ls({"a":1,"b":2})#call_ab');
 });
 
+test("assistant prose is excluded when tool_calls are present (scheme v2)", () => {
+  // OpenAI clients legally replay {content: null, tool_calls} while the tab
+  // produced prose + calls. Both must hash identically or every follow-up
+  // turn misclassifies as fabricated-assistant-echo.
+  const calls: ChatMessage["tool_calls"] = [
+    { id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } },
+  ];
+  const withProse: ChatMessage = { role: "assistant", content: "Need answer user.", tool_calls: calls };
+  const nulled: ChatMessage = { role: "assistant", content: null, tool_calls: calls };
+  assert.equal(canonical(withProse), canonical(nulled));
+  assert.equal(canonical(withProse), 'A|=> call get_weather({"city":"Paris"})#call_1');
+});
+
 test("array content joins text parts with newline", () => {
   const m: ChatMessage = {
     role: "user",

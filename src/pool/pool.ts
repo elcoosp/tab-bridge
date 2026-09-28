@@ -6,7 +6,7 @@
  */
 import { EventEmitter } from "node:events";
 import { randomId } from "../util/async.js";
-import type { WsConnection } from "../link/wsserver.js";
+import type { WsConnection, WsCloseInfo } from "../link/wsserver.js";
 import { parseWorkerMessage, encodeIntent, WORKER_PROTOCOL, type WorkerIntent, type WorkerObservation } from "../link/protocol.js";
 import type { HealthState } from "../adapter/types.js";
 import { log } from "../log.js";
@@ -38,10 +38,20 @@ export class WorkerPool extends EventEmitter {
   private inflight = new Set<Inflight>();
   private seq = 0;
   private healthByTab = new Map<number, HealthState>();
+  /** Connection serials: alternating attach serials in the log prove a
+   * duplicate-worker fight vs one flapping link. */
+  private connSerial = 0;
+  private activeSerial = 0;
   private readonly config: PoolConfig;
 
   constructor(config: PoolConfig) {
     super();
+    // One in-flight pool request holds exactly one "raw" listener; kod retry
+    // storms legitimately hold dozens concurrently. The default threshold of
+    // 10 fires scary-but-benign MaxListeners warnings under load — verified
+    // leak-free (every settle path removes its listener), so raise it while
+    // still catching genuine runaway growth.
+    this.setMaxListeners(64);
     this.config = config;
   }
 
@@ -57,12 +67,61 @@ export class WorkerPool extends EventEmitter {
     return [...this.healthByTab.entries()].map(([tabId, state]) => ({ tabId, state }));
   }
 
-  /** Wire a freshly upgraded connection; sends the effective pool config. */
+  /**
+   * Wire a freshly upgraded connection; sends the effective pool config.
+   * First live worker wins: a duplicate extension instance (second Chrome
+   * profile, dev+prod side by side) would otherwise steal the link back and
+   * forth on every reconnect, an alternating down/up storm that fails every
+   * in-flight turn. A newcomer is refused while ANY incumbent socket is open:
+   * a liveness grace was tried and failed, because during a total outage
+   * there is no traffic to keep the incumbent fresh and the fight never
+   * settles. A dead incumbent delivers a socket close, which clears the slot.
+   */
   attach(conn: WsConnection): void {
+    if (this.conn && this.conn.isOpen) {
+      // Peek at the newcomer's HELLO before refusing: the refusal log then
+      // names WHICH worker was turned away. One repeating instance id = a
+      // single stale copy to disable; rotating ids = several live copies
+      // (profiles/channels). Close is guaranteed by the timer even if the
+      // newcomer never speaks.
+      const guard = setTimeout(() => {
+        try {
+          conn.close(1013);
+        } catch {
+          /* ignore */
+        }
+      }, 5000);
+      conn.once("message", (raw: string) => {
+        clearTimeout(guard);
+        let instance = "unknown";
+        let extVersion = "unknown";
+        try {
+          const m = JSON.parse(raw) as { t?: string; instance?: string; extVersion?: string };
+          if (m && m.t === "HELLO") {
+            if (typeof m.instance === "string" && m.instance) instance = m.instance;
+            if (typeof m.extVersion === "string" && m.extVersion) extVersion = m.extVersion;
+          }
+        } catch {
+          /* not a HELLO — refuse unnamed */
+        }
+        log.warn("worker.refused-duplicate", { remote: conn.remoteAddress, instance, extVersion });
+        try {
+          conn.sendText(
+            JSON.stringify({ t: "HELLO_REFUSED", reason: "another worker holds a live link" })
+          );
+        } catch {
+          /* ignore */
+        }
+        conn.close(1013);
+      });
+      return;
+    }
     this.detach("replaced");
     this.conn = conn;
+    this.activeSerial = ++this.connSerial;
+    log.info("worker.attach", { serial: this.activeSerial, remote: conn.remoteAddress });
     conn.on("message", (raw: string) => this.onMessage(raw));
-    conn.on("close", () => this.onDown());
+    conn.on("close", (info: WsCloseInfo) => this.onDown(info));
     this.send({ t: "HELLO_OK", v: WORKER_PROTOCOL, config: this.config } as unknown as WorkerIntent);
   }
 
@@ -80,20 +139,36 @@ export class WorkerPool extends EventEmitter {
     this.emit("event", { type: "worker-down" } satisfies PoolEvent);
   }
 
-  /** Bind a session to a managed tab. */
+  /**
+   * Bind a session to a managed tab. A transient `no-tab-available` (worker
+   * still handshaking, tab pool momentarily empty) does NOT fail: the worker
+   * may be seconds away from readiness, so the bind waits out the deadline.
+   * Only terminal failures (rate-limited cooldown) reject early. A timeout
+   * still surfaces as bind-failed (503 pool_exhausted downstream), never a
+   * bare timeout string.
+   */
   async bind(sessionId: string, timeoutMs: number): Promise<{ tabId: number; state: string }> {
-    const obs = await this.request<{ t: "BOUND"; sessionId: string; tabId: number; state: string }>(
-      { t: "BIND", sessionId },
-      "BIND",
-      timeoutMs,
-      (o) => o?.t === "BOUND" && (o as { sessionId: string }).sessionId === sessionId,
-      (o) =>
-        o?.t === "BIND_FAILED" && (o as { sessionId: string }).sessionId === sessionId
-          ? new Error(`bind-failed: ${(o as { code?: string }).code ?? "unknown"}`)
-          : null
-    );
-    this.healthByTab.set(obs.tabId, "ok");
-    return { tabId: obs.tabId, state: obs.state };
+    try {
+      const obs = await this.request<{ t: "BOUND"; sessionId: string; tabId: number; state: string }>(
+        { t: "BIND", sessionId },
+        "BIND",
+        timeoutMs,
+        (o) => o?.t === "BOUND" && (o as { sessionId: string }).sessionId === sessionId,
+        (o) => {
+          if (o?.t !== "BIND_FAILED" || (o as { sessionId: string }).sessionId !== sessionId) return null;
+          const code = (o as { code?: string }).code ?? "unknown";
+          if (code.includes("rate-limited")) return new Error(`bind-failed: ${code}`);
+          return null; // no-tab-available and friends: keep waiting for BOUND
+        }
+      );
+      this.healthByTab.set(obs.tabId, "ok");
+      return { tabId: obs.tabId, state: obs.state };
+    } catch (e) {
+      if (e instanceof Error && /timed out after/.test(e.message)) {
+        throw new Error(`bind-failed: no-tab-available (timeout after ${timeoutMs}ms)`);
+      }
+      throw e;
+    }
   }
 
   release(sessionId: string, timeoutMs: number): Promise<unknown> {
@@ -130,9 +205,9 @@ export class WorkerPool extends EventEmitter {
     );
   }
 
-  resetIntent(reqId: string, timeoutMs: number): Promise<"ok" | "timeout"> {
+  resetIntent(reqId: string, timeoutMs: number, tabId?: number): Promise<"ok" | "timeout"> {
     return this.request<{ t: "RESET_OK" | "RESET_TIMEOUT" }>(
-      { t: "RESET", reqId },
+      { t: "RESET", reqId, ...(tabId !== undefined ? { tabId } : {}) },
       "RESET",
       timeoutMs,
       (o) =>
@@ -267,7 +342,7 @@ export class WorkerPool extends EventEmitter {
     if (!o) return;
     this.traceObservation(o);
     if (o.t === "HELLO") {
-      const hello = o as unknown as { t: "HELLO"; v: number; ext: string };
+      const hello = o as unknown as { t: "HELLO"; v: number; ext: string; extVersion?: string; instance?: string };
       if (hello.v !== WORKER_PROTOCOL) {
         this.conn?.sendText(
           JSON.stringify({ t: "HELLO_REFUSED", reason: `protocol version ${hello.v} not supported` })
@@ -276,7 +351,7 @@ export class WorkerPool extends EventEmitter {
         return;
       }
       this.info = { ext: hello.ext, connectedAt: Date.now() };
-      log.info("worker.up", { ext: hello.ext });
+      log.info("worker.up", { ext: hello.ext, extVersion: hello.extVersion ?? "unknown", instance: hello.instance ?? "unknown" });
       this.emit("event", { type: "worker-up", info: this.info } satisfies PoolEvent);
     }
     if (o.t === "HEALTH") {
@@ -352,12 +427,18 @@ export class WorkerPool extends EventEmitter {
     }
   }
 
-  private onDown(): void {
+  private onDown(info?: WsCloseInfo): void {
     if (this.conn === null) return;
+    const serial = this.activeSerial;
     this.conn = null;
     this.info = null;
     this.healthByTab.clear();
-    log.warn("worker.down", { reason: "socket closed" });
+    log.warn("worker.down", {
+      reason: "socket closed",
+      serial,
+      code: info?.code ?? null,
+      source: info?.source ?? "unknown",
+    });
     this.failAllPending(new Error("worker link lost (socket closed)"));
     this.emit("event", { type: "worker-down" } satisfies PoolEvent);
   }

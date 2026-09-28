@@ -155,6 +155,10 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
     } catch (e) {
       this.closeBuffer(reqId);
       this.pendingByTab.delete(tab.tabId);
+      // The intent failed while the ACCEPTED-watcher was still pending
+      // (link drop between queue and ack): it would otherwise reject later
+      // with nobody awaiting it — an unhandled rejection that kills node.
+      sendPromise.catch(() => {});
       throw e;
     }
   }
@@ -217,7 +221,8 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
     try {
       // 45s matches the worker RESET_TIMEOUT_MS: a control-not-found
       // fallback navigates the tab home and waits out a full page load.
-      return await this.pool.resetIntent(reqId, 45_000);
+      // The tab is addressed explicitly so other sessions' tabs are untouched.
+      return await this.pool.resetIntent(reqId, 45_000, tab.tabId);
     } catch {
       return "failed";
     }

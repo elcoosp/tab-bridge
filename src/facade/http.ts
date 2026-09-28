@@ -361,7 +361,13 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
     sse.done();
     sse.close();
   } catch (e) {
-    const be = mapTurnError(e);
+    // Preserve typed errors (409 session_busy, 429 rate_limited): flattening
+    // them through mapTurnError turns a non-retryable 409 into a retryable
+    // 500, and callers retry into their own running turn.
+    // Preserve typed errors (409 session_busy, 429 rate_limited): flattening
+    // them through mapTurnError turns a non-retryable 409 into a retryable
+    // 500, and callers retry into their own running turn.
+    const be = e instanceof BridgeError ? e : mapTurnError(e);
     sse.fail(be.status, be.body(), be.retryAfter);
   }
 }

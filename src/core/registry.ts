@@ -130,6 +130,10 @@ export class SessionRegistry {
     row.turns += 1;
     row.state = "active";
     row.pendingReset = false;
+    // Adopt the current scheme: without this, a migrated row (scheme 1/2
+    // chain reseeded under scheme 3) mismatches forever and every turn
+    // reseeds instead of continuing.
+    row.scheme = CHAIN_SCHEME;
     this.touch(row);
     if (!row.ephemeral) this.opts.persist?.append(row);
   }

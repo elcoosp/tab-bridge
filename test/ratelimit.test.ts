@@ -12,7 +12,7 @@ import type { AddressInfo } from "node:net";
 import { mapTurnError, RATE_LIMIT_COOLDOWN_SEC } from "../src/facade/errors.js";
 import { classify, messageHash, type ClassifierRow } from "../src/core/classifier.js";
 import { SessionRegistry } from "../src/core/registry.js";
-import { foldAll } from "../src/core/hashchain.js";
+import { foldAll, CHAIN_SCHEME } from "../src/core/hashchain.js";
 import { TabBridge } from "../src/bridge.js";
 import { createHttpServer } from "../src/facade/http.js";
 import { ScriptedAdapter } from "../src/adapter/scripted.js";
@@ -65,7 +65,7 @@ describe("mapTurnError: rate limits map to 429 with a ~20 min Retry-After", () =
 function row(partial: Partial<ClassifierRow> & { chain?: string[] }): ClassifierRow {
   return {
     hasRow: true,
-    scheme: 1,
+    scheme: CHAIN_SCHEME,
     mode: "stateful",
     chain: partial.chain ?? [],
     tabHash: partial.tabHash ?? null,

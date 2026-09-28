@@ -16,12 +16,20 @@ export function acceptKey(key: string): string {
 
 export type WsMessage = { data: string };
 
+/** How a worker socket died: WS close code + where it was observed. */
+export interface WsCloseInfo {
+  code: number | null;
+  source: string;
+}
+
 export class WsConnection extends EventEmitter {
   private socket: Duplex;
   private buffer: Buffer = Buffer.alloc(0);
   private fragParts: Buffer[] = [];
   private fragOpcode = -1;
   private _open = true;
+  private closeCode: number | null = null;
+  private closeSource = "";
   readonly remoteAddress: string;
   readonly url: string;
 
@@ -31,9 +39,13 @@ export class WsConnection extends EventEmitter {
     this.remoteAddress = req.socket.remoteAddress ?? "unknown";
     this.url = req.url ?? "/";
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
-    socket.on("error", () => this.doClose());
-    socket.on("close", () => this.doClose());
-    socket.on("end", () => this.doClose());
+    socket.on("error", (err: unknown) =>
+      this.doClose(1011, `socket-error: ${(err as Error)?.message ?? "unknown"}`)
+    );
+    socket.on("close", (hadError: boolean) =>
+      this.doClose(hadError ? 1006 : 1000, hadError ? "tcp-error" : "tcp-close")
+    );
+    socket.on("end", () => this.doClose(1000, "tcp-end"));
   }
 
   get isOpen(): boolean {
@@ -50,7 +62,7 @@ export class WsConnection extends EventEmitter {
     this.writeFrame(0x9, payload);
   }
 
-  close(code = 1000): void {
+  close(code = 1000, reason = ""): void {
     if (!this._open) return;
     const body = Buffer.alloc(2);
     body.writeUInt16BE(code, 0);
@@ -59,18 +71,22 @@ export class WsConnection extends EventEmitter {
     } catch {
       /* ignore */
     }
-    this.doClose();
+    this.doClose(code, reason || "local-close");
   }
 
-  private doClose(): void {
+  /** Close reason tracking: first signal wins. */
+  private doClose(code: number | null = null, source = ""): void {
     if (!this._open) return;
     this._open = false;
+    if (code !== null) this.closeCode = code;
+    if (source) this.closeSource = source;
     try {
       this.socket.destroy();
     } catch {
       /* ignore */
     }
-    this.emit("close");
+    const info: WsCloseInfo = { code: this.closeCode, source: this.closeSource || "unknown" };
+    this.emit("close", info);
   }
 
   private writeFrame(opcode: number, payload: Buffer): void {
@@ -162,9 +178,16 @@ export class WsConnection extends EventEmitter {
         if (f.opcode === 0x1) this.emit("message", f.payload.toString("utf8"));
         break;
       }
-      case 0x8:
-        this.close();
+      case 0x8: {
+        let code: number | null = null;
+        let reason = "close-frame";
+        if (f.payload.length >= 2) {
+          code = f.payload.readUInt16BE(0);
+          reason = f.payload.subarray(2).toString("utf8").slice(0, 120) || "close-frame";
+        }
+        this.close(code ?? 1005, reason);
         break;
+      }
       case 0x9:
         this.writeFrame(0xa, f.payload); // pong
         break;
