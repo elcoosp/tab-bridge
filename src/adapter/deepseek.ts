@@ -101,10 +101,6 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
   }
 
   async ensureReady(tab: ManagedTab, timeoutMs: number): Promise<Ready> {
-    // PONG snapshots may temporarily miss the tab (worker SW restart wipes
-    // its tables; pings may also fail outright on a link flap). Both are
-    // transient: keep polling until the deadline, then report tab-not-known
-    // so the engine re-binds instead of surfacing a raw ping timeout.
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const remaining = deadline - Date.now();
@@ -114,8 +110,13 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
         const me = tabs.find((t) => t.tabId === tab.tabId);
         if (me) {
           if (me.health === "ok") return { ok: true };
-          return { ok: false, detail: me.health };
+          // Terminal for this window: map to 429/5xx immediately.
+          if (me.health !== "degraded") return { ok: false, detail: me.health };
+          // Transient (port reconnect / SW restart): keep polling.
         }
+        // Back off before the next ping — a hot loop here hammers the
+        // worker for the entire deadline when the tab is simply absent.
+        await new Promise((r) => setTimeout(r, 250));
       } catch (e) {
         if (e instanceof TimeoutError) return { ok: false, detail: "ensureReady-timeout" };
         if (Date.now() >= deadline) return { ok: false, detail: "tab-not-known-to-worker" };
@@ -250,5 +251,10 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
 /** Normalize an ERROR observation into a mappable error string. */
 function errText(ev: Extract<WorkerObservation, { t: "ERROR" }>): string {
   const base = `turn-error:${ev.code}`;
-  return ev.detail ? `${base}:${ev.detail}` : base;
+  const detail = ev.detail ? `:${ev.detail}` : "";
+  const retry =
+    typeof ev.retryAfterSec === "number" && ev.retryAfterSec > 0
+      ? `;retry-after=${ev.retryAfterSec}`
+      : "";
+  return `${base}${detail}${retry}`;
 }
