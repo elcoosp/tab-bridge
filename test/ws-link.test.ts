@@ -128,6 +128,7 @@ function config(db: string, over: Partial<Config> = {}): Config {
     turnTimeoutMs: 5_000,
     bindTimeoutMs: 3_000,
     maxPromptChars: 1_000_000,
+    holdbackCeiling: 65_536,
     ...over,
   };
 }
