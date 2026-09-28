@@ -32,6 +32,8 @@ export interface SessionRow {
 
 export interface PersistStore {
   append(row: SessionRow): void;
+  /** Optional housekeeping: rewrite the journal down to the given rows. */
+  compact?(rows: SessionRow[]): void;
 }
 
 export interface RegistryOptions {
@@ -46,6 +48,7 @@ export class SessionRegistry {
   private rows = new Map<string, SessionRow>();
   private locks = new Map<string, Mutex>();
   private sweepTimer: NodeJS.Timeout | null = null;
+  private sweepCount = 0;
   private readonly opts: RegistryOptions;
 
   constructor(opts: RegistryOptions) {
@@ -195,6 +198,17 @@ export class SessionRegistry {
     for (const id of expired) {
       this.delete(id);
       this.opts.onEvict?.(id);
+    }
+    this.sweepCount += 1;
+    if (expired.length > 0 || this.sweepCount % 30 === 0) {
+      // Rewrite the journal: after expirations, and periodically even
+      // without them, so a long-lived process does not grow the file
+      // one line per commit forever.
+      try {
+        this.opts.persist?.compact?.(this.list());
+      } catch {
+        /* best effort */
+      }
     }
     return expired;
   }
