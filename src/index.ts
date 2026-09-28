@@ -8,15 +8,33 @@ import { createHttpServer } from "./facade/http.js";
 import { TabBridge } from "./bridge.js";
 import { parseServeArgs, usage } from "./config.js";
 import { log } from "./log.js";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+const here = dirname(fileURLToPath(import.meta.url));
+function readPkgVersion(): string {
+  for (const p of [join(here, "../../package.json"), join(here, "../package.json")]) {
+    try {
+      const raw = readFileSync(p, "utf8");
+      const v = (JSON.parse(raw) as { version?: string }).version;
+      if (v) return v;
+    } catch {
+      /* try next */
+    }
+  }
+  return "unknown";
+}
+const pkgVersion: string = readPkgVersion();
 
 function main(argv: string[]): void {
   const [cmd, ...rest] = argv;
   if (cmd === "--help" || cmd === "-h" || cmd === "help" || !cmd) {
     process.stdout.write(usage() + "\n");
-    process.exit(cmd ? 0 : 0);
+    process.exit(0);
   }
   if (cmd === "--version" || cmd === "-v") {
-    process.stdout.write("tab-bridge 1.0.0\n");
+    process.stdout.write("tab-bridge " + pkgVersion + "\n");
     process.exit(0);
   }
   if (cmd !== "serve") {
