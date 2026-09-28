@@ -19,7 +19,7 @@ export type WorkerObservation =
   | { t: "HELLO_OK"; v: number; config: { autoCreateTabs: boolean; managedOnly: boolean; warmTabs: number } }
   | { t: "HELLO_REFUSED"; reason: string }
   | { t: "BOUND"; sessionId: string; tabId: number; state: string }
-  | { t: "BIND_FAILED"; sessionId: string; code: string; detail?: string }
+  | { t: "BIND_FAILED"; sessionId: string; code: string; detail?: string; retryAfterSec?: number }
   | { t: "ACCEPTED"; reqId: string }
   | { t: "FRAGMENT"; reqId: string; seq: number; text: string; full?: boolean }
   | { t: "STATUS"; reqId: string; code: "submitting" | "streaming" | "done" | "aborted" }
