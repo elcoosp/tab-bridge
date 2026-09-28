@@ -13,6 +13,9 @@ export interface Config {
   dbPath: string;
   turnTimeoutMs: number;
   bindTimeoutMs: number;
+  /** Max chars buffered inside an open tool_call fence before it is
+   * flushed as content with a warning (repair round can then react). */
+  holdbackCeiling: number;
   /** Refuse prompts longer than this (chars). No truncation ever: over-cap
    * prompts fail fast with prompt-too-large so callers can compact. */
   maxPromptChars: number;
@@ -31,6 +34,7 @@ export const DEFAULTS: Config = {
   dbPath: "bridge-sessions.json",
   turnTimeoutMs: 240_000,
   bindTimeoutMs: 20_000,
+  holdbackCeiling: 65_536,
   maxPromptChars: 1_000_000,
 };
 
@@ -115,6 +119,12 @@ export function parseServeArgs(argv: string[]): Config {
           throw new Error("--repair-rounds must be an integer 0-3");
         }
         break;
+      case "--holdback-ceiling":
+        cfg.holdbackCeiling = Number(val());
+        if (!Number.isInteger(cfg.holdbackCeiling) || cfg.holdbackCeiling < 1000) {
+          throw new Error("--holdback-ceiling must be an integer >= 1000");
+        }
+        break;
       case "--warm-tabs":
         cfg.warmTabs = Number(val());
         if (!Number.isInteger(cfg.warmTabs) || cfg.warmTabs < 0 || cfg.warmTabs > 8) {
@@ -159,6 +169,7 @@ export function usage(): string {
     "  --managed-only          allocate only worker-created tabs (default true)",
     "  --ttl=<dur>             idle session TTL, e.g. 30m (default 30m)",
     "  --repair-rounds=<n>     bounded tool-protocol repair rounds 0-3 (default 1)",
+    "  --holdback-ceiling=<n>  max chars held inside an open tool_call fence (default 65536)",
     "  --warm-tabs=<n>         pre-created managed tabs 0-8 (default 0)",
     "  --db=<path>             session journal path (default ./bridge-sessions.json)",
     "  --turn-timeout-ms=<n>   per-turn observation deadline (default 240000)",
