@@ -296,7 +296,9 @@ async function main() {
     );
     const s = await req("GET", "/v1/sessions/e2e-a");
     eq(s.status, 200, "session visible via GET /v1/sessions/:id");
-    eq(s.json.chain_length, 2, "chain = system + user");
+    // scheme v3: the leading system message is never chained (clients
+    // re-render it every turn), so the chain holds the user message only.
+    eq(s.json.chain_length, 1, "chain = user (system is not chained)");
   });
 
   // -- S06 ------------------------------------------------------------------
@@ -320,7 +322,7 @@ async function main() {
     eq(turn.text, USER2, "prompt is ONLY the new user text (echo skipped)");
     eq(fake.resets, 0, "no RESET intent (chain continuation, tab untouched)");
     const s = await req("GET", "/v1/sessions/e2e-a");
-    eq(s.json.chain_length, 4, "chain grew to 4");
+    eq(s.json.chain_length, 3, "chain grew to 3 (user + assistant + user; system never chained)");
     eq(s.json.turns, 2, "two turns committed");
   });
 
@@ -506,6 +508,7 @@ async function main() {
     const dt = Date.now() - t0;
     eq(r.status, 502, "mid-turn worker death -> 502 upstream_failure");
     ok(dt >= TURN_MS - 500, `turn deadline respected (${dt}ms >= ${TURN_MS}ms)`);
+    fake.close(); // release the link, else the fresh worker is refused as a duplicate
     fake = await connectFake(); // fresh worker for the remaining scenarios
   });
 
@@ -518,7 +521,7 @@ async function main() {
     const list = await req("GET", "/v1/sessions");
     const row = list.json.data.find((s) => s.session_id === "e2e-a");
     ok(row, "session e2e-a survived the restart");
-    eq(row.chain_length, 4, "chain restored (4 messages)");
+    eq(row.chain_length, 3, "chain restored (3 entries: user + assistant + user)");
     const r = await req("POST", "/v1/chat/completions", {
       headers: { "x-session-id": "e2e-a" },
       body: {
