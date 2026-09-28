@@ -116,15 +116,20 @@ export class TabBridge {
           repairRounds: this.config.repairRounds,
           turnTimeoutMs: this.config.turnTimeoutMs,
           bindTimeoutMs: this.config.bindTimeoutMs,
+          holdbackCeiling: this.config.holdbackCeiling,
           bindTab: this.bindTabImpl,
         },
         params.events
       );
       return out;
     } catch (e) {
-      // A turn that fails after submission leaves the tab state unknown:
-      // drop tabHash so the next request re-anchors safely (Chapter 9).
-      if (row.tabId !== null && row.chain.length > 0) {
+      // Only a failure AFTER the tab was addressed leaves tab state
+      // unknown; `markFailed` already handled the row for those. Bind/
+      // readiness failures must leave the chain anchor untouched.
+      const postSubmit = Boolean(
+        (e as Error & { postSubmit?: boolean })?.postSubmit
+      );
+      if (postSubmit && row.tabId !== null && row.chain.length > 0) {
         row.tabHash = null;
       }
       throw e;
