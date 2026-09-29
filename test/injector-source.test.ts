@@ -271,3 +271,23 @@ test("regression: serverDownVisible defers to a visible Continue button", () => 
     "the Continue-button guard must run BEFORE the server-down text scan"
   );
 });
+
+test("regression: Continue is checked before the empty-complete failure path", () => {
+  // Provider halt after streaming only a THINK fragment leaves t.emitted empty
+  // (THINK is suppressed from visible text). Previously the empty-complete
+  // guard fail-fast'd with "completion stream closed without text" while a
+  // Continue button sat unclicked — the bridge then scheduled a RESET_RESEED
+  // that emptied the pool tab. maybeContinue must now be checked first.
+  const idx = SRC.indexOf('case "complete": {');
+  assert.notEqual(idx, -1, '"complete" case not found in injector');
+  const body = SRC.slice(idx, idx + 3500);
+  const maybeIdx = body.indexOf('maybeContinue(t, "sse-complete")');
+  const emptyIdx = body.indexOf("!finalText && t.emitted.length === 0");
+  assert.notEqual(maybeIdx, -1, "maybeContinue(sse-complete) must be present in the complete case");
+  assert.notEqual(emptyIdx, -1, "empty-complete guard must be present in the complete case");
+  assert.ok(
+    maybeIdx < emptyIdx,
+    "maybeContinue(sse-complete) must run BEFORE the empty-complete failure — " +
+      "a halted generation that streamed only THINK has emitted.length === 0"
+  );
+});
