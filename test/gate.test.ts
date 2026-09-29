@@ -3,6 +3,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TurnGate, GateRejectionError } from "../src/core/turngate.js";
 
+// TurnGate unrefs its queue timers so a bridge process with no other
+// pending work can exit cleanly. Under node:test the event loop can
+// otherwise empty before a queue timer fires, failing the test with
+// "Promise resolution is still pending" and cascading to every later test
+// in the file (the first few pass only because their `tick()` helper holds
+// the loop open long enough). Hold the loop open for the file's lifetime.
+const keepAlive = setInterval(() => {}, 1_000);
+test.after(() => clearInterval(keepAlive));
+
 function gate(over: Partial<ConstructorParameters<typeof TurnGate>[0]> = {}): TurnGate {
   return new TurnGate({ maxConcurrent: 2, capacity: 4, queueTimeoutMs: 1_000, ...over });
 }

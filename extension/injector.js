@@ -50,7 +50,7 @@ const INJECTOR_VERSION = (() => {
 /** Prompts at or above this length go through a synthetic paste event so
  * DeepSeek's own paste pipeline (including its paste-to-file conversion)
  * decides how to carry the payload. */
-const PASTE_AS_FILE_THRESHOLD = 8000;
+const PASTE_AS_FILE_THRESHOLD = 4000;
 /** Longest wait for the send button to enable after a paste-to-file. */
 const SUBMIT_READY_TIMEOUT_MS = 90_000;
 /** If no send button was ever found, fall back to Enter after this long. */
@@ -597,13 +597,13 @@ function diagnoseSubmit(composer, sampleText) {
 /** Did the tab react to the submit? (composer cleared / stop shown / bubble).
  * Returns true, false, or "rate-limited" when the provider blocked the send
  * (the notice is transient, so it is scanned inside the poll loop). */
-async function verifySubmitted(composer, baseCount, hadText, timeoutMs) {
+async function verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (; ;) {
     await sleep(250);
     if (submitRateLimitHit(baseCount)) return "rate-limited";
-    if (findFirst(SELECTORS.stopButton)) return true;
-    if (conversationNodes().length > baseCount) return true;
+    if (dsMessageCount() > baseDsCount) return true;
+    if (!stopBefore && findFirst(SELECTORS.stopButton)) return true;
     if (hadText && readComposer(composer).length === 0) return true;
     if (Date.now() > deadline) return false;
   }
@@ -650,8 +650,17 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   const verifyMs = quickVerify ? 2500 : 6000;
   const preCount = conversationNodes().length;
   // Guard against the window right after a previous generation where the
-  // UI swaps stop -> send asynchronously.
-  await waitStableSend(composer, 8000);
+  // UI swaps stop -> send asynchronously. If the pre-check times out, give
+  // the DOM one more grace window; if it is STILL unstable, proceed — the
+  // downstream waitReadyToSubmit polls the live button and the post-click
+  // verify is the real safety net.
+  if (!(await waitStableSend(composer, 8000))) {
+    dbg("waitStableSend timed out; grace re-check before placing text");
+    await sleep(300);
+    if (!(await waitStableSend(composer, 3000))) {
+      dbg("waitStableSend still unstable after grace; proceeding");
+    }
+  }
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
     if (submitRateLimitHit(preCount)) {
@@ -691,6 +700,12 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     };
   }
   const baseCount = conversationNodes().length;
+  // baseDsCount uses the field-verified bubble container ONLY: broad legacy
+  // selectors can grow on a stale render from the previous turn, and a
+  // false-positive there was the root cause of the intermittent
+  // "verified-submit-but-no-stream" failures.
+  const baseDsCount = dsMessageCount();
+  const stopBefore = !!findFirst(SELECTORS.stopButton);
   const hadText = readComposer(composer).length > 0;
   const rateLimitedResult = () => ({
     ok: false,
@@ -706,20 +721,20 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   // reference survives React re-renders, and isEnabled() must read the
   // LIVE class list (BEM "--disabled" included).
   const btnA = findSendButton(composer);
-  const a = clickSend(btnA) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
+  const a = clickSend(btnA) ? await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs) : false;
   if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (a !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (a === true) return { ok: true, mode };
   // Method B: Enter on the composer.
   pressEnter(composer);
-  const b = await verifySubmitted(composer, baseCount, hadText, verifyMs);
+  const b = await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs);
   if (b === "rate-limited" || (b !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (b !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (b === true) return { ok: true, mode };
   // Last resort: re-find the button (the DOM may have re-rendered after the
   // attachment finished processing) and click it if it is now enabled.
   const btn2 = findSendButton(composer);
-  const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, hadText, verifyMs) : false;
+  const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs) : false;
   if (c === "rate-limited" || (c !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (c !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (c === true) return { ok: true, mode };
@@ -743,6 +758,8 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
 /** One active turn per tab. null when idle. */
 let turn = null;
 let sseHookPresent = false;
+/** Timestamp when the last turn ended (settle-floor anchor for the next TURN). */
+let lastTurnEndedAt = 0;
 
 /** Control-channel sender for the MAIN-world hook. */
 function hookPost(msg) {
@@ -791,6 +808,7 @@ function finishTurn(ok, code, detail, aborted, extra) {
   if (t.domTick) clearInterval(t.domTick);
   hookPost({ type: "disarm" });
   turn = null;
+  lastTurnEndedAt = Date.now();
   if (ok) {
     dbg("turn done:", t.reqId, `chars=${t.emitted.length}`, `mode=${t.mode}`);
     report("TURN_DONE", { reqId: t.reqId });
@@ -1181,6 +1199,66 @@ function onPortMessage(msg) {
   }
 }
 
+/**
+ * 15s no-stream window handler. If the bubble container grew (a slow render
+ * beat the stream), hand capture to the DOM observer. Otherwise, when the
+ * composer still holds the text and no bubble rendered, self-heal by
+ * re-running the submit pipeline once (idempotent — no bubble means nothing
+ * to duplicate). Only after the retry does the turn actually fail.
+ */
+async function onNoStream(t, composer, originalText, isRetry) {
+  if (turn !== t || t.finished || t.mode !== "sse-await") return;
+  const domEvidence = dsMessageCount() > (t.dsMessageBase ?? t.submitCount);
+  if (domEvidence) {
+    fallbackToDom(
+      t,
+      isRetry ? "no completion stream within 15s (retry)" : "no completion stream within 15s"
+    );
+    return;
+  }
+  if (!isRetry) {
+    const composerNow = findFirst(SELECTORS.composer);
+    const heldText = composerNow ? readComposer(composerNow) : "";
+    if (composerNow && heldText.length > 0) {
+      dbg("submit-failed: no stream/bubble after 15s — re-submitting (composer still holds text)");
+      if (sseHookPresent) {
+        hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
+      }
+      const retry = await submitPrompt(
+        composerNow,
+        heldText,
+        t.opts.submitWaitMs || SUBMIT_READY_TIMEOUT_MS,
+        true
+      );
+      if (turn === t && !t.finished) {
+        if (retry.ok) {
+          dbg("re-submit accepted; awaiting stream");
+          t.unverified = retry.unverified === true;
+          scheduleNoStreamFallback(t, composerNow, heldText, true);
+          return;
+        }
+        dbg("re-submit not verified by DOM:", retry.detail || retry.code);
+      }
+    }
+  }
+  diagnoseSubmit(composer, originalText);
+  finishTurn(
+    false,
+    "submit-failed",
+    isRetry
+      ? "re-submit failed: no completion stream and no ds-message growth"
+      : "submit not confirmed: no completion stream within 15s and no ds-message growth",
+    false,
+    { userBubbleRendered: false }
+  );
+}
+
+function scheduleNoStreamFallback(t, composer, originalText, isRetry) {
+  t.fallbackTimer = setTimeout(() => {
+    void onNoStream(t, composer, originalText, isRetry);
+  }, SSE_FALLBACK_AFTER_MS);
+}
+
 async function handleTurn(msg) {
   if (turn && !turn.finished) {
     report("TURN_ERROR", {
@@ -1189,6 +1267,10 @@ async function handleTurn(msg) {
       detail: "another turn is still active in this tab",
     });
     return;
+  }
+  const sinceLastTurn = Date.now() - lastTurnEndedAt;
+  if (lastTurnEndedAt > 0 && sinceLastTurn < 300) {
+    await sleep(300 - sinceLastTurn);
   }
   const opts = msg.opts || {};
   const t = {
@@ -1258,28 +1340,7 @@ async function handleTurn(msg) {
     if (t.mode === "dom") {
       startDomObserver(t);
     } else {
-      t.fallbackTimer = setTimeout(() => {
-        if (turn === t && !t.finished && t.mode === "sse-await") {
-          // SSE never attached: the field-verified witness is growth of the
-          // real bubble container (div.ds-message). Loose selectors like
-          // button[class*="stop"] / div[class*="markdown"] false-positive on
-          // unrelated UI, so they must not be used here — a genuine no-op
-          // click then reads as a slow submit and hangs for 60 s.
-          const domEvidence = dsMessageCount() > (t.dsMessageBase ?? t.submitCount);
-          if (domEvidence) {
-            fallbackToDom(t, "no completion stream within 15s");
-          } else {
-            diagnoseSubmit(composer, msg.text);
-            finishTurn(
-              false,
-              "submit-failed",
-              "submit not confirmed: no completion stream within 15s and no ds-message growth",
-              false,
-              { userBubbleRendered: false }
-            );
-          }
-        }
-      }, SSE_FALLBACK_AFTER_MS);
+      scheduleNoStreamFallback(t, composer, msg.text, false);
     }
     startWatchdog(t);
   } catch (e) {
