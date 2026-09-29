@@ -554,7 +554,7 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.37",
+    hookVersion: "1.2.38",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,
@@ -685,6 +685,49 @@
       armed = null;
       return;
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Synchronous arm path.
+  //
+  // The isolated world dispatches this event on window immediately BEFORE
+  // clicking a control that will synchronously fire a new fetch/XHR. Since
+  // `window.postMessage` above is asynchronous (its listener runs on the
+  // next task), the async arm races the continuation POST and loses it:
+  // DeepSeek's Continue click fires /api/v0/chat/completion synchronously
+  // while the hook is still unarmed. A CustomEvent dispatched on window is
+  // delivered synchronously across the world boundary — the arm lands in
+  // this MAIN-world listener BEFORE the click's event handler runs.
+  //
+  // Data is carried via a dataset attribute because Chrome's cross-world
+  // event object does not reliably expose `detail`.
+  // ---------------------------------------------------------------------------
+  window.addEventListener("tab-bridge-sse-arm-sync", () => {
+    let raw = "";
+    try {
+      raw = document.documentElement.dataset.tabBridgeArm || "";
+      delete document.documentElement.dataset.tabBridgeArm;
+    } catch {
+      /* noop */
+    }
+    if (!raw) return;
+    let d;
+    try {
+      d = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!d || typeof d.turnId !== "string") return;
+    armed = {
+      turnId: d.turnId,
+      deadline: Date.now() + (d.timeoutMs || 300000) + 30000,
+      started: false,
+    };
+    diag.arms += 1;
+    diag.lastArm = { turnId: d.turnId, at: new Date().toISOString(), sync: true };
+    diag.fetchesSeenWhileArmed = 0;
+    info("armed (sync) for", d.turnId);
+    post({ type: "arm-ack", turnId: d.turnId });
   });
 
   post({ type: "hello" });

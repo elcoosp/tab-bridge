@@ -1219,6 +1219,28 @@ function hookPost(msg) {
   }
 }
 
+/**
+ * Synchronous arm. window.postMessage is asynchronous — its listener runs
+ * on the next task — so arming via hookPost races any fetch/XHR that a
+ * subsequent synchronous click fires. This path stashes the arm payload on
+ * a DOM attribute and dispatches a CustomEvent on window; the MAIN-world
+ * hook's listener runs synchronously, within the dispatchEvent call, so
+ * the hook is guaranteed armed BEFORE control returns to us. That matters
+ * because DeepSeek's Continue button fires the continuation POST from its
+ * click handler in the same task.
+ */
+function hookArmSync(turnId, timeoutMs) {
+  try {
+    document.documentElement.dataset.tabBridgeArm = JSON.stringify({
+      turnId,
+      timeoutMs: timeoutMs || 300000,
+    });
+    window.dispatchEvent(new Event("tab-bridge-sse-arm-sync"));
+  } catch {
+    /* ignore */
+  }
+}
+
 function emitDelta(t, text) {
   if (!text) return;
   t.emitted += text;
@@ -1331,7 +1353,18 @@ function maybeContinue(t, why) {
   t.continues = (t.continues | 0) + 1;
   t.awaitContinue = Date.now();
   dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
-  // Full pointer sequence, then a keyboard fallback if nothing dispatched.
+  // Arm the hook SYNCHRONOUSLY before clicking. DeepSeek's Continue button
+  // fires /api/v0/chat/completion from within its click handler, in the
+  // same task as the click. window.postMessage (the async path) is
+  // delivered on a later task, so it misses that POST entirely — the hook
+  // is still unarmed when the fetch fires. hookArmSync uses a
+  // CustomEvent on window, whose listener in the MAIN world runs
+  // synchronously within dispatchEvent, guaranteeing the hook is armed
+  // before control returns here. The async arm below is kept as a
+  // belt-and-braces for any MAIN-world hook build that pre-dates the sync
+  // listener.
+  hookArmSync(t.reqId, t.opts.timeoutMs || 240000);
+  hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
   const clicked = syntheticClick(btn);
   const keyboardActivated = clicked ? false : keyboardActivate(btn);
   trace("maybeContinue: activated", {
@@ -1341,10 +1374,6 @@ function maybeContinue(t, why) {
     keyboardActivated,
     label: (btn.textContent || "").trim().slice(0, 40),
   });
-  // Re-arm: the continuation POST must be captured even though this arm
-  // already spent its single capture. Async delivery is fine — DeepSeek
-  // takes well over an event-loop turn to fire the request.
-  hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
   return true;
 }
 
@@ -1720,11 +1749,13 @@ function startWatchdog(t) {
       }
       return;
     }
-    // A Continue click that produced no stream within 30s: the click either
-    // missed the hook window or the provider stalled. Button back: try again
-    // (bounded); button gone with nothing new: end with what we captured.
-    // Stream activity after the click disarms this entirely.
-    if (t.awaitContinue && t.lastSseAt < t.awaitContinue && now - t.awaitContinue > 30000) {
+    // A Continue click that produced no stream: the click either missed the
+    // hook window or the provider stalled. Five seconds is ample for a
+    // synchronous continuation POST to be seen by the hook (the sync arm
+    // now guarantees the hook is armed before the click). One retry, then
+    // end the turn with whatever was already captured — never hang
+    // indefinitely, even if the Continue button persists forever.
+    if (t.awaitContinue && t.lastSseAt < t.awaitContinue && now - t.awaitContinue > 5000) {
       trace("continue-no-stream recovery firing", {
         reqId: t.reqId,
         emitted: t.emitted.length,
@@ -1733,9 +1764,14 @@ function startWatchdog(t) {
         sinceClickMs: now - t.awaitContinue,
       });
       t.awaitContinue = 0;
-      if (!maybeContinue(t, "continue-no-stream")) {
-        if (t.emitted.length > 0) finishTurn(true);
-        else fallbackToDom(t, "continuation produced no stream");
+      const retried = (t.continues | 0) < 2 && maybeContinue(t, "continue-no-stream");
+      if (!retried) {
+        if (t.emitted.length > 0) {
+          dbg("Continue produced no stream within 5s — ending turn with the captured text", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
+          finishTurn(true);
+        } else {
+          fallbackToDom(t, "continuation produced no stream and no captured text");
+        }
       }
     }
   }, 2000);
