@@ -38,6 +38,16 @@ let backoff = RECONNECT_MIN_MS;
 /** Timestamp of the last successful WS open; used to distinguish a flap
  * (short-lived connection → grow backoff) from a stable close (reset). */
 let connectedAt = 0;
+/**
+ * Dedicated pool window for managed tabs. Managed DeepSeek tabs live here
+ * instead of the user's main window, so activating one (which un-throttles
+ * its timers and its DeepSeek paste-to-file pipeline) does not steal OS
+ * focus from whatever the user is looking at in their own window. Created
+ * lazily; persisted in chrome.storage.session across SW restarts but NOT
+ * across browser restarts (stale window IDs would otherwise point at a
+ * different window after Chrome reassigns them).
+ */
+let poolWindowId = null;
 let poolConfig = { autoCreateTabs: false, managedOnly: true, warmTabs: 0 };
 let helloOk = false;
 // Stable per-profile identity (loaded from storage.local at boot, default
@@ -326,6 +336,52 @@ function markHealth(tabId, health, detail) {
   send({ t: "HEALTH", tabId, state: health, ...(detail ? { detail } : {}) });
 }
 
+/**
+ * Return the pool window id, creating the window if needed. A "pool window"
+ * is a normal Chrome window created with focused:false — visible (so its
+ * active tab is NOT intensively throttled) but never stealing OS focus
+ * from the user's own window. Managed tabs are created inside it.
+ */
+async function ensurePoolWindow() {
+  // Cached and still alive?
+  if (poolWindowId !== null) {
+    try {
+      await chrome.windows.get(poolWindowId);
+      return poolWindowId;
+    } catch {
+      poolWindowId = null;
+    }
+  }
+  // Recover from storage.session (survives SW restart, cleared at browser exit).
+  try {
+    const stored = await chrome.storage.session.get({ poolWindowId: null });
+    if (typeof stored.poolWindowId === "number") {
+      await chrome.windows.get(stored.poolWindowId);
+      poolWindowId = stored.poolWindowId;
+      blog("pool window recovered:", poolWindowId);
+      return poolWindowId;
+    }
+  } catch {
+    /* stale id — fall through and create a new window */
+  }
+  // Create it. No URL: the caller (allocateTab) will open its own tab.
+  let win;
+  try {
+    win = await chrome.windows.create({ focused: false, type: "normal" });
+  } catch (e) {
+    blog("pool window create failed:", String((e && e.message) || e));
+    return null;
+  }
+  poolWindowId = win.id;
+  try {
+    await chrome.storage.session.set({ poolWindowId });
+  } catch {
+    /* session storage unavailable — in-memory only */
+  }
+  blog("pool window created:", poolWindowId);
+  return poolWindowId;
+}
+
 async function allocateTab(sessionId) {
   // 1) re-use a free managed tab (skipping rate-limit cooldowns).
   // Foreign tabs are never in tabState, and the managedTabs check below is
@@ -353,7 +409,10 @@ async function allocateTab(sessionId) {
   blog("BIND", "(allocate) creating managed tab...");
   let created;
   try {
-    created = await chrome.tabs.create({ url: START_URL, active: false });
+    const poolWin = await ensurePoolWindow();
+    created = poolWin !== null
+      ? await chrome.tabs.create({ windowId: poolWin, url: START_URL, active: false })
+      : await chrome.tabs.create({ url: START_URL, active: false });
   } catch (e) {
     blog("BIND", "(allocate) chrome.tabs.create threw:", String((e && e.message) || e));
     throw e;
@@ -540,6 +599,18 @@ function handleSend(m) {
     }
   }, 30000);
   blog("SEND", m.reqId, "-> tab", useTab, `(${(m.text || "").length} chars)`);
+  // Activate the tab within its window. The pool window is created with
+  // focused:false, so this does not steal OS focus — but the tab becomes
+  // the active tab of a visible window, which is the tier Chrome does NOT
+  // intensively throttle. Without this, DeepSeek's paste-to-file pipeline
+  // (which drives the attachment conversion through React + timers) runs
+  // at throttled speed in a hidden tab, adding 60–120 s to the first
+  // fragment of large prompts.
+  try {
+    chrome.tabs.update(useTab, { active: true }, () => void chrome.runtime.lastError);
+  } catch {
+    /* tab gone — safePost below will surface it */
+  }
   if (!safePost(useTab, { t: "TURN", reqId: m.reqId, text: m.text, opts: m.opts || {} })) {
     blog("SEND", m.reqId, "-> port died between lookup and send (tab", useTab, ")");
     send({ t: "ERROR", reqId: m.reqId, code: "port-lost", detail: "injector port died on send" });
@@ -851,6 +922,16 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (managedTabs.delete(tabId)) saveManaged();
   for (const [sid, tid] of sessionTab) {
     if (tid === tabId) sessionTab.delete(sid);
+  }
+});
+
+// If the user closes the pool window, drop the cached id so the next
+// allocate creates a fresh one. (Stored session value is cleared too.)
+chrome.windows.onRemoved.addListener((winId) => {
+  if (winId === poolWindowId) {
+    blog("pool window closed by user:", winId, "— will recreate on next allocate");
+    poolWindowId = null;
+    chrome.storage.session.remove("poolWindowId").catch(() => {});
   }
 });
 

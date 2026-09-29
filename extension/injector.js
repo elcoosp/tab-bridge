@@ -671,6 +671,49 @@ const RETRY_LABEL_RE =
  * A quick scan of button-like elements for the retry labels gets us to a
  * correct, provider-side error in ~1s.
  */
+/**
+ * Structural detection for the icon-only retry affordance DeepSeek renders
+ * after a mid-generation halt when the answer is not a Continue scenario.
+ * Shape observed 2026-09-29 (rendered inline next to the last assistant
+ * message, no text label, warning-coloured circle with a reload arrow):
+ *
+ *   <div role="button"
+ *        class="ds-button ds-button--warning ds-button--filled
+ *               ds-button--circle ds-button--xs …">
+ *     <div class="ds-button__background"></div>
+ *     <div class="ds-button__icon …">
+ *       <div class="ds-icon"><svg>…reload path…</svg></div>
+ *     </div>
+ *   </div>
+ *
+ * The `--warning` + `--circle` combination is unique in the DOM (the send
+ * button uses --primary + --circle; warning toasts use --warning without
+ * --circle). Requiring an svg child further distinguishes it from any
+ * future text-only warning button. No label match is attempted — the
+ * control has no visible text, which is exactly why the label-based
+ * RETRY_LABEL_RE missed it and the turn hung.
+ */
+function retryButtonStructuralVisible() {
+  let els;
+  try {
+    els = document.querySelectorAll(
+      'div[role="button"].ds-button--warning.ds-button--circle, ' +
+        'button.ds-button--warning.ds-button--circle'
+    );
+  } catch {
+    return false;
+  }
+  for (const el of els) {
+    if (!isVisible(el)) continue;
+    if (!el.querySelector("svg")) continue;
+    trace("retryButtonStructuralVisible: hit", {
+      label: (el.textContent || "").trim().slice(0, 40),
+    });
+    return true;
+  }
+  return false;
+}
+
 function generationFailedVisible() {
   let els;
   try {
@@ -689,6 +732,12 @@ function generationFailedVisible() {
     if (!text || text.length > 24) continue;
     if (RETRY_LABEL_RE.test(text)) return true;
   }
+  // Fall back to the structural detector for icon-only retry buttons
+  // (warning circle + svg child). DeepSeek switched the retry affordance
+  // from a labelled Continue button to this icon-only control without
+  // sending an SSE `complete`; label-only detection missed it and the
+  // caller hung.
+  if (retryButtonStructuralVisible()) return true;
   return false;
 }
 
