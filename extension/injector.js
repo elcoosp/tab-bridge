@@ -74,8 +74,13 @@ const RATE_LIMIT_RE =
 const CONCURRENCY_RE =
   /(?:another\s+(?:message|response|reply|request|generation)|already\s+(?:being\s+)?generated|generat\w*\s+(?:already\s+)?in\s+progress|one\s+(?:conversation|chat)\s+at\s+a\s+time|please\s+wait[^.\n]{0,40}(?:finish|complete)|已有一条消息|消息正在生成|正在生成中|请等待.{0,20}(?:完成|结束))/i;
 
-/** Labeled action buttons: role=button with a ds-button__content label span. */
-const CONTINUE_RE = /^\s*(continue|继续|继续生成)\s*$/i;
+/**
+ * Labels for the "resume a halted answer" affordance. DeepSeek has shipped
+ * several variants across builds/locales; match the ones we have seen plus
+ * the obvious neighbours, and stay anchored (^…$) so a full assistant turn
+ * that merely contains the word "continue" cannot be misread as the button.
+ */
+const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
 /** Provider outage banner text (exact). */
@@ -175,12 +180,18 @@ function findContinueButton() {
     if (!isVisible(el)) continue;
     let label = "";
     try {
+      // Prefer the design-system label span; fall back to the element's own
+      // text (some builds omit the wrapper span).
       const span = el.querySelector("span.ds-button__content");
       label = ((span || el).textContent || "").trim();
     } catch {
       continue;
     }
-    if (label && CONTINUE_RE.test(label)) return el;
+    if (!label) continue;
+    // Hard cap: a real Continue control's label is 1-3 words. Anything
+    // longer is an assistant turn that happens to contain the word.
+    if (label.length > 40) continue;
+    if (CONTINUE_RE.test(label)) return el;
   }
   return null;
 }
@@ -215,19 +226,33 @@ function findNewChatByLabel() {
   return null;
 }
 
-/** Exact provider outage banner (checked only on completion paths, not per tick). */
+/**
+ * Provider outage banner. Rendered in different element types across builds
+ * (span / div / p), with or without the trailing period. A leaf-only size
+ * guard prevents a false positive on a container whose textContent happens
+ * to include the whole conversation.
+ */
 function serverDownVisible() {
-  let spans;
+  let els;
   try {
-    spans = document.querySelectorAll("span");
+    els = document.querySelectorAll("span, div, p");
   } catch {
     return false;
   }
-  for (const el of spans) {
+  const needle = "Server is temporarily unavailable";
+  for (const el of els) {
     try {
-      if ((el.textContent || "").trim() === SERVER_DOWN_TEXT) return true;
+      // Leaf-ish elements only: skip containers that concatenate many
+      // children (which would include the banner inside a huge blob).
+      if (el.children.length > 2) continue;
+      const t = (el.textContent || "").trim();
+      if (t.length > 120) continue;
+      if (t === needle || t === needle + ".") return true;
+      // Some builds append a short suffix; keep the prefix match tight
+      // (must be within 4 chars of the bare sentence).
+      if (t.startsWith(needle) && t.length <= needle.length + 4) return true;
     } catch {
-      /* noop */
+      continue;
     }
   }
   return false;
@@ -1173,16 +1198,36 @@ function startDomObserver(t) {
     }
     const text = replyText();
     if (text === null) {
+      // Provider outage check FIRST. DeepSeek renders
+      // "Server is temporarily unavailable." as a system notice and the
+      // reply bubble never grows. Report the specific provider error so the
+      // bridge maps it to a retryable 502 — NOT submit-failed with
+      // submit_no_bubble=true, which wrongly tells the caller the tab was
+      // untouched when the tool-results attachment WAS placed.
+      if (serverDownVisible()) {
+        finishTurn(false, "dom-error", "provider: server temporarily unavailable");
+        return;
+      }
       if (!nullSince) nullSince = Date.now();
       else {
         // No user bubble ever appeared (baseCount === submitCount) means the
         // submit never landed — fail fast instead of riding the full 60 s.
         const limit = t.baseCount === t.submitCount ? 5000 : 60000;
         if (Date.now() - nullSince > limit) {
+          // Enrich the failure with the state we saw, so the bridge log
+          // pins down whether the composer was in edit mode, a Continue
+          // button was on-screen, or the tab simply never responded.
+          let diag = "";
+          try {
+            const c = findFirst(SELECTORS.composer);
+            diag = ` [editMode=${composerInEditMode(c) ? "y" : "n"}, continueBtn=${findContinueButton() ? "y" : "n"}, composerLen=${c ? readComposer(c).length : -1}]`;
+          } catch {
+            /* diagnostic only */
+          }
           finishTurn(
             false,
             "submit-failed",
-            `reply bubble never appeared within ${limit / 1000}s of submit`,
+            `reply bubble never appeared within ${limit / 1000}s of submit${diag}`,
             false,
             { userBubbleRendered: conversationNodes().length > t.submitCount }
           );
@@ -1397,6 +1442,15 @@ function onPortMessage(msg) {
  */
 async function onNoStream(t, composer, originalText, isRetry) {
   if (turn !== t || t.finished || t.mode !== "sse-await") return;
+  // Provider outage wins over every other diagnostic: DeepSeek shows
+  // "Server is temporarily unavailable." instead of a reply stream, and a
+  // re-submit cannot help until the provider recovers. Report the specific
+  // error so the bridge maps it to a retryable 502 rather than treating the
+  // tool-results attachment as a successful submit.
+  if (serverDownVisible()) {
+    finishTurn(false, "dom-error", "provider: server temporarily unavailable");
+    return;
+  }
   const domEvidence = dsMessageCount() > (t.dsMessageBase ?? t.submitCount);
   if (domEvidence) {
     fallbackToDom(

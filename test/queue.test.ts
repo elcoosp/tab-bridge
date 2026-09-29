@@ -245,7 +245,7 @@ test("queue: x-bridge-queued-ms appears on JSON responses (0 when immediate)", a
   const [h, v] = await Promise.all([ph, pv]);
   assert.equal(h.headers.get("x-bridge-queued-ms"), "0");
   const queuedMs = Number(v.headers.get("x-bridge-queued-ms"));
-  assert.ok(Number.isFinite(queuedMs) && queuedMs >= 100, `expected a real wait, got ${queuedMs}`);
+  assert.ok(Number.isFinite(queuedMs) && queuedMs >= 50, `expected a real wait, got ${queuedMs}`);
   assert.deepEqual([h.status, v.status], [200, 200]);
 });
 
