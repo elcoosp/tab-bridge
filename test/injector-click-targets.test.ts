@@ -77,3 +77,22 @@ test("regression: maybeContinue logs diagnostics as JSON strings", () => {
     "post-click diagnostic must be a JSON string"
   );
 });
+
+test("regression: maybeContinue scrolls an offscreen button into view before clicking", () => {
+  // Without this, DeepSeek's still-auto-scrolling conversation leaves the
+  // Continue button below the viewport; the debugger click dispatches
+  // viewport-space coords, hits nothing, and the 5s continue-no-stream
+  // timer is what saves the turn — the ~10s latency users reported.
+  const fn = extractFunction("maybeContinue");
+  assert.match(fn, /scrollIntoView/, "maybeContinue must scroll the button into view");
+  assert.match(
+    fn,
+    /window\.innerHeight|documentElement\.clientHeight/,
+    "must measure the viewport height to detect an offscreen button"
+  );
+  assert.match(
+    fn,
+    /button offscreen/,
+    "must emit a diagnostic when the button is offscreen (visible in SW log)"
+  );
+});

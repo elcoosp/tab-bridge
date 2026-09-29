@@ -1591,7 +1591,7 @@ function fallbackToDom(t, why) {
 }
 
 /**
- * v1.2.52 — DOM continuation.
+ * v1.2.53 — DOM continuation.
  *
  * DeepSeek halted, the trusted Continue click landed, but the continuation
  * POST (if any) went over a transport the SSE hook does not intercept: the
@@ -1784,6 +1784,29 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
+  // v1.2.53 — ensure the button is on-screen before we compute the click
+  // target. When the SSE stream completes and DeepSeek paints the Continue
+  // button, the conversation may still be auto-scrolling; the button can
+  // sit BELOW the viewport. The debugger click dispatches viewport-space
+  // coordinates, so a click at y > viewport-height hits nothing (the tell
+  // is hitAtCenter === "(null)" in the diagnostic). Scroll it into view
+  // first, then re-read the rect so cx/cy reflect the new position.
+  try {
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const r0 = btn.getBoundingClientRect();
+    const cx0 = r0.left + r0.width / 2;
+    const cy0 = r0.top + r0.height / 2;
+    if (cx0 < 0 || cx0 > vw || cy0 < 0 || cy0 > vh) {
+      dbg(
+        "maybeContinue: button offscreen — scrolling into view " +
+          JSON.stringify({ cx: Math.round(cx0), cy: Math.round(cy0), vw, vh })
+      );
+      btn.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+    }
+  } catch {
+    /* best effort */
+  }
   try {
     const r = btn.getBoundingClientRect();
     rectStr = JSON.stringify({
@@ -1849,7 +1872,7 @@ function maybeContinue(t, why) {
       );
     }
     if (r.ok) {
-      // v1.2.52 DOM continuation. The trusted click landed but the log
+      // v1.2.53 DOM continuation. The trusted click landed but the log
       // shows `streamAfterClick:false` even when `stillThere:false`: the
       // continuation travels over a transport the SSE hook does not see.
       // Give the stream 1.5s to show up; if it does not, switch the turn
@@ -1902,7 +1925,7 @@ function startDomObserver(t, opts) {
     // 1.2.6 boot-race fix); this is only a prose safety net.
     text = stripThinkBlocks(text);
     if (continuationMode) {
-      // v1.2.52 DOM continuation. The SSE path already streamed the partial
+      // v1.2.53 DOM continuation. The SSE path already streamed the partial
       // answer, DeepSeek halted, and its Continue click went over a transport
       // the hook does not intercept. Read the growth of the assistant bubble
       // as continued text; append it to what we already emitted so the caller
@@ -2023,7 +2046,7 @@ function startDomObserver(t, opts) {
       clearInterval(tick);
       return;
     }
-    // v1.2.52 — multi-halt support while in DOM continuation mode. If
+    // v1.2.53 — multi-halt support while in DOM continuation mode. If
     // DeepSeek halts AGAIN after a previous resume, the Continue button
     // reappears. Click it once more via the trusted debugger path (bounded
     // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
@@ -2094,7 +2117,7 @@ function startDomObserver(t, opts) {
       return;
     }
     nullSince = 0;
-    // v1.2.52 continuation bailout: if the Continue button persists past
+    // v1.2.53 continuation bailout: if the Continue button persists past
     // MAX_CONTINUES trusted-click retries, finish with what we captured
     // rather than hanging until the turn deadline.
     if (
@@ -2470,8 +2493,8 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    domContinuation: false, // v1.2.52: DOM-continuation mode active for this turn
-    domContinuationClickAt: 0, // v1.2.52: last DOM-continuation Continue click (cooldown)
+    domContinuation: false, // v1.2.53: DOM-continuation mode active for this turn
+    domContinuationClickAt: 0, // v1.2.53: last DOM-continuation Continue click (cooldown)
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
