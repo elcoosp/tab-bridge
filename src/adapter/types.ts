@@ -7,6 +7,10 @@ export interface ManagedTab {
   tabId: number;
   state: "created" | "connecting" | "ready" | "busy" | "cooldown" | "dead";
   health?: Health;
+  /** WS-D: worker-observed dirtiness — true when the tab completed a turn
+   * since its last reset/creation, or when dirtiness is unknown (e.g. MV3
+   * service-worker restart re-registration). */
+  dirty?: boolean;
 }
 
 export type HealthState =

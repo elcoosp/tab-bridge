@@ -7,7 +7,7 @@ export const WORKER_PROTOCOL = 1;
 
 export type WorkerIntent =
   | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown>; extVersion?: string; instance?: string }
-  | { t: "BIND"; sessionId: string }
+  | { t: "BIND"; sessionId: string; noCreate?: boolean }
   | { t: "SEND"; reqId: string; text: string; opts: { timeoutMs: number; think: boolean }; tabId?: number }
   | { t: "RESET"; reqId: string; tabId?: number }
   | { t: "ABORT"; reqId: string }
@@ -16,9 +16,9 @@ export type WorkerIntent =
 
 export type WorkerObservation =
   | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown>; extVersion?: string; instance?: string }
-  | { t: "HELLO_OK"; v: number; config: { autoCreateTabs: boolean; managedOnly: boolean; warmTabs: number } }
+  | { t: "HELLO_OK"; v: number; config: { autoCreateTabs: boolean; managedOnly: boolean; warmTabs: number; maxTabs?: number; tabIdleCloseMs?: number } }
   | { t: "HELLO_REFUSED"; reason: string }
-  | { t: "BOUND"; sessionId: string; tabId: number; state: string }
+  | { t: "BOUND"; sessionId: string; tabId: number; state: string; dirty?: boolean }
   | { t: "BIND_FAILED"; sessionId: string; code: string; detail?: string; retryAfterSec?: number }
   | { t: "ACCEPTED"; reqId: string }
   | { t: "FRAGMENT"; reqId: string; seq: number; text: string; full?: boolean }

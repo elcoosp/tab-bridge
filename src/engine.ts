@@ -39,7 +39,12 @@ export interface TurnRequest {
   holdbackCeiling?: number;
   /** Binds a session to a managed tab (pool-backed deployments). */
   bindTab: (sessionId: string, timeoutMs: number) => Promise<number>;
+  /** WS-D: SEED-into-dirty-tab policy. auto = reset when the worker reports
+   * the tab dirty (default); always = reset on every SEED; never = legacy. */
+  resetOnSeed?: "auto" | "always" | "never";
 }
+
+export type ResetOnSeed = "auto" | "always" | "never";
 
 export interface TurnEvents {
   onContent?(text: string): void;
@@ -98,8 +103,8 @@ export function validateCallEvent(
   };
 }
 
-function tabOf(tabId: number): ManagedTab {
-  return { tabId, state: "ready" };
+function tabOf(tabId: number, dirty?: boolean): ManagedTab {
+  return dirty === true ? { tabId, state: "ready", dirty: true } : { tabId, state: "ready" };
 }
 
 /**
@@ -126,8 +131,18 @@ export function summarizeMessages(messages: readonly ChatMessage[]): string {
 }
 
 async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<ManagedTab> {
+  let dirty: boolean | undefined;
   if (row.tabId === null) {
-    row.tabId = await req.bindTab(row.sessionId, req.bindTimeoutMs);
+    const bound = await req.bindTab(row.sessionId, req.bindTimeoutMs);
+    // Pool-backed bindTab returns a tab id (number) for compat; the
+    // WorkerPool.bind shape { tabId, dirty } is unwrapped by the caller in
+    // bridge.ts — here we accept either form.
+    if (typeof bound === "number") {
+      row.tabId = bound;
+    } else {
+      row.tabId = (bound as unknown as { tabId: number }).tabId;
+      dirty = (bound as unknown as { dirty?: boolean }).dirty;
+    }
   }
   const ready = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
   if (!ready.ok) {
@@ -143,7 +158,7 @@ async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<Man
       throw new Error(`not-ready:${detail}`);
     }
   }
-  return tabOf(row.tabId as number);
+  return tabOf(row.tabId as number, dirty === true);
 }
 
 async function resetOrThrow(adapter: ChatProviderAdapter, tab: ManagedTab): Promise<void> {
@@ -294,7 +309,18 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
   try {
     let promptText: string;
     if (plan.plan === "SEED") {
-      if (row.chain.length > 0 || row.pendingReset) await resetOrThrow(req.adapter, tab);
+      // WS-D: never SEED into a dirty tab. A fresh row (empty chain) reuses
+      // whatever conversation the physical tab still shows; the worker flags
+      // such tabs dirty (completed turn since reset, or unknown after MV3
+      // restart), and we reset before seeding. Fresh tabs report clean → no
+      // extra reset on the common path.
+      const policy = req.resetOnSeed ?? "auto";
+      const needReset =
+        row.chain.length > 0 ||
+        row.pendingReset ||
+        policy === "always" ||
+        (policy === "auto" && tab.dirty === true);
+      if (needReset) await resetOrThrow(req.adapter, tab);
       promptText = compileSeed(messages, tools);
     } else if (plan.plan === "RESET_RESEED") {
       await resetOrThrow(req.adapter, tab);

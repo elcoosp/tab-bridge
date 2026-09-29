@@ -15,6 +15,8 @@ export interface PoolConfig {
   autoCreateTabs: boolean;
   managedOnly: boolean;
   warmTabs: number;
+  maxTabs?: number;
+  tabIdleCloseMs?: number;
 }
 
 export interface WorkerInfo {
@@ -180,10 +182,14 @@ export class WorkerPool extends EventEmitter {
    * still surfaces as bind-failed (503 pool_exhausted downstream), never a
    * bare timeout string.
    */
-  async bind(sessionId: string, timeoutMs: number): Promise<{ tabId: number; state: string }> {
+  async bind(
+    sessionId: string,
+    timeoutMs: number,
+    opts: { noCreate?: boolean } = {}
+  ): Promise<{ tabId: number; state: string; dirty: boolean }> {
     try {
-      const obs = await this.request<{ t: "BOUND"; sessionId: string; tabId: number; state: string }>(
-        { t: "BIND", sessionId },
+      const obs = await this.request<{ t: "BOUND"; sessionId: string; tabId: number; state: string; dirty?: boolean }>(
+        { t: "BIND", sessionId, ...(opts.noCreate ? { noCreate: true } : {}) },
         "BIND",
         timeoutMs,
         (o) => o?.t === "BOUND" && (o as { sessionId: string }).sessionId === sessionId,
@@ -191,11 +197,14 @@ export class WorkerPool extends EventEmitter {
           if (o?.t !== "BIND_FAILED" || (o as { sessionId: string }).sessionId !== sessionId) return null;
           const code = (o as { code?: string }).code ?? "unknown";
           if (code.includes("rate-limited")) return new Error(`bind-failed: ${code}`);
+          // E5: ephemeral background traffic must never grow the pool — a
+          // noCreate BIND fails fast instead of waiting out the deadline.
+          if (opts.noCreate) return new Error(`bind-failed: ${code}`);
           return null; // no-tab-available and friends: keep waiting for BOUND
         }
       );
       this.healthByTab.set(obs.tabId, "ok");
-      return { tabId: obs.tabId, state: obs.state };
+      return { tabId: obs.tabId, state: obs.state, dirty: obs.dirty === true };
     } catch (e) {
       if (e instanceof Error && /timed out after/.test(e.message)) {
         throw new Error(`bind-failed: no-tab-available (timeout after ${timeoutMs}ms)`);

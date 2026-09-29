@@ -116,6 +116,10 @@ chrome.storage.local.get({ managedTabs: [], workerInstance: null }, (res) => {
   } catch {
     /* corrupted entry — start empty */
   }
+  // v1.2.49: re-attach on boot. debuggerAttached is a per-SW Set, so a
+  // worker restart clears it; without this, the first Continue click
+  // after a restart pays the handshake again. Fire-and-forget.
+  for (const id of managedTabs) eagerAttachDebugger(id);
   // Stable per-profile worker identity, shared with the bridge in HELLO.
   // Successive log lines with DIFFERENT ids prove distinct live workers
   // (profiles/browsers); the SAME id repeating proves one worker looping.
@@ -462,6 +466,9 @@ async function allocateTab(sessionId) {
   managedTabs.add(created.id);
   saveManaged();
   tabState.set(created.id, { state: "connecting", health: "ok" });
+  // v1.2.49: attach the CDP debugger now so the first Continue click does
+  // not pay the attach handshake (Chrome allows only one debugger per tab).
+  eagerAttachDebugger(created.id);
   // Cold-tab grace: the injector port connects before the SPA finishes
   // booting, and submits into a half-loaded app silently go nowhere (first
   // turn fails, retry succeeds). Wait for the document load first.
@@ -902,6 +909,20 @@ function debuggerDetach(target) {
 // to every Continue click (attach handshake + detach handshake per press).
 // Chrome detaches automatically when the tab is destroyed.
 const debuggerAttached = new Set();
+
+// v1.2.49 — eager attach: pay the CDP handshake ONCE per pool tab,
+// at tab creation and on service-worker boot, instead of lazily on the
+// first Continue click. Fire-and-forget: a failure (DevTools open on the
+// tab, permission revoked, tab already gone) logs and is swallowed, and
+// the lazy path inside debuggerClick still retries on demand.
+function eagerAttachDebugger(tabId) {
+  if (typeof tabId !== "number") return;
+  if (debuggerAttached.has(tabId)) return;
+  void debuggerEnsureAttached({ tabId }).then(
+    () => blog("debugger attached (eager)", tabId),
+    (e) => blog("debugger eager attach failed", tabId, String((e && e.message) || e))
+  );
+}
 
 async function debuggerEnsureAttached(target) {
   if (debuggerAttached.has(target.tabId)) return;

@@ -28,6 +28,9 @@ export interface ChatParams {
   /** Resolved session id, or null for the stateless legacy path. */
   sessionId: string | null;
   events?: TurnEvents;
+  /** E5: ephemeral background-class traffic must never grow the tab pool —
+   * set by the facade when metadata.tab_bridge_class = "background". */
+  background?: boolean;
   /** Aborted when the HTTP client disconnects. Consumed by the generation
    * gate for the QUEUED phase only; an admitted turn always runs to
    * completion (unchanged v1 behavior). */
@@ -59,6 +62,7 @@ export class TabBridge {
   readonly turnGate: TurnGate;
   private readonly wsServer: WsServer;
   private readonly bindTabImpl: (sessionId: string, timeoutMs: number) => Promise<number>;
+  private pendingNoCreate = false;
 
   constructor(config: Config, adapter?: ChatProviderAdapter) {
     this.config = config;
@@ -69,7 +73,10 @@ export class TabBridge {
       persist: this.store,
       onEvict: (sessionId) => {
         log.audit("session.evict", { sessionId });
-        this.pool.release(`evict:${sessionId}`, 3_000).catch(() => {});
+        // E1: release with the RAW session id. The worker keys its
+        // sessionTab map by raw id (stored at BIND); a prefixed id never
+        // matches and the tab stays occupied forever.
+        this.pool.release(sessionId, 3_000).catch(() => {});
       },
     });
     // Replay persisted chains (ADR-3: restart resumes without stored text).
