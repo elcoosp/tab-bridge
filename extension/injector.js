@@ -82,16 +82,26 @@ const MAX_CONTINUES = 5;
 const SERVER_DOWN_TEXT = "Server is temporarily unavailable.";
 
 const SELECTORS = {
+  // Anchor on stable attributes observed on chat.deepseek.com:
+  //   <textarea name="search" placeholder="Message DeepSeek" rows="2" ...>
+  // The legacy '#chat-input' id is kept only as a fallback for older builds.
   composer: [
+    'textarea[name="search"]',
+    'textarea[placeholder="Message DeepSeek"]',
+    'textarea[placeholder*="Message"]',
     'textarea#chat-input',
     'textarea[placeholder]',
     'div[contenteditable="true"]',
   ],
+  // DeepSeek design-system classes only — never generated _xxxxxx hashes.
+  // The send control is the sole primary, filled, CIRCULAR ds-button:
+  //   ds-button--primary + ds-button--filled + ds-button--circle.
+  // Requiring --circle excludes the text-labelled buttons used elsewhere
+  // (cookie banner "Accept all", edit-mode "Cancel"/"Send") which carry
+  // --capsule instead.
   sendButton: [
-    'div[role="button"][aria-disabled]',
-    'button[class*="send"]',
-    'div[class*="send-button"]',
-    'button:has(svg)',
+    'div[role="button"].ds-button--primary.ds-button--circle',
+    'div[role="button"].ds-button--primary.ds-button--filled.ds-button--circle',
   ],
   stopButton: [
     'button[class*="stop"]',
@@ -103,6 +113,9 @@ const SELECTORS = {
     'div[class*="new-chat"] button',
     'button[class*="new-chat"]',
   ],
+  // The real "New chat" control is a <div tabindex="0"> whose container class
+  // is a generated hash (e.g. _5a8ac7a) and whose only stable hook is the
+  // visible "New chat" label. See findNewChatByLabel() below.
   messageNodes: [
     // Field-verified (ds-3): every chat bubble is div.ds-message inside the
     // virtual list. Legacy fragment selectors kept as fallback.
@@ -168,6 +181,36 @@ function findContinueButton() {
       continue;
     }
     if (label && CONTINUE_RE.test(label)) return el;
+  }
+  return null;
+}
+
+/**
+ * DeepSeek renders "New chat" as a div[tabindex="0"] whose label span reads
+ * the localized "New chat" string; its container class is a generated hash.
+ * The label text is the only stable hook, so scan for it. Covers the shipped
+ * languages (en/zh + common locales) to be safe.
+ */
+const NEW_CHAT_LABEL_RE =
+  /^(new\s*chat|新对话|新聊天|novo\s*chat|neuer\s*chat|nueva\s*conversación|nouvelle\s*conversation|nuova\s*chat)$/i;
+
+function findNewChatByLabel() {
+  let els;
+  try {
+    els = document.querySelectorAll('[tabindex="0"]');
+  } catch {
+    return null;
+  }
+  for (const el of els) {
+    if (!isVisible(el)) continue;
+    let text = "";
+    try {
+      text = (el.textContent || "").trim();
+    } catch {
+      continue;
+    }
+    if (!text || text.length > 40) continue;
+    if (NEW_CHAT_LABEL_RE.test(text)) return el;
   }
   return null;
 }
@@ -381,7 +424,7 @@ function readComposer(el) {
 /** The composer's probable action bar: walk up a few container levels. */
 function composerScope(el) {
   let scope = el;
-  for (let i = 0; i < 3 && scope.parentElement; i++) scope = scope.parentElement;
+  for (let i = 0; i < 5 && scope.parentElement; i++) scope = scope.parentElement;
   return scope;
 }
 
@@ -389,20 +432,141 @@ function composerScope(el) {
  * Find the send control. Priority: explicit selectors anywhere, then icon
  * buttons scoped near the composer (send sits bottom-right => last match).
  */
-function findSendButton(composer) {
-  const direct = findAll(SELECTORS.sendButton).filter(isVisible);
-  if (direct.length > 0) return direct[direct.length - 1];
-  if (composer) {
+/**
+ * Detect DeepSeek's edit-message UI: a Cancel control rendered in the
+ * composer's action bar. Editing a previous message reuses the composer
+ * element; if a turn is dispatched while the tab is in edit mode, placeText
+ * overwrites the edit draft and the submit never fires — the composer then
+ * shows the tool-results text with Cancel/Send buttons and no reply streams.
+ */
+function composerInEditMode(composer) {
+  if (!composer) return false;
+  let scope;
+  try {
+    scope = composerScope(composer);
+  } catch {
+    return false;
+  }
+  let buttons;
+  try {
+    buttons = scope.querySelectorAll('button, div[role="button"], [role="button"]');
+  } catch {
+    return false;
+  }
+  for (const el of buttons) {
+    if (!isVisible(el)) continue;
+    let text = "";
     try {
-      const scoped = [
-        ...composerScope(composer).querySelectorAll('button, div[role="button"], [role="button"]'),
-      ].filter(isVisible);
-      const iconBtns = scoped.filter((el) => el.querySelector("svg"));
-      if (iconBtns.length > 0) return iconBtns[iconBtns.length - 1];
-      if (scoped.length > 0) return scoped[scoped.length - 1];
+      text = (el.textContent || "").trim().toLowerCase();
     } catch {
-      /* DOM shape drift — fall through */
+      continue;
     }
+    if (text === "cancel" || text === "取消") return true;
+  }
+  return false;
+}
+
+/** Click the Cancel control in the composer action bar to exit edit mode. */
+function exitEditMode(composer) {
+  if (!composer) return false;
+  let scope;
+  try {
+    scope = composerScope(composer);
+  } catch {
+    return false;
+  }
+  let buttons;
+  try {
+    buttons = scope.querySelectorAll('button, div[role="button"], [role="button"]');
+  } catch {
+    return false;
+  }
+  for (const el of buttons) {
+    if (!isVisible(el)) continue;
+    let text = "";
+    try {
+      text = (el.textContent || "").trim().toLowerCase();
+    } catch {
+      continue;
+    }
+    if (text === "cancel" || text === "取消") {
+      try {
+        el.click();
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Locate the SEND control, scoped STRICTLY to the composer's action bar.
+ *
+ * History: an earlier revision used a document-wide search for
+ * `div[role="button"][aria-disabled]`, which ALSO matches every action
+ * button on user message bubbles (Copy, Regenerate, EDIT, thumbs, speaker,
+ * share). `direct[direct.length - 1]` returned the last such button in the
+ * DOM — usually an edit affordance — and clicking it opened DeepSeek's
+ * edit-message UI instead of submitting. The turn then hung: no POST fired,
+ * no completion stream attached, no TURN_DONE ever reached the bridge.
+ *
+ * The scoped version below cannot leave the composer subtree.
+ *
+ * Preference order (all within composerScope(composer)):
+ *   1. DeepSeek design-system send button (ds-button--primary + ds-button--circle)
+ *      — the ds-* class names are public and stable; the trailing _xxxxxx
+ *      tokens on the same element are generated CSS-in-JS hashes and are
+ *      never relied on.
+ *   2. a button whose class names it a send control (legacy DeepSeek builds)
+ *   3. the LAST enabled SVG-bearing button in the composer action bar
+ *      (the real send control sits at the end of that row)
+ */
+function findSendButton(composer) {
+  if (!composer) return null;
+  let scope;
+  try {
+    scope = composerScope(composer);
+  } catch {
+    return null;
+  }
+
+  // 1. DeepSeek design-system send button — never a generated hash.
+  for (const sel of SELECTORS.sendButton) {
+    try {
+      const matches = [...scope.querySelectorAll(sel)].filter(isVisible);
+      if (matches.length > 0) return matches[matches.length - 1];
+    } catch {
+      /* invalid selector for this DOM — try the next one */
+    }
+  }
+
+  let candidates;
+  try {
+    candidates = [
+      ...scope.querySelectorAll('button, div[role="button"], [role="button"]'),
+    ].filter(isVisible);
+  } catch {
+    return null;
+  }
+
+  // 2. Legacy fallback: a class that names the element a send control.
+  const isSendish = (el) => {
+    const cls = typeof el.className === "string" ? el.className : "";
+    return /(^|[\s-])send([\s_-]|$)/i.test(cls);
+  };
+  const classMatches = candidates.filter(isSendish);
+  if (classMatches.length > 0) {
+    const enabled = classMatches.filter(isEnabled);
+    return enabled.length > 0 ? enabled[enabled.length - 1] : classMatches[classMatches.length - 1];
+  }
+
+  // 3. Last resort: the LAST enabled icon button in the action bar.
+  const iconBtns = candidates.filter((el) => el.querySelector("svg"));
+  if (iconBtns.length > 0) {
+    const enabled = iconBtns.filter(isEnabled);
+    if (enabled.length > 0) return enabled[enabled.length - 1];
   }
   return null;
 }
@@ -649,6 +813,19 @@ async function waitStableSend(composer, timeoutMs) {
 async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   const verifyMs = quickVerify ? 2500 : 6000;
   const preCount = conversationNodes().length;
+  // If the composer is showing an edit draft (Cancel/Send in the action bar),
+  // exit that mode FIRST. Otherwise placeText overwrites the draft and the
+  // eventual click lands on the edit-send button, which the app rejects as
+  // "no edit target" — no POST fires, no stream, and the turn hangs.
+  if (composerInEditMode(composer)) {
+    dbg("composer in edit mode — cancelling edit before placing text");
+    if (exitEditMode(composer)) {
+      await sleep(350);
+      // Re-resolve the composer: the edit UI may have swapped the node.
+      const again = findFirst(SELECTORS.composer);
+      if (again) composer = again;
+    }
+  }
   // Guard against the window right after a previous generation where the
   // UI swaps stop -> send asynchronously. If the pre-check times out, give
   // the DOM one more grace window; if it is STILL unstable, proceed — the
@@ -809,6 +986,18 @@ function finishTurn(ok, code, detail, aborted, extra) {
   hookPost({ type: "disarm" });
   turn = null;
   lastTurnEndedAt = Date.now();
+  // Best-effort composer hygiene: if the turn ended with a leftover draft
+  // (failed or unverified submit), leave the composer clean so the next
+  // turn's readiness gate does not trip on stale content.
+  try {
+    const c = findFirst(SELECTORS.composer);
+    if (c && readComposer(c).length > 0) {
+      dbg("clearing leftover composer text after turn end");
+      setComposerValue(c, "");
+    }
+  } catch {
+    /* best effort */
+  }
   if (ok) {
     dbg("turn done:", t.reqId, `chars=${t.emitted.length}`, `mode=${t.mode}`);
     report("TURN_DONE", { reqId: t.reqId });
@@ -1351,7 +1540,7 @@ async function handleTurn(msg) {
 async function handleReset(msg) {
   const fresh = !!(msg && msg.fresh);
   try {
-    const link = findFirst(SELECTORS.newChat);
+    const link = findFirst(SELECTORS.newChat) || findNewChatByLabel();
     if (!link) {
       if (fresh && location.pathname === "/") {
         // The worker navigated this tab home as the reset action itself
