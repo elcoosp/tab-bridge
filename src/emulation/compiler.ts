@@ -45,8 +45,13 @@ export function renderToolProtocolBlock(tools: ToolSpec[]): string {
       "more valuable than N single-call turns. Do not space calls out one turn at a time. Only stop " +
       "to wait for results when you genuinely cannot decide the next call without them."
   );
+  lines.push(
+    "PROSE FORMAT: any text outside a tool_call block is a normal markdown answer. " +
+      "Use headings, bullet lists, numbered steps, fenced code blocks, tables, and inline " +
+      "code freely — markdown formatting is expected, not suppressed."
+  );
   lines.push("=== TOOLS ===");
-  if (tools.length === 0) lines.push("(no tools declared; answer in plain text)");
+  if (tools.length === 0) lines.push("(no tools declared; answer normally — markdown is fine)");
   else for (const t of tools) lines.push(renderToolSpec(t));
   return lines.join("\n");
 }
@@ -91,7 +96,8 @@ export function compileSeed(
       "need in the SAME reply — back to back, batched, before stopping. The bridge runs those " +
       "calls in parallel and the provider is rate-limited per message, so a single batched reply " +
       "is strictly more valuable than several single-call turns. Stop only when you genuinely " +
-      "need the results to decide the next call; otherwise answer in plain text."
+      "need the results to decide the next call. When no tools are needed, write a normal "
+      + "markdown answer — headings, lists, code fences, and tables are all welcome."
   );
   return out.join("\n\n");
 }
@@ -118,7 +124,8 @@ export function compileInjectResults(results: readonly ChatMessage[]): string {
       "SAME BATCHING RULE as before: emit EVERY independent tool_call block you already know " +
       "you will need in a SINGLE reply — back to back, batched, before stopping. Parallel calls " +
       "are executed together and the provider is rate-limited per message; do not spend one turn " +
-      "per call. Answer in plain text only when no further calls are needed."
+      "per call. When no further calls are needed, write a normal markdown answer — "
+      + "headings, lists, code fences, and tables are all welcome."
   );
   return out.join("\n\n");
 }
@@ -140,6 +147,7 @@ export function compileRepair(offendingOutput: string, validationError: string):
     "Reply again. To call a tool, output a fenced ```tool_call block containing one JSON object " +
       'with "name" and "arguments". No prose inside the block. You may (and should) emit several ' +
       "such blocks back to back in the same reply when you need several independent tools — " +
-      "batching is preferred. If no tool is needed, answer in plain text.",
+      "batching is preferred. If no tool is needed, write a normal markdown answer — "
+      + "markdown formatting is encouraged.",
   ].join("\n");
 }

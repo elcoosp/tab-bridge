@@ -122,3 +122,24 @@ test("tool schema renderer truncates at budget", () => {
   assert.ok(rendered.length <= 100);
   assert.ok(rendered.endsWith("…"));
 });
+
+test("cues do NOT force plain text; markdown is explicitly welcome", () => {
+  const seed = compileSeed([{ role: "user", content: "q" }], TOOLS);
+  const inj = compileInjectResults([{ role: "tool", content: "x", tool_call_id: "t" }]);
+  const rep = compileRepair("bad", "err");
+
+  assert.doesNotMatch(seed, /plain text/i, "seed must not force plain text");
+  assert.doesNotMatch(inj, /plain text/i, "inject-results cue must not force plain text");
+  assert.doesNotMatch(rep, /plain text/i, "repair must not force plain text");
+
+  assert.match(seed, /markdown/i, "seed must mention markdown as acceptable");
+  assert.match(inj, /markdown/i, "inject-results cue must mention markdown");
+  assert.match(rep, /markdown/i, "repair must mention markdown");
+});
+
+test("protocol block declares PROSE FORMAT: markdown expected", () => {
+  const seed = compileSeed([{ role: "user", content: "q" }], TOOLS);
+  assert.match(seed, /PROSE FORMAT/, "protocol block must declare the prose format rule");
+  assert.match(seed, /markdown formatting is expected/i,
+    "protocol block must say markdown is expected, not suppressed");
+});
