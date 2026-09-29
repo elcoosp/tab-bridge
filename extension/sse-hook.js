@@ -60,7 +60,13 @@
 
   function createInternals() {
     /** DeepSeek completion endpoint (api/v0/chat/completion). */
-    const COMPLETION_RE = /chat\/completion/i;
+    // DeepSeek streams the initial answer and the "Continue" resume on
+    // two distinct endpoints: /api/v0/chat/completion and
+    // /api/v0/chat/continue. Both carry the same `data: {"v":...}` SSE
+    // shape and are parsed identically. The initial capture arms on
+    // completion; the Continue button's trusted click re-arms for the
+    // follow-up POST, which lands on /chat/continue — hence the union.
+    const COMPLETION_RE = /\/chat\/(completion|continue)/i;
     const THINK_OPEN = "<think>";
     const THINK_CLOSE = "</think>";
 
@@ -554,7 +560,7 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.47",
+    hookVersion: "1.2.48",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,

@@ -1591,7 +1591,7 @@ function fallbackToDom(t, why) {
 }
 
 /**
- * v1.2.47 — DOM continuation.
+ * v1.2.48 — DOM continuation.
  *
  * DeepSeek halted, the trusted Continue click landed, but the continuation
  * POST (if any) went over a transport the SSE hook does not intercept: the
@@ -1849,7 +1849,7 @@ function maybeContinue(t, why) {
       );
     }
     if (r.ok) {
-      // v1.2.47 DOM continuation. The trusted click landed but the log
+      // v1.2.48 DOM continuation. The trusted click landed but the log
       // shows `streamAfterClick:false` even when `stillThere:false`: the
       // continuation travels over a transport the SSE hook does not see.
       // Give the stream 1.5s to show up; if it does not, switch the turn
@@ -1902,7 +1902,7 @@ function startDomObserver(t, opts) {
     // 1.2.6 boot-race fix); this is only a prose safety net.
     text = stripThinkBlocks(text);
     if (continuationMode) {
-      // v1.2.47 DOM continuation. The SSE path already streamed the partial
+      // v1.2.48 DOM continuation. The SSE path already streamed the partial
       // answer, DeepSeek halted, and its Continue click went over a transport
       // the hook does not intercept. Read the growth of the assistant bubble
       // as continued text; append it to what we already emitted so the caller
@@ -2023,7 +2023,7 @@ function startDomObserver(t, opts) {
       clearInterval(tick);
       return;
     }
-    // v1.2.47 — multi-halt support while in DOM continuation mode. If
+    // v1.2.48 — multi-halt support while in DOM continuation mode. If
     // DeepSeek halts AGAIN after a previous resume, the Continue button
     // reappears. Click it once more via the trusted debugger path (bounded
     // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
@@ -2087,7 +2087,7 @@ function startDomObserver(t, opts) {
       return;
     }
     nullSince = 0;
-    // v1.2.47 continuation bailout: if the Continue button persists past
+    // v1.2.48 continuation bailout: if the Continue button persists past
     // MAX_CONTINUES trusted-click retries, finish with what we captured
     // rather than hanging until the turn deadline.
     if (
@@ -2459,8 +2459,8 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    domContinuation: false, // v1.2.47: DOM-continuation mode active for this turn
-    domContinuationClickAt: 0, // v1.2.47: last DOM-continuation Continue click (cooldown)
+    domContinuation: false, // v1.2.48: DOM-continuation mode active for this turn
+    domContinuationClickAt: 0, // v1.2.48: last DOM-continuation Continue click (cooldown)
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);

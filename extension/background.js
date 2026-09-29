@@ -897,10 +897,35 @@ function debuggerDetach(target) {
     });
   });
 }
+// v1.2.48 — attach the CDP debugger ONCE per pool tab and keep it attached
+// for the tab's lifetime. The previous per-click attach/detach added ~1s
+// to every Continue click (attach handshake + detach handshake per press).
+// Chrome detaches automatically when the tab is destroyed.
+const debuggerAttached = new Set();
+
+async function debuggerEnsureAttached(target) {
+  if (debuggerAttached.has(target.tabId)) return;
+  try {
+    await debuggerAttach(target, "1.3");
+    debuggerAttached.add(target.tabId);
+    return;
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    // "Another debugger is already attached" — could be a prior attach
+    // of ours (the Set is per-SW, lost on restart) or DevTools. Proceed
+    // optimistically; a real DevTools conflict surfaces on the dispatch.
+    if (/already attached/i.test(msg)) {
+      debuggerAttached.add(target.tabId);
+      return;
+    }
+    throw e;
+  }
+}
+
 async function debuggerClick(tabId, x, y) {
   const target = { tabId };
   try {
-    await debuggerAttach(target, "1.3");
+    await debuggerEnsureAttached(target);
   } catch (e) {
     return { ok: false, error: "attach: " + String((e && e.message) || e) };
   }
@@ -917,9 +942,10 @@ async function debuggerClick(tabId, x, y) {
     });
     return { ok: true };
   } catch (e) {
+    // Attach may have been revoked silently (DevTools opened, SW restart).
+    // Drop the cached flag so the next call re-attaches.
+    debuggerAttached.delete(tabId);
     return { ok: false, error: "dispatch: " + String((e && e.message) || e) };
-  } finally {
-    await debuggerDetach(target);
   }
 }
 
