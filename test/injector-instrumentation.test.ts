@@ -35,11 +35,20 @@ test("instrumentation: trace helper is declared", () => {
 
 test("instrumentation: syntheticClick dispatches the full pointer sequence", () => {
   const fn = extractFunction("syntheticClick");
-  assert.match(fn, /el\.click\(\)/, "syntheticClick must call native .click()");
+  // The implementation iterates over multiple targets (the outer button and
+  // the ds-button__content label span), so the native click call is
+  // `target.click()` rather than `el.click()`. Either name is acceptable —
+  // what matters is that the native click method is invoked at all.
+  assert.match(fn, /\.click\(\)/, "syntheticClick must call the native .click() method");
   assert.match(fn, /"pointerdown"/, "syntheticClick must dispatch pointerdown");
   assert.match(fn, /"pointerup"/, "syntheticClick must dispatch pointerup");
   assert.match(fn, /"mousedown"/, "syntheticClick must dispatch mousedown");
   assert.match(fn, /"mouseup"/, "syntheticClick must dispatch mouseup");
+  // And it must iterate over multiple targets: the outer element plus the
+  // design-system label span, so a build that routes onClick through the
+  // label span is still activated.
+  assert.match(fn, /for \(const target of targets\)/, "syntheticClick must loop over targets");
+  assert.match(fn, /span\.ds-button__content/, "syntheticClick must target the ds-button__content span");
 });
 
 test("instrumentation: keyboardActivate fires Enter keydown/keyup", () => {

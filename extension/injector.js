@@ -121,6 +121,21 @@ const trace = (...a) => {
 // click-listener case. syntheticClick fires the full sequence a real user
 // would produce, and keyboardActivate is the fallback when even that fails.
 // ---------------------------------------------------------------------------
+/**
+ * Aggressive activation for DeepSeek's design-system buttons.
+ *
+ * Fires the click on the outer element AND every plausible interactive
+ * descendant (the ds-button__content label span, any icon wrapper, the
+ * svg's parent), and also dispatches a plain Event("click") in addition
+ * to the MouseEvent form. DeepSeek's design system has, across builds,
+ * routed onClick through the outer div, through the label span, and
+ * through a wrapper div; a single el.click() on the outer div misses
+ * those variants.
+ *
+ * Returns true if at least one dispatch did not throw. The caller is
+ * expected to verify success by checking whether the button disappeared
+ * (React re-renders it away on a successful click).
+ */
 function syntheticClick(el) {
   if (!el || !el.isConnected) return false;
   let ok = false;
@@ -129,16 +144,33 @@ function syntheticClick(el) {
   } catch {
     /* scrollIntoView can throw on detached nodes — ignore */
   }
-  // Native click first: cheapest path, works for the common case.
+  // Collect every target we'll fire the sequence against: the element
+  // itself, the design-system label span if present, and (as a last
+  // resort) the svg's direct parent.
+  const targets = [el];
   try {
-    el.click();
-    ok = true;
+    const span = el.querySelector("span.ds-button__content");
+    if (span) targets.push(span);
   } catch {
-    /* fall through to pointer sequence */
+    /* noop */
   }
-  // Full pointer sequence for handlers wired to pointerdown/up.
   try {
-    const rect = el.getBoundingClientRect();
+    const svg = el.querySelector("svg");
+    if (svg && svg.parentElement && !targets.includes(svg.parentElement)) {
+      targets.push(svg.parentElement);
+    }
+  } catch {
+    /* noop */
+  }
+
+  for (const target of targets) {
+    if (!target || !target.isConnected) continue;
+    let rect;
+    try {
+      rect = target.getBoundingClientRect();
+    } catch {
+      rect = { left: 0, top: 0, width: 0, height: 0 };
+    }
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
     const base = {
@@ -148,16 +180,37 @@ function syntheticClick(el) {
       clientX: x,
       clientY: y,
       button: 0,
+      buttons: 0,
+      // view: window is required by some frameworks' synthetic-event
+      // normalizers (React doesn't care, but it's harmless).
+      view: window,
     };
-    el.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
-    el.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
-    el.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
-    el.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
-    el.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0 }));
-    ok = true;
-  } catch {
-    /* PointerEvent may be missing on very old Chrome — the .click() above
-       already fired, so this is a soft failure */
+    // 1. Native click — cheapest, works for React's delegated onClick.
+    try {
+      target.click();
+      ok = true;
+    } catch {
+      /* fall through */
+    }
+    // 2. Full pointer sequence — covers handlers wired to pointerdown/up.
+    try {
+      target.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
+      target.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+      target.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
+      target.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+      target.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0 }));
+      ok = true;
+    } catch {
+      /* PointerEvent unavailable — .click() above already fired */
+    }
+    // 3. Plain Event("click") — bypasses any `instanceof MouseEvent`
+    // check some libraries use for their own synthetic dispatch.
+    try {
+      target.dispatchEvent(new Event("click", { bubbles: true, cancelable: true, composed: true }));
+      ok = true;
+    } catch {
+      /* noop */
+    }
   }
   return ok;
 }
@@ -1500,28 +1553,32 @@ function maybeContinue(t, why) {
     return false;
   }
   // ALWAYS-ON diagnostic: dump the button's shape, parentage, and React
-  // event handlers, so a stuck repro tells us exactly what we found and
-  // which handlers we should be firing.
+  // event handlers as a JSON STRING. Passing an object as the second arg
+  // to console.log makes DevTools collapse it to "Object"; the string is
+  // the whole point of the diagnostic, so it must not be collapsible.
   let reactHandlers = "(unknown)";
   try {
     reactHandlers = dumpReactHandlers(btn);
   } catch (e) {
     reactHandlers = "ERR: " + String((e && e.message) || e);
   }
-  let rect = null;
+  let rectStr = "{}";
   try {
     const r = btn.getBoundingClientRect();
-    rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+    rectStr = JSON.stringify({ x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) });
   } catch {
     /* noop */
   }
-  dbg("maybeContinue: button", {
-    why,
-    outerHTML: (btn.outerHTML || "").slice(0, 220),
-    className: typeof btn.className === "string" ? btn.className : String(btn.className),
-    rect,
-    reactHandlers,
-  });
+  dbg(
+    "maybeContinue: button " +
+      JSON.stringify({
+        why,
+        outerHTML: (btn.outerHTML || "").slice(0, 260),
+        className: typeof btn.className === "string" ? btn.className : String(btn.className),
+        rect: rectStr,
+        reactHandlers,
+      })
+  );
   t.continues = (t.continues | 0) + 1;
   t.awaitContinue = Date.now();
   dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
@@ -1529,25 +1586,24 @@ function maybeContinue(t, why) {
   // matters), then async arm as a belt-and-braces.
   hookArmSync(t.reqId, t.opts.timeoutMs || 240000);
   hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
-  // Fire BOTH activation strategies unconditionally. `el.click()` on a
-  // div[role=button] never throws, so gating keyboardActivate on
-  // `!clicked` meant it almost never ran — yet DeepSeek's tabindex=0
-  // role=button controls are documented as keyboard-activatable, and some
-  // builds respond to Enter but not click. DeepSeek's handler is
-  // idempotent for a single in-flight resume, so firing both is safe.
+  // Fire BOTH activation strategies unconditionally.
   const clicked = syntheticClick(btn);
   const keyboardActivated = keyboardActivate(btn);
-  dbg("maybeContinue: activated", {
-    why,
-    continues: t.continues,
-    clicked,
-    keyboardActivated,
-    label: (btn.textContent || "").trim().slice(0, 40),
-  });
-  // Post-click verification: 500ms later, check whether the button
-  // disappeared (React handled the click and re-rendered) or is still
-  // there (the click did not register). This is the definitive signal
-  // for the next repro.
+  dbg(
+    "maybeContinue: activated " +
+      JSON.stringify({
+        why,
+        continues: t.continues,
+        clicked,
+        keyboardActivated,
+        label: (btn.textContent || "").trim().slice(0, 40),
+      })
+  );
+  // Post-click verification: poll for the button's disappearance. If
+  // React handled the click, it re-renders the button away within ~1
+  // frame. If it's still there after 300ms, the click dispatched but
+  // did not register — the second-wave activation (see the retry
+  // branch below) will try a focus + Enter-only path with no click.
   const btnRef = btn;
   setTimeout(() => {
     if (!t || t.finished) return;
@@ -1560,13 +1616,48 @@ function maybeContinue(t, why) {
       /* noop */
     }
     const streamAfterClick = t.lastSseAt > t.awaitContinue;
-    dbg("maybeContinue: post-click state", {
-      reqId: t.reqId,
-      stillThere,
-      label: nowLabel,
-      streamAfterClick,
-    });
-  }, 500);
+    dbg(
+      "maybeContinue: post-click state " +
+        JSON.stringify({ reqId: t.reqId, stillThere, label: nowLabel, streamAfterClick })
+    );
+    // Second-wave recovery: if the button survived, fire the keyboard
+    // path by itself with focus and WITHOUT the click sequence — some
+    // React builds handle Enter-on-focused-role=button but ignore a
+    // programmatic click (usually due to a focus requirement in the
+    // component's own onClick guard). Non-fatal: the existing
+    // continue-no-stream watchdog picks up if this also misses.
+    if (stillThere && t.lastSseAt <= t.awaitContinue) {
+      try {
+        const btn2 = findContinueButton();
+        if (btn2) {
+          dbg("maybeContinue: retrying with focus + Enter only");
+          try {
+            btn2.focus();
+          } catch {
+            /* noop */
+          }
+          try {
+            btn2.dispatchEvent(
+              new KeyboardEvent("keydown", {
+                key: "Enter", code: "Enter", keyCode: 13, which: 13,
+                bubbles: true, cancelable: true,
+              })
+            );
+            btn2.dispatchEvent(
+              new KeyboardEvent("keyup", {
+                key: "Enter", code: "Enter", keyCode: 13, which: 13,
+                bubbles: true, cancelable: true,
+              })
+            );
+          } catch {
+            /* noop */
+          }
+        }
+      } catch {
+        /* noop */
+      }
+    }
+  }, 300);
   return true;
 }
 

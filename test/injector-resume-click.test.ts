@@ -66,9 +66,15 @@ test("regression: maybeContinue fires BOTH click and keyboard unconditionally", 
 test("regression: maybeContinue emits always-on button diagnostics", () => {
   const fn = extractFunction("maybeContinue");
   assert.match(fn, /dumpReactHandlers\(btn\)/, "maybeContinue must dump React handlers");
-  assert.match(fn, /dbg\("maybeContinue: button"/, "button diagnostic must be dbg (always-on)");
-  assert.match(fn, /dbg\("maybeContinue: activated"/, "activation diagnostic must be dbg (always-on)");
+  // The diagnostics are emitted as JSON strings (never objects, which
+  // DevTools collapses to "Object") via `dbg("..." + JSON.stringify(...))`.
+  // Match the prefix of the string literal, with or without the trailing
+  // space — either shape means the always-on dbg call is present.
+  assert.match(fn, /dbg\(\s*"maybeContinue: button/, "button diagnostic must be dbg (always-on)");
+  assert.match(fn, /dbg\(\s*"maybeContinue: activated/, "activation diagnostic must be dbg (always-on)");
   assert.match(fn, /maybeContinue: post-click state/, "post-click verification must be present");
+  // And they must be JSON.stringify'd, so they cannot be collapsed.
+  assert.match(fn, /JSON\.stringify\(/, "diagnostics must be JSON-stringified");
 });
 
 test("regression: window.__tabBridgeClickResume diagnostic is exposed", () => {
