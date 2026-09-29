@@ -1591,7 +1591,7 @@ function fallbackToDom(t, why) {
 }
 
 /**
- * v1.2.51 — DOM continuation.
+ * v1.2.52 — DOM continuation.
  *
  * DeepSeek halted, the trusted Continue click landed, but the continuation
  * POST (if any) went over a transport the SSE hook does not intercept: the
@@ -1849,7 +1849,7 @@ function maybeContinue(t, why) {
       );
     }
     if (r.ok) {
-      // v1.2.51 DOM continuation. The trusted click landed but the log
+      // v1.2.52 DOM continuation. The trusted click landed but the log
       // shows `streamAfterClick:false` even when `stillThere:false`: the
       // continuation travels over a transport the SSE hook does not see.
       // Give the stream 1.5s to show up; if it does not, switch the turn
@@ -1902,7 +1902,7 @@ function startDomObserver(t, opts) {
     // 1.2.6 boot-race fix); this is only a prose safety net.
     text = stripThinkBlocks(text);
     if (continuationMode) {
-      // v1.2.51 DOM continuation. The SSE path already streamed the partial
+      // v1.2.52 DOM continuation. The SSE path already streamed the partial
       // answer, DeepSeek halted, and its Continue click went over a transport
       // the hook does not intercept. Read the growth of the assistant bubble
       // as continued text; append it to what we already emitted so the caller
@@ -2023,7 +2023,7 @@ function startDomObserver(t, opts) {
       clearInterval(tick);
       return;
     }
-    // v1.2.51 — multi-halt support while in DOM continuation mode. If
+    // v1.2.52 — multi-halt support while in DOM continuation mode. If
     // DeepSeek halts AGAIN after a previous resume, the Continue button
     // reappears. Click it once more via the trusted debugger path (bounded
     // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
@@ -2056,6 +2056,13 @@ function startDomObserver(t, opts) {
       // honest than waiting out the 60s nullSince budget and reporting a
       // generic submit-failed that lies about the tab state.
       if (generationFailedVisible()) {
+        // Retry affordance = the icon-only warning-circle button, which
+        // findContinueButton already matches (pass 2 structural). Route
+        // through the trusted-debugger click instead of failing the turn
+        // outright — a successful click resumes the same generation, no
+        // reset, no SW flap. Only fail when no clickable control is
+        // actually present or MAX_CONTINUES has been exceeded.
+        if (maybeContinue(t, "generation-failed-retry")) return;
         finishTurn(false, "dom-error", "provider: generation failed (retry affordance visible)");
         return;
       }
@@ -2087,7 +2094,7 @@ function startDomObserver(t, opts) {
       return;
     }
     nullSince = 0;
-    // v1.2.51 continuation bailout: if the Continue button persists past
+    // v1.2.52 continuation bailout: if the Continue button persists past
     // MAX_CONTINUES trusted-click retries, finish with what we captured
     // rather than hanging until the turn deadline.
     if (
@@ -2374,6 +2381,10 @@ async function onNoStream(t, composer, originalText, isRetry) {
   // the same prompt would just re-trigger the same failure (rate-limit /
   // context overflow / refusal); report it now.
   if (generationFailedVisible()) {
+    // Same as the DOM tick: click the retry affordance via the trusted
+    // debugger path before giving up. maybeContinue returns false when
+    // the click budget is exhausted or the button truly is not present.
+    if (maybeContinue(t, "generation-failed-retry")) return;
     finishTurn(false, "dom-error", "provider: generation failed (retry affordance visible)");
     return;
   }
@@ -2459,8 +2470,8 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    domContinuation: false, // v1.2.51: DOM-continuation mode active for this turn
-    domContinuationClickAt: 0, // v1.2.51: last DOM-continuation Continue click (cooldown)
+    domContinuation: false, // v1.2.52: DOM-continuation mode active for this turn
+    domContinuationClickAt: 0, // v1.2.52: last DOM-continuation Continue click (cooldown)
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);

@@ -132,7 +132,10 @@ test("regression: serverDownVisible returns false when the banner is absent", ()
 test("regression: DOM tick's null path checks serverDownVisible() before submit-failed", () => {
   const idx = SRC.indexOf("const text = replyText();");
   assert.notEqual(idx, -1, "replyText() call not found — injector structure drifted");
-  const window = SRC.slice(idx, idx + 4000);
+  // 8000-char window covers the extended null path (serverDown check, retry-
+  // affordance click, then the submit-failed fallback). A larger budget keeps
+  // the ordering assertion robust as the diagnostic block grows.
+  const window = SRC.slice(idx, idx + 8000);
   const serverDownIdx = window.indexOf("serverDownVisible()");
   const submitFailedIdx = window.indexOf('"submit-failed"');
   assert.notEqual(serverDownIdx, -1, "serverDownVisible() not called in the DOM tick's null path");
@@ -140,6 +143,39 @@ test("regression: DOM tick's null path checks serverDownVisible() before submit-
   assert.ok(
     serverDownIdx < submitFailedIdx,
     "serverDownVisible() must be checked before the submit-failed fallback, else a provider outage is misclassified as a client-side submit failure"
+  );
+});
+
+test("regression: retry affordance is clicked before failing the DOM tick", () => {
+  // The retry button (icon-only warning-circle) is matched by findContinueButton,
+  // so the turn must route through maybeContinue — the trusted-debugger click —
+  // before declaring the generation failed. Otherwise every provider retry
+  // affordance triggers a full RESET_RESEED and a worker-link flap cascade.
+  const idx = SRC.indexOf("const text = replyText();");
+  assert.notEqual(idx, -1, "replyText() call not found");
+  const window = SRC.slice(idx, idx + 8000);
+  const maybeIdx = window.indexOf('maybeContinue(t, "generation-failed-retry")');
+  const failIdx = window.indexOf('"provider: generation failed (retry affordance visible)"');
+  assert.notEqual(maybeIdx, -1, "DOM tick must call maybeContinue for the retry affordance");
+  assert.notEqual(failIdx, -1, "DOM tick must still have the fail-fast fallback");
+  assert.ok(
+    maybeIdx < failIdx,
+    "maybeContinue(generation-failed-retry) must run BEFORE the finishTurn fail-fast, " +
+      "else a retry button the debugger could have clicked causes a spurious reset"
+  );
+});
+
+test("regression: retry affordance is clicked before failing onNoStream", () => {
+  const idx = SRC.indexOf("async function onNoStream(");
+  assert.notEqual(idx, -1, "onNoStream not found");
+  const window = SRC.slice(idx, idx + 3000);
+  const maybeIdx = window.indexOf('maybeContinue(t, "generation-failed-retry")');
+  const failIdx = window.indexOf('"provider: generation failed (retry affordance visible)"');
+  assert.notEqual(maybeIdx, -1, "onNoStream must call maybeContinue for the retry affordance");
+  assert.notEqual(failIdx, -1, "onNoStream must still have the fail-fast fallback");
+  assert.ok(
+    maybeIdx < failIdx,
+    "maybeContinue(generation-failed-retry) must run BEFORE the finishTurn fail-fast in onNoStream"
   );
 });
 
