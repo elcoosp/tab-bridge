@@ -52,7 +52,7 @@ let poolWindowId = null;
  * so we can restore it after the injector's Continue click. Null when we
  * have not stolen focus. */
 let priorFocusedWindowId = null;
-let poolConfig = { autoCreateTabs: false, managedOnly: true, warmTabs: 0 };
+let poolConfig = { autoCreateTabs: false, managedOnly: true, warmTabs: 0, maxTabs: 4, tabIdleCloseMs: 15 * 60 * 1000 };
 let helloOk = false;
 // Stable per-profile identity (loaded from storage.local at boot, default
 // while the async load is in flight). Sent in HELLO so the bridge log can
@@ -212,8 +212,10 @@ function connect() {
       // Do NOT reset backoff here. A connection that dies shortly after
       // HELLO_OK is a flap and must grow backoff; see the close handler.
       helloOk = true;
-      poolConfig = m.config || poolConfig;
+      poolConfig = { maxTabs: 4, tabIdleCloseMs: 15 * 60 * 1000, ...(m.config || poolConfig) };
       blog("bridge HELLO_OK", JSON.stringify(poolConfig));
+      // E4: warm tabs become real — pre-create once the handshake completes.
+      void ensureWarmTabs().catch((e) => blog("warm tabs failed:", String((e && e.message) || e)));
       // Flush intents that arrived during the handshake: they must run under
       // the real pool config, never the default-deny one (otherwise BIND
       // fails spuriously with no-tab-available despite autoCreateTabs).
@@ -423,7 +425,7 @@ async function restorePriorFocus() {
   }
 }
 
-async function allocateTab(sessionId) {
+async function allocateTab(sessionId, opts = {}) {
   // 1) re-use a free managed tab (skipping rate-limit cooldowns).
   // Foreign tabs are never in tabState, and the managedTabs check below is
   // belt-and-braces for the same invariant.
@@ -447,6 +449,24 @@ async function allocateTab(sessionId) {
     blog("BIND", "(allocate) autoCreateTabs off — no free managed tab");
     return null;
   }
+  // E5: background-class ephemeral binds must never grow the pool.
+  if (opts.noCreate) {
+    blog("BIND", "(allocate) noCreate — refusing to create a tab for background traffic");
+    return null;
+  }
+  // E2: cap the pool at maxTabs (0 = unbounded). Prefer closing the
+  // least-recently-released free tab before creating a new one; if nothing
+  // is closable, refuse so the bridge surfaces a clean 503/429.
+  if (poolConfig.maxTabs > 0 && managedTabs.size >= poolConfig.maxTabs) {
+    const victim = oldestReleasedFreeTab();
+    if (victim !== null) {
+      blog("BIND", "(allocate) at maxTabs — closing LRU free tab", victim);
+      await closeManagedTab(victim);
+    } else {
+      blog("BIND", "(allocate) at maxTabs with no closable tab");
+      return "at-capacity";
+    }
+  }
   blog("BIND", "(allocate) creating managed tab...");
   let created;
   try {
@@ -465,7 +485,7 @@ async function allocateTab(sessionId) {
   blog("BIND", "(allocate) created tab", created.id, "— waiting for load");
   managedTabs.add(created.id);
   saveManaged();
-  tabState.set(created.id, { state: "connecting", health: "ok" });
+  tabState.set(created.id, { state: "connecting", health: "ok", dirty: false });
   // v1.2.49: attach the CDP debugger now so the first Continue click does
   // not pay the attach handshake (Chrome allows only one debugger per tab).
   eagerAttachDebugger(created.id);
@@ -572,7 +592,7 @@ function waitForReady(tabId, timeoutMs) {
 // ---------------------------------------------------------------------------
 
 async function handleBind(m) {
-  const tabId = await allocateTab(m.sessionId);
+  const tabId = await allocateTab(m.sessionId, { noCreate: m.noCreate === true });
   if (tabId === "rate-limited-cooldown") {
     blog("BIND", m.sessionId, "-> rate-limited-cooldown");
     send({
@@ -583,17 +603,22 @@ async function handleBind(m) {
     });
     return;
   }
-  if (tabId === null || tabId === undefined) {
-    blog("BIND", m.sessionId, "-> no-tab-available");
-    send({ t: "BIND_FAILED", sessionId: m.sessionId, code: "no-tab-available" });
+  if (tabId === null || tabId === undefined || tabId === "at-capacity") {
+    const atCap = tabId === "at-capacity";
+    blog("BIND", m.sessionId, atCap ? "-> no-tab-available (at maxTabs)" : "-> no-tab-available");
+    send({ t: "BIND_FAILED", sessionId: m.sessionId, code: "no-tab-available", ...(atCap ? { detail: "at-capacity: pool at maxTabs" } : {}) });
     return;
   }
-  const st = tabState.get(tabId) || { state: "ready", health: "ok" };
+  const st = tabState.get(tabId) || { state: "ready", health: "ok", dirty: true };
+  // Unknown dirtiness (re-registered tab with no record) is treated as dirty
+  // by the bridge; default true when the flag was never set.
+  if (st.dirty === undefined) st.dirty = true;
   st.sessionId = m.sessionId;
+  st.releasedAt = undefined;
   tabState.set(tabId, st);
   sessionTab.set(m.sessionId, tabId);
-  blog("BIND", m.sessionId, "-> tab", tabId, `(${st.state})`);
-  send({ t: "BOUND", sessionId: m.sessionId, tabId, state: st.state });
+  blog("BIND", m.sessionId, "-> tab", tabId, `(${st.state},dirty=${st.dirty})`);
+  send({ t: "BOUND", sessionId: m.sessionId, tabId, state: st.state, dirty: st.dirty === true });
 }
 
 function handleSend(m) {
@@ -729,6 +754,11 @@ function finishResetOk(reqId) {
   st.done = true;
   clearTimeout(st.timer);
   resetStates.delete(reqId);
+  // WS-D: a successful reset leaves every target tab clean.
+  for (const tabId of st.targets) {
+    const tst = tabState.get(tabId);
+    if (tst) tst.dirty = false;
+  }
   blog("RESET", reqId, "ok");
   send({ t: "RESET_OK", reqId });
 }
@@ -792,16 +822,24 @@ function handlePing(m) {
 }
 
 function handleRelease(m) {
-  const tabId = sessionTab.get(m.sessionId);
-  sessionTab.delete(m.sessionId);
+  // E1 cross-version safety: older bridges sent `evict:<id>`; strip it.
+  const raw = m.sessionId;
+  const sid = typeof raw === "string" && raw.startsWith("evict:") ? raw.slice("evict:".length) : raw;
+  const tabId = sessionTab.get(sid);
+  sessionTab.delete(sid);
+  // Also clear the prefixed key in case a peer stored it verbatim.
+  if (sid !== raw) sessionTab.delete(raw);
   if (tabId !== undefined) {
     const st = tabState.get(tabId);
     if (st) {
       st.sessionId = null;
       st.state = "ready";
+      // E3: record when the tab became free for the idle-close sweep.
+      // Dirtiness is kept — the tab still shows the old conversation.
+      st.releasedAt = Date.now();
     }
   }
-  send({ t: "RELEASED", sessionId: m.sessionId });
+  send({ t: "RELEASED", sessionId: raw });
 }
 
 // ---------------------------------------------------------------------------
@@ -837,8 +875,10 @@ function handleInjectorConnect(port, tabId) {
     // injector) survived: re-register it so PONG snapshots — and therefore
     // the bridge's ensureReady — see it again. Session affinity is
     // re-established by the bridge's next BIND.
-    tabState.set(tabId, { state: "ready", health: "ok" });
-    blog("injector reconnected managed tab", tabId);
+    // WS-D: dirtiness is unknown after a restart, so report dirty — the
+    // bridge resets before SEED rather than appending into a stale chat.
+    tabState.set(tabId, { state: "ready", health: "ok", dirty: true });
+    blog("injector reconnected managed tab", tabId, "(unknown state — marked dirty)");
   }
   const waiters = readyWaiters.get(tabId) || [];
   readyWaiters.set(tabId, []);
@@ -1017,7 +1057,10 @@ function handleInjectorMessage(tabId, port, msg) {
           turnByReq.delete(msg.reqId);
         }
         const st = tabState.get(tabId);
-        if (st) st.submitFails = 0; // healthy turn clears the wedge counter
+        if (st) {
+          st.submitFails = 0; // healthy turn clears the wedge counter
+          st.dirty = true; // WS-D: tab now shows this turn's conversation
+        }
         const s = fragStats.get(msg.reqId);
         blog(msg.t, msg.reqId, s ? `(${s.n} fragments, ${s.chars} chars)` : "(no fragments)");
         fragStats.delete(msg.reqId);
@@ -1035,6 +1078,10 @@ function handleInjectorMessage(tabId, port, msg) {
         if (msg.code === "rate_limited") {
           applyRateLimitCooldown(tabId);
         }
+        // Even a failed turn may have placed content; mark dirty unless the
+        // injector confirms no user bubble rendered (tab untouched).
+        const turnSt = tabState.get(tabId);
+        if (turnSt && msg.userBubbleRendered !== false) turnSt.dirty = true;
         if (msg.code === "submit-failed" || msg.code === "send-button-disabled") {
           noteSubmitFail(tabId, msg.code);
         }
@@ -1151,6 +1198,93 @@ function recycleTab(tabId, why) {
 }
 
 // ---------------------------------------------------------------------------
+// pool hygiene: max-tabs LRU, idle close, warm tabs (WS-E)
+// ---------------------------------------------------------------------------
+
+/** Least-recently-released free managed tab, or null when none is closable. */
+function oldestReleasedFreeTab() {
+  let victim = null;
+  let oldest = Infinity;
+  for (const [tabId, st] of tabState) {
+    if (st.state !== "ready" || st.sessionId) continue;
+    if (!managedTabs.has(tabId)) continue;
+    if (tabInCooldown(tabId, st)) continue;
+    const ts = typeof st.releasedAt === "number" ? st.releasedAt : 0;
+    if (ts < oldest) {
+      oldest = ts;
+      victim = tabId;
+    }
+  }
+  return victim;
+}
+
+async function closeManagedTab(tabId) {
+  tabState.delete(tabId);
+  portByTab.delete(tabId);
+  if (managedTabs.delete(tabId)) saveManaged();
+  for (const [sid, tid] of sessionTab) {
+    if (tid === tabId) sessionTab.delete(sid);
+  }
+  try {
+    const r = chrome.tabs.remove(tabId);
+    if (r && typeof r.catch === "function") await r.catch(() => {});
+  } catch {
+    /* already gone */
+  }
+  blog("pool hygiene closed tab", tabId);
+}
+
+/** E4: pre-create up to N managed tabs once the handshake completes. */
+async function ensureWarmTabs() {
+  const want = Math.max(0, Math.min(8, poolConfig.warmTabs | 0));
+  if (!poolConfig.autoCreateTabs || want <= 0) return;
+  const free = [...tabState.values()].filter((st) => st.state === "ready" && !st.sessionId).length;
+  let need = want - free;
+  while (need > 0) {
+    if (poolConfig.maxTabs > 0 && managedTabs.size >= poolConfig.maxTabs) break;
+    need--;
+    try {
+      const poolWin = await ensurePoolWindow();
+      const created = poolWin !== null
+        ? await chrome.tabs.create({ windowId: poolWin, url: START_URL, active: false })
+        : await chrome.tabs.create({ url: START_URL, active: false });
+      if (!created || typeof created.id !== "number") break;
+      managedTabs.add(created.id);
+      saveManaged();
+      tabState.set(created.id, { state: "connecting", health: "ok", dirty: false });
+      const loaded = await waitForLoaded(created.id, 30000);
+      if (!loaded) {
+        tabState.set(created.id, { state: "dead", health: "degraded" });
+        continue;
+      }
+      const ok = await waitForReady(created.id, 20000);
+      tabState.get(created.id).state = ok ? "ready" : "dead";
+      if (ok) blog("warm tab ready:", created.id);
+    } catch (e) {
+      blog("warm tab create failed:", String((e && e.message) || e));
+      break;
+    }
+  }
+}
+
+/** E3: close ready+unbound tabs idle beyond the threshold. MV3 service
+ * workers die otherwise, so this runs on chrome.alarms. */
+async function sweepIdleTabs() {
+  const idleMs = poolConfig.tabIdleCloseMs | 0;
+  if (!idleMs || idleMs <= 0) return;
+  const now = Date.now();
+  for (const [tabId, st] of [...tabState]) {
+    if (st.state !== "ready" || st.sessionId) continue;
+    if (!managedTabs.has(tabId)) continue;
+    if (typeof st.releasedAt !== "number") continue;
+    if (now - st.releasedAt >= idleMs) {
+      blog("pool idle-close tab", tabId, `idle ${Math.round((now - st.releasedAt) / 1000)}s`);
+      await closeManagedTab(tabId);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // boot: load config, keep the SW alive, connect
 // ---------------------------------------------------------------------------
 
@@ -1160,6 +1294,8 @@ chrome.storage.sync.get({ wsUrl: DEFAULT_WS_URL }, (cfg) => {
 });
 
 chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.create("pool-sweep", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "keepalive" && (!ws || ws.readyState !== WebSocket.OPEN)) connect();
+  if (a.name === "pool-sweep") void sweepIdleTabs().catch((e) => blog("pool sweep failed:", String((e && e.message) || e)));
 });
