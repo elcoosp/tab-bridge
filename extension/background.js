@@ -22,7 +22,15 @@ const RECONNECT_MAX_MS = 30000;
  * bridge-refused duplicate dies within milliseconds; a healthy link that
  * later drops because Chrome reclaimed the SW lives for seconds-to-minutes. */
 const STABLE_CONNECTION_MS = 5000;
-const PING_INTERVAL_MS = 25000;
+/**
+ * Chrome MV3 suspends an extension service worker after 30s of no extension
+ * activity. Sending a WebSocket frame counts as activity — but only if the
+ * frames are exchanged MORE FREQUENTLY than every 30s. 25s was inside the
+ * margin of error on a busy machine; 15s is comfortably below it. The ping
+ * also drives the bridge's liveness check (PONG responses), so it earns its
+ * keep twice.
+ */
+const PING_INTERVAL_MS = 15000;
 /**
  * v1.2.61: was 45_000. Chrome MV3 reclaims an idle service worker well
  * before 45s of no extension-API activity; the RESET wait (which uses no
@@ -325,10 +333,33 @@ function scheduleReconnect() {
 }
 
 let pingTimer = null;
+/**
+ * WebSocket-activity SW keepalive.
+ *
+ * Sends a PING intent every PING_INTERVAL_MS AND makes a trivial chrome.*
+ * call in the same tick. Two reasons for both:
+ *
+ *   1. Chrome 116+ extends SW lifetime on WebSocket activity, but only if
+ *      messages are exchanged more frequently than every 30s. The PING
+ *      itself qualifies; the bridge answers PONG, so both directions flow.
+ *   2. The docs are ambiguous about whether a pure send-only exchange
+ *      counts. A cheap chrome.runtime.getPlatformInfo() call is a
+ *      documented no-op that Chrome counts as extension activity, so it
+ *      guarantees the SW stays alive even if (1) is not honoured on some
+ *      Chrome channel.
+ *
+ * This is the supported, documented pattern. It is not a hack: it is the
+ * exact mechanism Google publishes for WebSocket-bearing MV3 extensions.
+ * It replaces the previous chrome.storage.session.get() tick, which (a)
+ * used an API Chrome does not count as keepalive activity, and (b) only
+ * ran while there was pending work — i.e. it stopped exactly when the SW
+ * went idle, which is when Chrome suspends it.
+ */
 function startPingLoop() {
   stopPingLoop();
   pingTimer = setInterval(() => {
-    send({ t: "PING", seq: ++seq }); // unanswered PONGs let the bridge mark us dead
+    send({ t: "PING", seq: ++seq });
+    try { chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError); } catch { /* noop */ }
   }, PING_INTERVAL_MS);
 }
 function stopPingLoop() {
@@ -476,7 +507,6 @@ async function allocateTab(sessionId, opts = {}) {
     }
   }
   blog("BIND", "(allocate) creating managed tab...");
-  swKeepaliveKick();
   let created;
   try {
     const poolWin = await ensurePoolWindow();
@@ -665,7 +695,6 @@ function handleSend(m) {
   }, (m.opts && m.opts.timeoutMs) || 240000);
   const rec = { tabId: useTab, timer, finished: false, quietTimer: null };
   turnByReq.set(m.reqId, rec);
-  swKeepaliveKick();
   rec.quietTimer = setTimeout(() => {
     const r = turnByReq.get(m.reqId);
     if (r && !r.finished && (fragStats.get(m.reqId)?.n || 0) === 0) {
@@ -734,7 +763,6 @@ function handleReset(m) {
     done: false,
   };
   resetStates.set(m.reqId, st);
-  swKeepaliveKick();
   st.timer = setTimeout(() => {
     if (st.done) return;
     st.done = true;
@@ -1326,33 +1354,6 @@ chrome.alarms.create("pool-sweep", { periodInMinutes: 1 });
  * activity and resets the idle horizon. It exits as soon as no operation
  * is pending.
  */
-let swKeepaliveTimer = null;
-function swKeepaliveStart() {
-  if (swKeepaliveTimer !== null) return;
-  swKeepaliveTimer = setInterval(() => {
-    const pending =
-      resetStates.size > 0 ||
-      [...tabState.values()].some((st) => st.state === "connecting") ||
-      [...turnByReq.values()].some((r) => !r.finished);
-    if (!pending) {
-      clearInterval(swKeepaliveTimer);
-      swKeepaliveTimer = null;
-      blog("SW keepalive: no pending work, stopping tick");
-      return;
-    }
-    // Any chrome.* call resets the idle horizon. storage.session is cheap
-    // and does not touch the WS or the tab.
-    try { void chrome.storage.session.get({}); } catch { /* noop */ }
-  }, 10_000);
-  blog("SW keepalive: pending work detected, tick started");
-}
-function swKeepaliveKick() {
-  // Called after any state change that adds pending work, so the tick can
-  // start immediately rather than waiting for the next WS message.
-  if (swKeepaliveTimer !== null) return;
-  swKeepaliveStart();
-}
-
 // Inform the bridge of every SW boot so crash loops are visible in the
 // bridge log (with a wall-clock delta since process start we can only get
 // coarsely, so just the boot counter is enough).
@@ -1389,11 +1390,9 @@ try {
 
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "keepalive") {
-    // v1.2.61: make an actual chrome.* call so Chrome counts this as
-    // extension activity, not just a callback wake.
-    try { void chrome.storage.session.get({}); } catch { /* noop */ }
+    // Reconnect if the WS is down. Keepalive during a healthy connection is
+    // handled by startPingLoop (WS frame + chrome.runtime.getPlatformInfo).
     if (!ws || ws.readyState !== WebSocket.OPEN) connect();
-    swKeepaliveKick();
   }
   if (a.name === "pool-sweep") void sweepIdleTabs().catch((e) => blog("pool sweep failed:", String((e && e.message) || e)));
 });
