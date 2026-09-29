@@ -23,7 +23,15 @@ const RECONNECT_MAX_MS = 30000;
  * later drops because Chrome reclaimed the SW lives for seconds-to-minutes. */
 const STABLE_CONNECTION_MS = 5000;
 const PING_INTERVAL_MS = 25000;
-const RESET_TIMEOUT_MS = 45000;
+/**
+ * v1.2.61: was 45_000. Chrome MV3 reclaims an idle service worker well
+ * before 45s of no extension-API activity; the RESET wait (which uses no
+ * chrome.* API while the SW awaits the injector reply) was losing its
+ * timer and dying mid-reset, then reconnecting, receiving the same RESET
+ * from the bridge, and dying again — the flap cascade. Keep the timeout
+ * below the idle horizon AND drive a keepalive tick during the wait.
+ */
+const RESET_TIMEOUT_MS = 20_000;
 const START_URL = "https://chat.deepseek.com/";
 /**
  * DeepSeek "Messages too frequent. Try again later." cooldown. The provider
@@ -468,6 +476,7 @@ async function allocateTab(sessionId, opts = {}) {
     }
   }
   blog("BIND", "(allocate) creating managed tab...");
+  swKeepaliveKick();
   let created;
   try {
     const poolWin = await ensurePoolWindow();
@@ -656,6 +665,7 @@ function handleSend(m) {
   }, (m.opts && m.opts.timeoutMs) || 240000);
   const rec = { tabId: useTab, timer, finished: false, quietTimer: null };
   turnByReq.set(m.reqId, rec);
+  swKeepaliveKick();
   rec.quietTimer = setTimeout(() => {
     const r = turnByReq.get(m.reqId);
     if (r && !r.finished && (fragStats.get(m.reqId)?.n || 0) === 0) {
@@ -724,6 +734,7 @@ function handleReset(m) {
     done: false,
   };
   resetStates.set(m.reqId, st);
+  swKeepaliveKick();
   st.timer = setTimeout(() => {
     if (st.done) return;
     st.done = true;
@@ -1300,7 +1311,91 @@ chrome.storage.sync.get({ wsUrl: DEFAULT_WS_URL }, (cfg) => {
 
 chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.create("pool-sweep", { periodInMinutes: 1 });
+/**
+ * v1.2.61: SW lifetime guard.
+ *
+ * Every long wait the SW does (RESET awaiting injector reply, BIND awaiting
+ * tab load, turn awaiting completion) is a window in which no chrome.* API
+ * is called and Chrome can reclaim the service worker. When that happens,
+ * the pending timer / promise / port listener is lost, the bridge sees a
+ * WS disconnect, reconnects, re-sends the same intent, and we get a flap
+ * cascade.
+ *
+ * This tick fires every 10s and, whenever there is a pending operation,
+ * calls a trivial chrome API (storage.session.get) so Chrome counts it as
+ * activity and resets the idle horizon. It exits as soon as no operation
+ * is pending.
+ */
+let swKeepaliveTimer = null;
+function swKeepaliveStart() {
+  if (swKeepaliveTimer !== null) return;
+  swKeepaliveTimer = setInterval(() => {
+    const pending =
+      resetStates.size > 0 ||
+      [...tabState.values()].some((st) => st.state === "connecting") ||
+      [...turnByReq.values()].some((r) => !r.finished);
+    if (!pending) {
+      clearInterval(swKeepaliveTimer);
+      swKeepaliveTimer = null;
+      blog("SW keepalive: no pending work, stopping tick");
+      return;
+    }
+    // Any chrome.* call resets the idle horizon. storage.session is cheap
+    // and does not touch the WS or the tab.
+    try { void chrome.storage.session.get({}); } catch { /* noop */ }
+  }, 10_000);
+  blog("SW keepalive: pending work detected, tick started");
+}
+function swKeepaliveKick() {
+  // Called after any state change that adds pending work, so the tick can
+  // start immediately rather than waiting for the next WS message.
+  if (swKeepaliveTimer !== null) return;
+  swKeepaliveStart();
+}
+
+// Inform the bridge of every SW boot so crash loops are visible in the
+// bridge log (with a wall-clock delta since process start we can only get
+// coarsely, so just the boot counter is enough).
+const swBootAt = Date.now();
+function reportSwBoot() {
+  // Deferred until the WS is up.
+  const send2 = () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      send({ t: "HEALTH", state: "ok", detail: `sw-boot-ms=${swBootAt}` });
+    } else {
+      setTimeout(send2, 500);
+    }
+  };
+  send2();
+}
+
+// Global error reporting: anything uncaught in the SW would normally kill
+// it silently. Report to the bridge so we can see the exact exception.
+try {
+  self.addEventListener("unhandledrejection", (ev) => {
+    const r = ev && ev.reason;
+    const detail = String((r && (r.stack || r.message)) || r).slice(0, 300);
+    blog("SW unhandledrejection:", detail);
+    try { send({ t: "HEALTH", state: "degraded", detail: `unhandledrejection: ${detail}` }); } catch { /* noop */ }
+  });
+} catch { /* noop */ }
+try {
+  self.addEventListener("error", (ev) => {
+    const detail = String((ev && (ev.message || ev.error)) || ev).slice(0, 300);
+    blog("SW uncaught error:", detail);
+    try { send({ t: "HEALTH", state: "degraded", detail: `error: ${detail}` }); } catch { /* noop */ }
+  });
+} catch { /* noop */ }
+
 chrome.alarms.onAlarm.addListener((a) => {
-  if (a.name === "keepalive" && (!ws || ws.readyState !== WebSocket.OPEN)) connect();
+  if (a.name === "keepalive") {
+    // v1.2.61: make an actual chrome.* call so Chrome counts this as
+    // extension activity, not just a callback wake.
+    try { void chrome.storage.session.get({}); } catch { /* noop */ }
+    if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+    swKeepaliveKick();
+  }
   if (a.name === "pool-sweep") void sweepIdleTabs().catch((e) => blog("pool sweep failed:", String((e && e.message) || e)));
 });
+
+reportSwBoot();
