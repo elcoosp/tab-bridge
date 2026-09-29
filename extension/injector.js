@@ -92,7 +92,7 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.59: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.60: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
@@ -1393,10 +1393,20 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
     if (submitRateLimitHit(preCount)) {
-      return { ok: false, code: "rate_limited", detail: "composer rejected the prompt under a provider send block" };
+      return {
+        ok: false,
+        code: "rate_limited",
+        detail: "composer rejected the prompt under a provider send block",
+        userBubbleRendered: conversationNodes().length > preCount,
+      };
     }
     if (submitConcurrencyHit(preCount)) {
-      return { ok: false, code: "concurrency_blocked", detail: "composer rejected the prompt: another message is generating" };
+      return {
+        ok: false,
+        code: "concurrency_blocked",
+        detail: "composer rejected the prompt: another message is generating",
+        userBubbleRendered: conversationNodes().length > preCount,
+      };
     }
     return {
       ok: false,
@@ -1412,6 +1422,12 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "concurrency_blocked",
         detail: `${ready.detail || "provider notice: another message is generating"} (mode=${mode})`,
+        // v1.2.60: submit rejected before any generation started — no user
+        // bubble was rendered. MUST be explicit so the engine does NOT mark
+        // the row failed (which sets pendingReset and poisons the session
+        // into an infinite RESET_RESEED loop, one that on this DeepSeek
+        // build navigates the pool tab home and crashes the SW).
+        userBubbleRendered: conversationNodes().length > preCount,
       };
     }
     if (ready.rateLimited || submitRateLimitHit(preCount)) {
@@ -1419,6 +1435,10 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "rate_limited",
         detail: `${ready.detail || "provider notice: messages too frequent"} (mode=${mode})`,
+        // v1.2.60: submit-time rate limit — nothing submitted, no bubble.
+        // Explicit false keeps the engine from calling markFailed and
+        // setting pendingReset (the poisoned-session loop).
+        userBubbleRendered: conversationNodes().length > preCount,
       };
     }
     return {
@@ -1535,7 +1555,7 @@ function emitDelta(t, text) {
  * watchdog, abort) funnels here; the first caller wins.
  */
 /**
- * v1.2.59 — rate-limit recovery with exponential backoff.
+ * v1.2.60 — rate-limit recovery with exponential backoff.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1831,7 +1851,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.59 — ensure the button is on-screen before we compute the click
+  // v1.2.60 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -2003,7 +2023,7 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
-      // v1.2.59: capture the provider-reported token delta for this turn.
+      // v1.2.60: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
       // emit a real total_tokens instead of the chars/4 estimate.
@@ -2035,7 +2055,7 @@ window.addEventListener("message", (ev) => {
         finishTurn(false, "concurrency_blocked", d.hintError.content || "provider: another message is being generated");
         break;
       }
-      // v1.2.59: Continue/retry is the strongest "halted, more available"
+      // v1.2.60: Continue/retry is the strongest "halted, more available"
       // signal — check it BEFORE the empty-text failure path. A generation
       // that streamed only a THINK fragment leaves t.emitted.length === 0
       // when the stream closes; the old order fail-fast'd to dom-error
@@ -2298,9 +2318,9 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    rateLimitRetries: 0, // v1.2.59: rate-limit recovery attempts this turn
-    rateLimitRecoveryActive: false, // v1.2.59: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.59: for re-submit
+    rateLimitRetries: 0, // v1.2.60: rate-limit recovery attempts this turn
+    rateLimitRecoveryActive: false, // v1.2.60: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.60: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
