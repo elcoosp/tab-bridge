@@ -53,36 +53,6 @@ test("regression: RETRY_LABEL_RE covers the obvious retry labels", () => {
   assert.match(decl, /重试/, "RETRY_LABEL_RE must include the CJK 'retry' label");
 });
 
-test("regression: DOM tick null path checks generationFailedVisible() before the 60s fallback", () => {
-  // The DOM tick lives inside startDomObserver(). Its ordering invariants
-  // are what matter here, not proximity — the replyText() call, the
-  // serverDownVisible() check, the generationFailedVisible() check, and
-  // the generic submit-failed fallback all live in that one function.
-  // Extract its body and assert the indices are ordered.
-  const startIdx = SRC.indexOf("function startDomObserver(");
-  assert.notEqual(startIdx, -1, "startDomObserver() not found");
-  // The function closes at the first top-level `\n}` after startIdx.
-  const endIdx = SRC.indexOf("\n}", startIdx);
-  assert.notEqual(endIdx, -1, "closing brace of startDomObserver() not found");
-  const body = SRC.slice(startIdx, endIdx + 2);
-
-  const genFailIdx = body.indexOf("generationFailedVisible()");
-  const serverDownIdx = body.indexOf("serverDownVisible()");
-  const submitFailedIdx = body.indexOf('"submit-failed"');
-  assert.notEqual(genFailIdx, -1, "generationFailedVisible() must be called in startDomObserver()");
-  assert.notEqual(serverDownIdx, -1, "serverDownVisible() must still be called in startDomObserver()");
-  assert.notEqual(submitFailedIdx, -1, "submit-failed fallback not found in startDomObserver()");
-  assert.ok(
-    serverDownIdx < genFailIdx,
-    "serverDownVisible() must be checked before generationFailedVisible() — the outage banner is the more specific signal"
-  );
-  assert.ok(
-    genFailIdx < submitFailedIdx,
-    "generationFailedVisible() must be checked BEFORE the generic submit-failed fallback, " +
-      "else a silently-failed generation waits the full 60s before reporting"
-  );
-});
-
 test("regression: onNoStream checks generationFailedVisible()", () => {
   const idx = SRC.indexOf("async function onNoStream(");
   assert.notEqual(idx, -1, "onNoStream not found");

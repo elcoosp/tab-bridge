@@ -92,7 +92,7 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.56: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.57: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
@@ -1530,27 +1530,12 @@ function emitDelta(t, text) {
   }
   report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
 }
-
-/**
- * Snapshot-oriented <think> stripper for DOM-sourced text (the MAIN-world
- * hook filters the stream incrementally; the isolated world cannot reuse
- * it). Removes complete blocks and a trailing unclosed block (generation
- * still in flight). Applied to EVERY snapshot before diffing so lastSent
- * and deltas stay mutually consistent.
- */
-function stripThinkBlocks(text) {
-  if (!text || text.indexOf("<think") === -1) return text;
-  return text
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<think>[\s\S]*$/gi, "");
-}
-
 /**
  * Close the turn exactly once. Every path (SSE complete/error, DOM observer,
  * watchdog, abort) funnels here; the first caller wins.
  */
 /**
- * v1.2.56 — rate-limit recovery with exponential backoff.
+ * v1.2.57 — rate-limit recovery with exponential backoff.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1637,8 +1622,6 @@ function finishTurn(ok, code, detail, aborted, extra) {
   t.finished = true;
   if (t.fallbackTimer) clearTimeout(t.fallbackTimer);
   if (t.watchdog) clearInterval(t.watchdog);
-  if (t.domObserver) t.domObserver.disconnect();
-  if (t.domTick) clearInterval(t.domTick);
   hookPost({ type: "disarm" });
   turn = null;
   lastTurnEndedAt = Date.now();
@@ -1674,39 +1657,7 @@ function finishTurn(ok, code, detail, aborted, extra) {
   }
 }
 
-/** Hand capture over to the DOM observer (only while nothing was emitted). */
-function fallbackToDom(t, why) {
-  if (t.mode === "dom" || t.finished) return;
-  dbg("DOM fallback engaged:", why, `(hook ${sseHookPresent ? "present" : "ABSENT"})`);
-  t.mode = "dom";
-  if (t.fallbackTimer) {
-    clearTimeout(t.fallbackTimer);
-    t.fallbackTimer = null;
-  }
-  startDomObserver(t);
-}
 
-/**
- * v1.2.56 — DOM continuation.
- *
- * DeepSeek halted, the trusted Continue click landed, but the continuation
- * POST (if any) went over a transport the SSE hook does not intercept: the
- * caller would otherwise be handed the partial answer and the turn would
- * time out at the 120s idle ceiling. Switch to DOM reading instead — the
- * continuation is rendered in the same assistant bubble (or a new one), so
- * the existing DOM observer's growth-diff supplies the missing text as
- * ordinary fragments appended to `t.emitted`. The caller sees one continuous
- * response: partial + continued, one turn, no timeout, no partial yield.
- */
-function startDomContinuation(t) {
-  if (!t || t.finished || t.domObserver) return;
-  dbg("DOM continuation engaged for", t.reqId, `(partial=${t.emitted.length} chars)`);
-  t.mode = "dom";
-  t.domContinuation = true;
-  t.awaitContinue = 0;
-  t.continueGraceUntil = 0;
-  startDomObserver(t, { continuationBaseline: true });
-}
 
 /**
  * Provider stopped mid-answer with a Continue button on screen: click it and
@@ -1880,7 +1831,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.56 — ensure the button is on-screen before we compute the click
+  // v1.2.57 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -1967,21 +1918,6 @@ function maybeContinue(t, why) {
           JSON.stringify({ clicked, keyboardActivated })
       );
     }
-    if (r.ok) {
-      // v1.2.56 DOM continuation. The trusted click landed but the log
-      // shows `streamAfterClick:false` even when `stillThere:false`: the
-      // continuation travels over a transport the SSE hook does not see.
-      // Give the stream 1.5s to show up; if it does not, switch the turn
-      // to DOM reading so the continued text is appended to the partial
-      // we already emitted, inside the same turn.
-      setTimeout(() => {
-        if (!t || t.finished) return;
-        if (t.mode === "dom") return;
-        if (t.awaitContinue && t.lastSseAt > t.awaitContinue) return;
-        if (findContinueButton()) return;
-        startDomContinuation(t);
-      }, 1500);
-    }
     // Post-dispatch verification: did the button disappear?
     setTimeout(() => {
       if (!t || t.finished) return;
@@ -2001,248 +1937,6 @@ function maybeContinue(t, why) {
   return true;
 }
 
-/** Legacy DOM capture (v1.1 logic): observer + stability tick. Used only
- * when the SSE hook is absent or produced nothing. */
-function startDomObserver(t, opts) {
-  if (t.domObserver) return;
-  let lastLen = -1;
-  let sawGrowth = false;
-  let stableSince = 0;
-  let lastSent = "";
-  let tickLen = -1;
-  let tickStableSince = 0;
-
-  const continuationMode = !!(opts && opts.continuationBaseline === true);
-  const emitText = (text) => {
-    // DOM scraping sees RENDERED markdown: the thinking block leaks as plain
-    // text (tags are elements, not text) and code fences lose their backticks.
-    // Strip thinking here so DOM fallback never emits Chain-of-Thought. Fence
-    // fidelity is unrecoverable from DOM — tool turns must ride SSE (the
-    // 1.2.6 boot-race fix); this is only a prose safety net.
-    text = stripThinkBlocks(text);
-    if (continuationMode) {
-      // v1.2.56 DOM continuation. The SSE path already streamed the partial
-      // answer, DeepSeek halted, and its Continue click went over a transport
-      // the hook does not intercept. Read the growth of the assistant bubble
-      // as continued text; append it to what we already emitted so the caller
-      // receives partial+continued as one continuous stream in one turn.
-      if (text.startsWith(t.emitted)) {
-        const delta = text.slice(t.emitted.length);
-        if (delta) emitDelta(t, delta);
-      } else if (t.emitted.startsWith(text)) {
-        // The rendered bubble has not caught up with the partial we already
-        // sent. Wait for growth; do not double-emit.
-        return;
-      } else if (text.length > 0) {
-        // DeepSeek painted the continuation in a NEW bubble, so the prefix
-        // check fails. Emit that content additively — the caller still gets
-        // the full answer.
-        emitDelta(t, text);
-      }
-      return;
-    }
-    if (text.startsWith(lastSent)) {
-      const delta = text.slice(lastSent.length);
-      if (delta) {
-        lastSent = text;
-        emitDelta(t, delta);
-      }
-    } else if (t.emitted.length === 0) {
-      // Non-prefix re-read before anything was emitted: safe to adopt.
-      lastSent = text;
-      emitDelta(t, text);
-    }
-    // After content has flowed a non-prefix re-read cannot be resynced
-    // without corrupting the bridge's holdback buffer — ignore it.
-  };
-
-  /** Reply text: only nodes that appeared AFTER our prompt was submitted.
-   * Prefers the dedicated answer node (thinking excluded structurally);
-   * otherwise strips thinking subtrees from a clone (never mutates the page).
-   * Our own injected prompt (TOOL RESULTS / ASSISTANT CUE block) is never a
-   * reply, even when it renders after the baseline. */
-  function replyText() {
-    const nodes = conversationNodes();
-    if (nodes.length <= t.baseCount) return null; // no reply bubble yet
-    const last = nodes[nodes.length - 1];
-    let text = "";
-    try {
-      const main =
-        last.querySelector && last.querySelector("div.ds-assistant-message-main-content");
-      if (main) {
-        text = main.textContent || "";
-      } else {
-        const clone = last.cloneNode(true);
-        const thinkers = clone.querySelectorAll("div.ds-think-content");
-        thinkers.forEach((n) => {
-          try {
-            n.remove();
-          } catch {
-            /* noop */
-          }
-        });
-        text = clone.textContent || "";
-      }
-    } catch {
-      return null;
-    }
-    if (text.startsWith("=== TOOL RESULTS ===")) return null; // our own echo
-    return text;
-  }
-
-  const domDone = () => {
-    const composer = findFirst(SELECTORS.composer);
-    const sendBtn = composer ? findSendButton(composer) : null;
-    const stopBtn = findFirst(SELECTORS.stopButton);
-    // done = generation over: stop control gone AND send enabled again.
-    // A Continue button means halted, not done (handled before this).
-    if (findContinueButton()) return false;
-    return !stopBtn && sendBtn && isEnabled(sendBtn);
-  };
-
-  /** Stable text + done controls: Continue first, server-down next, else done. */
-  const settleTurn = () => {
-    if (maybeContinue(t, "dom-settled")) {
-      stableSince = 0;
-      tickStableSince = 0;
-      return;
-    }
-    if (serverDownVisible()) {
-      finishTurn(false, "dom-error", "provider: server temporarily unavailable");
-      return;
-    }
-    finishTurn(true);
-  };
-
-  const observer = new MutationObserver(() => {
-    if (t.finished) return;
-    const text = replyText();
-    if (text === null) return;
-    if (text.length > lastLen) {
-      if (lastLen >= 0) sawGrowth = true;
-      lastLen = text.length;
-      emitText(text);
-      stableSince = 0;
-    } else if (text.length === lastLen && sawGrowth) {
-      if (!stableSince) stableSince = Date.now();
-      else if (Date.now() - stableSince > 400 && domDone()) settleTurn();
-    }
-  });
-  observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-
-  // Secondary completion detector: a reply that finishes entirely inside the
-  // baseline-settle window never shows growth to the observer, so the tick
-  // checks "text settled + stop control gone + send enabled" on its own.
-  // It also bounds the silent case: a reply bubble that never appears at all
-  // (submitted but the provider never rendered) fails here within 60s
-  // instead of hanging to the turn deadline.
-  let nullSince = 0;
-  const tick = setInterval(() => {
-    if (t.finished) {
-      clearInterval(tick);
-      return;
-    }
-    // v1.2.56 — multi-halt support while in DOM continuation mode. If
-    // DeepSeek halts AGAIN after a previous resume, the Continue button
-    // reappears. Click it once more via the trusted debugger path (bounded
-    // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
-    if (continuationMode && (t.continues | 0) < MAX_CONTINUES) {
-      const contBtn = findContinueButton();
-      if (
-        contBtn &&
-        (!t.domContinuationClickAt || Date.now() - t.domContinuationClickAt > 5000)
-      ) {
-        t.domContinuationClickAt = Date.now();
-        maybeContinue(t, "dom-continuation-halt");
-      }
-    }
-    const text = replyText();
-    if (text === null) {
-      // Provider outage check FIRST. DeepSeek renders
-      // "Server is temporarily unavailable." as a system notice and the
-      // reply bubble never grows. Report the specific provider error so the
-      // bridge maps it to a retryable 502 — NOT submit-failed with
-      // submit_no_bubble=true, which wrongly tells the caller the tab was
-      // untouched when the tool-results attachment WAS placed.
-      if (serverDownVisible()) {
-        finishTurn(false, "dom-error", "provider: server temporarily unavailable");
-        return;
-      }
-      // Failed-generation check next. DeepSeek accepts the submit, commits
-      // the user bubble, then silently refuses to generate (rate limit at
-      // generation time, context overflow, model refusal) and paints a
-      // retry affordance. Failing here in ~1s is both faster and more
-      // honest than waiting out the 60s nullSince budget and reporting a
-      // generic submit-failed that lies about the tab state.
-      if (generationFailedVisible()) {
-        // Retry affordance = the icon-only warning-circle button, which
-        // findContinueButton already matches (pass 2 structural). Route
-        // through the trusted-debugger click instead of failing the turn
-        // outright — a successful click resumes the same generation, no
-        // reset, no SW flap. Only fail when no clickable control is
-        // actually present or MAX_CONTINUES has been exceeded.
-        if (maybeContinue(t, "generation-failed-retry")) return;
-        finishTurn(false, "dom-error", "provider: generation failed (retry affordance visible)");
-        return;
-      }
-      if (!nullSince) nullSince = Date.now();
-      else {
-        // No user bubble ever appeared (baseCount === submitCount) means the
-        // submit never landed — fail fast instead of riding the full 60 s.
-        const limit = t.baseCount === t.submitCount ? 5000 : 60000;
-        if (Date.now() - nullSince > limit) {
-          // Enrich the failure with the state we saw, so the bridge log
-          // pins down whether the composer was in edit mode, a Continue
-          // button was on-screen, or the tab simply never responded.
-          let diag = "";
-          try {
-            const c = findFirst(SELECTORS.composer);
-            diag = ` [editMode=${composerInEditMode(c) ? "y" : "n"}, continueBtn=${findContinueButton() ? "y" : "n"}, composerLen=${c ? readComposer(c).length : -1}]`;
-          } catch {
-            /* diagnostic only */
-          }
-          finishTurn(
-            false,
-            "submit-failed",
-            `reply bubble never appeared within ${limit / 1000}s of submit${diag}`,
-            false,
-            { userBubbleRendered: conversationNodes().length > t.submitCount }
-          );
-        }
-      }
-      return;
-    }
-    nullSince = 0;
-    // v1.2.56 continuation bailout: if the Continue button persists past
-    // MAX_CONTINUES trusted-click retries, finish with what we captured
-    // rather than hanging until the turn deadline.
-    if (
-      continuationMode &&
-      (t.continues | 0) >= MAX_CONTINUES &&
-      tickStableSince &&
-      Date.now() - tickStableSince > 5000 &&
-      text.length > 0
-    ) {
-      dbg(
-        "DOM continuation exhausted; finishing with captured text",
-        `(${t.emitted.length} chars, ${t.continues | 0} click(s))`
-      );
-      finishTurn(true);
-      return;
-    }
-    if (text.length !== tickLen) {
-      tickLen = text.length;
-      tickStableSince = Date.now();
-      return;
-    }
-    if (tickStableSince && Date.now() - tickStableSince > 600 && text.length > 0 && domDone()) {
-      settleTurn();
-    }
-  }, 1000);
-
-  t.domObserver = observer;
-  t.domTick = tick;
-}
 
 // ---------------------------------------------------------------------------
 // MAIN-world hook observations (window messages)
@@ -2309,7 +2003,7 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
-      // v1.2.56: capture the provider-reported token delta for this turn.
+      // v1.2.57: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
       // emit a real total_tokens instead of the chars/4 estimate.
@@ -2350,7 +2044,7 @@ window.addEventListener("message", (ev) => {
           finishTurn(false, "concurrency_blocked", "provider notice: another message is generating");
           break;
         }
-        fallbackToDom(t, "completion stream closed without text");
+        finishTurn(false, "dom-error", "completion stream closed without text");
         break;
       }
       // Provider halted mid-answer with more available: resume in this turn.
@@ -2383,7 +2077,7 @@ window.addEventListener("message", (ev) => {
       if (t.emitted.length > 0) {
         finishTurn(false, "dom-error", "capture failed after partial stream: " + (d.error || d.type));
       } else {
-        fallbackToDom(t, `${d.type}: ${d.error || "capture failed"}`);
+        finishTurn(false, "dom-error", `${d.type}: ${d.error || "capture failed"}`);
       }
       break;
     default:
@@ -2474,7 +2168,7 @@ function startWatchdog(t) {
           dbg("Continue produced no stream within 10s — ending turn with the captured text", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
           finishTurn(true);
         } else {
-          fallbackToDom(t, "continuation produced no stream and no captured text");
+          finishTurn(false, "dom-error", "continuation produced no stream and no captured text");
         }
       }
     }
@@ -2498,11 +2192,10 @@ function onPortMessage(msg) {
 }
 
 /**
- * 15s no-stream window handler. If the bubble container grew (a slow render
- * beat the stream), hand capture to the DOM observer. Otherwise, when the
- * composer still holds the text and no bubble rendered, self-heal by
- * re-running the submit pipeline once (idempotent — no bubble means nothing
- * to duplicate). Only after the retry does the turn actually fail.
+ * 15s no-stream window handler. When the composer still holds the
+ * text, self-heal by re-running the submit pipeline once (idempotent —
+ * no bubble means nothing to duplicate). Only after the retry fails
+ * does the turn actually fail.
  */
 async function onNoStream(t, composer, originalText, isRetry) {
   if (turn !== t || t.finished || t.mode !== "sse-await") return;
@@ -2525,14 +2218,6 @@ async function onNoStream(t, composer, originalText, isRetry) {
     // the click budget is exhausted or the button truly is not present.
     if (maybeContinue(t, "generation-failed-retry")) return;
     finishTurn(false, "dom-error", "provider: generation failed (retry affordance visible)");
-    return;
-  }
-  const domEvidence = dsMessageCount() > (t.dsMessageBase ?? t.submitCount);
-  if (domEvidence) {
-    fallbackToDom(
-      t,
-      isRetry ? "no completion stream within 15s (retry)" : "no completion stream within 15s"
-    );
     return;
   }
   if (!isRetry) {
@@ -2604,16 +2289,12 @@ async function handleTurn(msg) {
     baseCount: -1,
     fallbackTimer: null,
     watchdog: null,
-    domObserver: null,
-    domTick: null,
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    domContinuation: false, // v1.2.56: DOM-continuation mode active for this turn
-    domContinuationClickAt: 0, // v1.2.56: last DOM-continuation Continue click (cooldown)
-    rateLimitRetries: 0, // v1.2.56: rate-limit recovery attempts this turn
-    rateLimitRecoveryActive: false, // v1.2.56: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.56: for re-submit
+    rateLimitRetries: 0, // v1.2.57: rate-limit recovery attempts this turn
+    rateLimitRecoveryActive: false, // v1.2.57: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.57: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
@@ -2635,10 +2316,8 @@ async function handleTurn(msg) {
     }
     if (sseHookPresent) {
       hookPost({ type: "arm", turnId: msg.reqId, timeoutMs: opts.timeoutMs || 240000 });
-      t.mode = "sse-await";
-    } else {
-      t.mode = "dom";
     }
+    t.mode = "sse-await";
     // Frozen BEFORE the submit: the submit-block scan only looks at nodes
     // that appear after this point, so our own prompt echo can't match.
     t.submitCount = conversationNodes().length;
@@ -2665,11 +2344,7 @@ async function handleTurn(msg) {
     // Let the user bubble render before freezing the reply baseline.
     await sleep(REPLY_BASELINE_SETTLE_MS);
     t.baseCount = conversationNodes().length;
-    if (t.mode === "dom") {
-      startDomObserver(t);
-    } else {
-      scheduleNoStreamFallback(t, composer, msg.text, false);
-    }
+    scheduleNoStreamFallback(t, composer, msg.text, false);
     startWatchdog(t);
   } catch (e) {
     finishTurn(false, "dom-error", String(e && e.message));
