@@ -92,7 +92,7 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.55: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.56: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
@@ -1550,7 +1550,7 @@ function stripThinkBlocks(text) {
  * watchdog, abort) funnels here; the first caller wins.
  */
 /**
- * v1.2.55 — rate-limit recovery with exponential backoff.
+ * v1.2.56 — rate-limit recovery with exponential backoff.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1656,7 +1656,10 @@ function finishTurn(ok, code, detail, aborted, extra) {
   }
   if (ok) {
     dbg("turn done:", t.reqId, `chars=${t.emitted.length}`, `mode=${t.mode}`);
-    report("TURN_DONE", { reqId: t.reqId });
+    report("TURN_DONE", {
+      reqId: t.reqId,
+      ...(typeof t.usageTokens === "number" ? { usageTokens: t.usageTokens } : {}),
+    });
   } else if (aborted) {
     dbg("turn aborted:", t.reqId);
     report("TURN_ABORTED", { reqId: t.reqId });
@@ -1684,7 +1687,7 @@ function fallbackToDom(t, why) {
 }
 
 /**
- * v1.2.55 — DOM continuation.
+ * v1.2.56 — DOM continuation.
  *
  * DeepSeek halted, the trusted Continue click landed, but the continuation
  * POST (if any) went over a transport the SSE hook does not intercept: the
@@ -1877,7 +1880,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.55 — ensure the button is on-screen before we compute the click
+  // v1.2.56 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -1965,7 +1968,7 @@ function maybeContinue(t, why) {
       );
     }
     if (r.ok) {
-      // v1.2.55 DOM continuation. The trusted click landed but the log
+      // v1.2.56 DOM continuation. The trusted click landed but the log
       // shows `streamAfterClick:false` even when `stillThere:false`: the
       // continuation travels over a transport the SSE hook does not see.
       // Give the stream 1.5s to show up; if it does not, switch the turn
@@ -2018,7 +2021,7 @@ function startDomObserver(t, opts) {
     // 1.2.6 boot-race fix); this is only a prose safety net.
     text = stripThinkBlocks(text);
     if (continuationMode) {
-      // v1.2.55 DOM continuation. The SSE path already streamed the partial
+      // v1.2.56 DOM continuation. The SSE path already streamed the partial
       // answer, DeepSeek halted, and its Continue click went over a transport
       // the hook does not intercept. Read the growth of the assistant bubble
       // as continued text; append it to what we already emitted so the caller
@@ -2139,7 +2142,7 @@ function startDomObserver(t, opts) {
       clearInterval(tick);
       return;
     }
-    // v1.2.55 — multi-halt support while in DOM continuation mode. If
+    // v1.2.56 — multi-halt support while in DOM continuation mode. If
     // DeepSeek halts AGAIN after a previous resume, the Continue button
     // reappears. Click it once more via the trusted debugger path (bounded
     // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
@@ -2210,7 +2213,7 @@ function startDomObserver(t, opts) {
       return;
     }
     nullSince = 0;
-    // v1.2.55 continuation bailout: if the Continue button persists past
+    // v1.2.56 continuation bailout: if the Continue button persists past
     // MAX_CONTINUES trusted-click retries, finish with what we captured
     // rather than hanging until the turn deadline.
     if (
@@ -2306,6 +2309,17 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
+      // v1.2.56: capture the provider-reported token delta for this turn.
+      // The wire carries a cumulative counter (thinking + response); the
+      // per-turn total is final − baseline. Propagated up so the engine can
+      // emit a real total_tokens instead of the chars/4 estimate.
+      if (typeof d.usageBaseline === "number" && typeof d.usageFinal === "number") {
+        const delta = d.usageFinal - d.usageBaseline;
+        if (delta > 0) {
+          t.usageTokens = delta;
+          dbg("turn usage (provider)", `${delta} tokens`, `(${d.usageBaseline}→${d.usageFinal})`);
+        }
+      }
       const finalText = typeof d.text === "string" ? d.text : "";
       // Belt & braces: emit any suffix the delta stream missed (the parser's
       // think-filter guarantees finalText === emitted, so this is a no-op in
@@ -2595,11 +2609,11 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    domContinuation: false, // v1.2.55: DOM-continuation mode active for this turn
-    domContinuationClickAt: 0, // v1.2.55: last DOM-continuation Continue click (cooldown)
-    rateLimitRetries: 0, // v1.2.55: rate-limit recovery attempts this turn
-    rateLimitRecoveryActive: false, // v1.2.55: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.55: for re-submit
+    domContinuation: false, // v1.2.56: DOM-continuation mode active for this turn
+    domContinuationClickAt: 0, // v1.2.56: last DOM-continuation Continue click (cooldown)
+    rateLimitRetries: 0, // v1.2.56: rate-limit recovery attempts this turn
+    rateLimitRecoveryActive: false, // v1.2.56: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.56: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);

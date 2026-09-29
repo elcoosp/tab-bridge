@@ -1082,6 +1082,12 @@ function handleInjectorMessage(tabId, port, msg) {
         const s = fragStats.get(msg.reqId);
         blog(msg.t, msg.reqId, s ? `(${s.n} fragments, ${s.chars} chars)` : "(no fragments)");
         fragStats.delete(msg.reqId);
+        // v1.2.56: emit USAGE before STATUS done when the injector forwarded
+        // the provider-reported token delta. The deepseek adapter reads
+        // ev.t === "USAGE" and stashes meta onto TurnResult.usageMeta.
+        if (typeof msg.usageTokens === "number" && msg.usageTokens > 0) {
+          send({ t: "USAGE", reqId: msg.reqId, meta: { total_tokens: msg.usageTokens } });
+        }
         send({ t: "STATUS", reqId: msg.reqId, code: msg.t === "TURN_DONE" ? "done" : "aborted" });
         break;
       }

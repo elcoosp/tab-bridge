@@ -172,12 +172,26 @@ function optionsFor(req: TurnRequest): TurnOptions {
  * Run one streamed observation pass: pump adapter fragments through the
  * holdback buffer, emitting content/call events. Returns the pass result.
  */
+/**
+ * v1.2.56 — extract a provider-reported total-token count from an adapter's
+ * usageMeta bag. The deepseek adapter surfaces `{ total_tokens }` when the
+ * worker's USAGE observation arrived before STATUS done; anything else
+ * (unknown shape, negative/zero, non-number) returns undefined so the
+ * estimate path stays authoritative.
+ */
+function readTotalTokens(meta: Record<string, unknown> | undefined): number | undefined {
+  if (!meta) return undefined;
+  const v = meta.total_tokens;
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return undefined;
+  return Math.floor(v);
+}
+
 async function observePass(
   req: TurnRequest,
   tab: ManagedTab,
   events: TurnEvents,
   tools: ToolSpec[]
-): Promise<{ text: string; calls: ParsedCall[]; invalidText: string[]; passWarnings: string[]; stopReason: string }> {
+): Promise<{ text: string; calls: ParsedCall[]; invalidText: string[]; passWarnings: string[]; stopReason: string; usageMeta?: Record<string, unknown> }> {
   const holdback = new HoldbackBuffer(req.holdbackCeiling ?? HOLDBACK_CEILING);
   const calls: ParsedCall[] = [];
   const callOccurrence = new Map<string, number>();
@@ -237,6 +251,7 @@ async function observePass(
     invalidText,
     passWarnings,
     stopReason: result.stopReason,
+    ...(result.usageMeta !== undefined ? { usageMeta: result.usageMeta } : {}),
   };
 }
 
@@ -354,6 +369,8 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     const warnings = [...first.passWarnings];
     let repairsUsed = 0;
     let stopReason = first.stopReason;
+    // v1.2.56: provider-reported total_tokens, summed across repair rounds.
+    let usageTotalTokens: number | undefined = readTotalTokens(first.usageMeta);
 
     // ---- repair round (ADR-5, spec 6.4) --------------------------------------
     if (calls.length === 0 && tools.length > 0 && warnings.length > 0 && req.repairRounds > 0) {
@@ -364,6 +381,10 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       const second = await observePass(req, tab, events, tools);
       text += second.text;
       stopReason = second.stopReason;
+      const secondTotal = readTotalTokens(second.usageMeta);
+      if (secondTotal !== undefined) {
+        usageTotalTokens = (usageTotalTokens ?? 0) + secondTotal;
+      }
       if (second.calls.length > 0) {
         calls = second.calls;
         warnings.push("recovered after repair round");
@@ -377,8 +398,26 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       calls.length > 0 ? "tool_calls" : stopReason === "length" ? "length" : "stop";
 
     // ---- usage ---------------------------------------------------------------
-    const promptTokens = Math.ceil(promptText.length / 4);
-    const completionTokens = Math.ceil(text.length / 4) || 0;
+    // v1.2.56: provider-reported token totals. total_tokens comes from
+    // DeepSeek's accumulated_token_usage delta when available (real,
+    // includes thinking); prompt is our chars/4 estimate; completion is
+    // derived so prompt + completion === total. Fallback to the all-
+    // estimate shape when no provider total was captured.
+    const promptEstimate = Math.ceil(promptText.length / 4);
+    const completionEstimate = Math.ceil(text.length / 4) || 0;
+    let promptTokens = promptEstimate;
+    let completionTokens = completionEstimate;
+    let totalTokens = promptEstimate + completionEstimate;
+    if (usageTotalTokens !== undefined && usageTotalTokens > 0) {
+      totalTokens = usageTotalTokens;
+      if (promptEstimate >= totalTokens) {
+        promptTokens = totalTokens;
+        completionTokens = 0;
+      } else {
+        promptTokens = promptEstimate;
+        completionTokens = totalTokens - promptEstimate;
+      }
+    }
 
     // ---- commit chain + tabHash (spec 5.1/5.2) -------------------------------
     const chain =
@@ -429,7 +468,7 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       usage: {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
+        total_tokens: totalTokens,
       },
       plan: plan.plan,
       sessionId: row.sessionId,

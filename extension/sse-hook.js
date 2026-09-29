@@ -271,6 +271,13 @@
       let sawDoneMarker = false;
       let sawFinish = false;
       let hintError = null;
+      // v1.2.56: provider-reported token accounting. DeepSeek streams an
+      // authoritative cumulative token count (`accumulated_token_usage`),
+      // baseline in the initial {v:{response:...}} snapshot, refined by
+      // BATCH sub-patches. Per-turn total = final − baseline and INCLUDES
+      // thinking tokens (no separate think/response split on the wire).
+      let usageBaseline = null;
+      let usageFinal = null;
       // Frames that carried a payload but yielded no text: proves whether
       // "missing" bytes were never extracted (odd wire shape) vs never sent.
       let skipped = 0;
@@ -332,6 +339,13 @@
       }
 
       function applyPatchOp(p, o, v, out) {
+        // v1.2.56: cumulative token counter — arrives as a sub-patch of the
+        // terminal BATCH (no "o"), and possibly as its own frame.
+        if (p === "accumulated_token_usage" && typeof v === "number") {
+          if (usageBaseline === null) usageBaseline = v;
+          usageFinal = v;
+          return;
+        }
         if (p === "response/fragments" && o === "APPEND" && Array.isArray(v)) {
           for (const f of v) {
             if (!f || typeof f !== "object") continue;
@@ -375,6 +389,10 @@
         const rv = obj.v;
         if (rv && typeof rv === "object" && !Array.isArray(rv) && rv.response && typeof rv.response === "object") {
           const resp = rv.response;
+          if (typeof resp.accumulated_token_usage === "number" && usageBaseline === null) {
+            usageBaseline = resp.accumulated_token_usage;
+            usageFinal = resp.accumulated_token_usage;
+          }
           if (typeof resp.status === "string" && /finish/i.test(resp.status)) sawFinish = true;
           if (Array.isArray(resp.fragments)) {
             for (const f of resp.fragments) {
@@ -496,6 +514,8 @@
           sawDoneMarker,
           sawFinish,
           hintError,
+          usageBaseline,
+          usageFinal,
         };
       }
 
@@ -560,7 +580,7 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.55",
+    hookVersion: "1.2.56",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,
@@ -778,6 +798,8 @@
       sawAny: fin.sawAny,
       doneMarker: fin.sawDoneMarker || fin.sawFinish,
       hintError: fin.hintError,
+      usageBaseline: fin.usageBaseline,
+      usageFinal: fin.usageFinal,
     });
     try {
       branch.cancel();
@@ -987,6 +1009,8 @@
         sawAny: fin.sawAny,
         doneMarker: fin.sawDoneMarker || fin.sawFinish,
         hintError: fin.hintError,
+        usageBaseline: fin.usageBaseline,
+        usageFinal: fin.usageFinal,
       });
     };
 
@@ -1155,6 +1179,8 @@
         sawAny: fin.sawAny,
         doneMarker: true,
         hintError: fin.hintError,
+        usageBaseline: fin.usageBaseline,
+        usageFinal: fin.usageFinal,
       });
     };
 
