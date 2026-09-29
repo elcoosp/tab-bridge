@@ -181,6 +181,11 @@ function syntheticClick(el) {
       clientY: y,
       button: 0,
       buttons: 0,
+      // detail: 1 marks this as a real user-style click. Some SPA handlers
+      // guard on `event.detail >= 1` to ignore programmatic .click() calls
+      // (which produce detail=0). Setting it here is the only way to reach
+      // those handlers.
+      detail: 1,
       // view: window is required by some frameworks' synthetic-event
       // normalizers (React doesn't care, but it's harmless).
       view: window,
@@ -222,25 +227,78 @@ function syntheticClick(el) {
  * nothing is found.
  */
 function dumpReactHandlers(el) {
-  let key = null;
-  try {
-    const keys = Object.keys(el);
-    key = keys.find((k) => k.startsWith("__reactProps") || k.startsWith("__reactEventHandlers"));
-  } catch {
-    return "(no keys)";
-  }
-  if (!key) return "(no react props)";
-  const props = el[key];
-  if (!props || typeof props !== "object") return "(props not an object)";
-  const out = [];
-  try {
-    for (const name of Object.keys(props)) {
-      if (/^on[A-Z]/.test(name)) out.push(name);
+  const ownKeysOf = (node) => {
+    try {
+      return Object.keys(node);
+    } catch {
+      return [];
     }
-  } catch {
-    return "(iteration error)";
+  };
+  const reactPropsKeyOf = (node) => {
+    const keys = ownKeysOf(node);
+    return keys.find((k) => k.startsWith("__reactProps") || k.startsWith("__reactEventHandlers"));
+  };
+  const fiberKeyOf = (node) => {
+    const keys = ownKeysOf(node);
+    return keys.find((k) => k.startsWith("__reactFiber") || k.startsWith("__reactInternalInstance"));
+  };
+  const summarize = (props) => {
+    if (!props || typeof props !== "object") return "(not-an-object)";
+    const out = [];
+    try {
+      for (const name of Object.keys(props)) {
+        if (/^on[A-Z]/.test(name)) out.push(name);
+      }
+    } catch {
+      return "(iteration-error)";
+    }
+    return out.length > 0 ? out.join(",") : "(no-handler-props)";
+  };
+  // Pass 1: props on the element itself.
+  const selfKey = reactPropsKeyOf(el);
+  if (selfKey) return "self:" + summarize(el[selfKey]);
+  // Pass 2: fiber on the element itself but no props key (React 19 shape).
+  const selfFiberKey = fiberKeyOf(el);
+  if (selfFiberKey) {
+    let fp = null;
+    try {
+      fp = el[selfFiberKey] && el[selfFiberKey].memoizedProps;
+    } catch {
+      /* noop */
+    }
+    return "self-fiber:" + summarize(fp);
   }
-  return out.length > 0 ? out.join(",") : "(no handler props)";
+  // Pass 3: walk ancestors up to 20 hops. Report the first ancestor that
+  // has React keys, along with how far up it is.
+  let node = el.parentElement;
+  let hops = 0;
+  while (node && hops < 20) {
+    const pk = reactPropsKeyOf(node);
+    if (pk) {
+      const cls =
+        typeof node.className === "string" && node.className
+          ? "." + node.className.trim().split(/\s+/)[0]
+          : "";
+      return "ancestor+" + hops + "(" + node.tagName.toLowerCase() + cls + "):" + summarize(node[pk]);
+    }
+    const fk = fiberKeyOf(node);
+    if (fk) {
+      let fp = null;
+      try {
+        fp = node[fk] && node[fk].memoizedProps;
+      } catch {
+        /* noop */
+      }
+      const cls =
+        typeof node.className === "string" && node.className
+          ? "." + node.className.trim().split(/\s+/)[0]
+          : "";
+      return "ancestor-fiber+" + hops + "(" + node.tagName.toLowerCase() + cls + "):" + summarize(fp);
+    }
+    node = node.parentElement;
+    hops++;
+  }
+  return "(no react props on el or 20 ancestors)";
 }
 
 function keyboardActivate(el) {
@@ -1538,6 +1596,113 @@ function fallbackToDom(t, why) {
  * is a fresh completion POST, so the hook is re-armed to catch it. Bounded:
  * returns false when no button is present or the budget is spent.
  */
+/**
+ * Last-resort activation via React fiber traversal.
+ *
+ * If syntheticClick + keyboardActivate both fail (the button survives
+ * every dispatched event and the stream does not resume), the DOM event
+ * pipeline is being ignored — either because the button's handler lives on
+ * an ancestor fiber, or because a delegated root handler has decided the
+ * synthetic event is not real. This helper finds the fiber for the button
+ * (or for the nearest React-tracked ancestor) and invokes the first
+ * onClick / onPointerUp / onMouseUp / onPointerDown / onMouseDown prop it
+ * finds on the fiber's return chain, passing a minimal synthetic-event
+ * shim. This is a function call, not an event dispatch — the handler
+ * cannot reject it for being synthetic.
+ *
+ * Non-fatal: returns false when no fiber or no handler prop is found, so
+ * the existing continue-no-stream recovery still ends the turn cleanly.
+ */
+function deepReactActivate(el) {
+  if (!el || !el.isConnected) return false;
+  const fiberKeyOf = (node) => {
+    let keys;
+    try {
+      keys = Object.keys(node);
+    } catch {
+      return null;
+    }
+    return keys.find((k) => k.startsWith("__reactFiber") || k.startsWith("__reactInternalInstance"));
+  };
+  // Find any React fiber on the element or its ancestors.
+  let rootNode = el;
+  let rootFiber = null;
+  let hops = 0;
+  while (rootNode && hops < 30) {
+    const key = fiberKeyOf(rootNode);
+    if (key) {
+      rootFiber = rootNode[key];
+      break;
+    }
+    rootNode = rootNode.parentElement;
+    hops++;
+  }
+  if (!rootFiber) {
+    trace("deepReactActivate: no fiber on el or 30 ancestors");
+    return false;
+  }
+  // Walk the fiber tree (child/sibling) to find the fiber whose stateNode
+  // is our element. If rootFiber already is the fiber we want, use it.
+  let targetFiber = rootFiber;
+  if (rootFiber.stateNode !== el) {
+    let found = null;
+    const walk = (f, depth) => {
+      if (found || !f || depth > 400) return;
+      if (f.stateNode === el) {
+        found = f;
+        return;
+      }
+      if (f.child) walk(f.child, depth + 1);
+      if (f.sibling) walk(f.sibling, depth + 1);
+    };
+    walk(rootFiber, 0);
+    if (!found) {
+      trace("deepReactActivate: fiber for el not found in tree");
+      return false;
+    }
+    targetFiber = found;
+  }
+  // Walk the fiber's return chain looking for a handler prop. Host
+  // components (our div) have memoizedProps with onClick/onPointerUp/etc
+  // exactly when they were passed; composite ancestors may carry them too.
+  const HANDLERS = ["onClick", "onPointerUp", "onMouseUp", "onPointerDown", "onMouseDown"];
+  let f = targetFiber;
+  let up = 0;
+  while (f && up < 30) {
+    const props = f.memoizedProps;
+    if (props && typeof props === "object") {
+      for (const name of HANDLERS) {
+        const fn = props[name];
+        if (typeof fn === "function") {
+          try {
+            const ev = {
+              type: name.slice(2).toLowerCase(),
+              target: el,
+              currentTarget: el,
+              nativeEvent: { type: name.slice(2).toLowerCase(), target: el },
+              preventDefault() {},
+              stopPropagation() {},
+              persist() {},
+              isDefaultPrevented: () => false,
+              isPropagationStopped: () => false,
+              isTrusted: true,
+            };
+            fn(ev);
+            trace("deepReactActivate: invoked " + name + " at fiber-return+" + up);
+            return true;
+          } catch (e) {
+            trace("deepReactActivate: " + name + " threw", String((e && e.message) || e));
+          }
+        }
+      }
+    }
+    f = f.return;
+    up++;
+  }
+  trace("deepReactActivate: no handler prop on fiber chain (30 levels)");
+  return false;
+}
+
 function maybeContinue(t, why) {
   if (!t || t.finished || (t.continues | 0) >= MAX_CONTINUES) {
     trace("maybeContinue: skip", {
@@ -1563,9 +1728,22 @@ function maybeContinue(t, why) {
     reactHandlers = "ERR: " + String((e && e.message) || e);
   }
   let rectStr = "{}";
+  let hitStr = "(unknown)";
   try {
     const r = btn.getBoundingClientRect();
     rectStr = JSON.stringify({ x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) });
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    if (hit) {
+      const tag = hit.tagName.toLowerCase();
+      const cls =
+        typeof hit.className === "string" && hit.className
+          ? "." + hit.className.trim().split(/\s+/)[0]
+          : "";
+      const isSelf = hit === btn || btn.contains(hit);
+      hitStr = (isSelf ? "self" : "other") + ":" + tag + cls;
+    } else {
+      hitStr = "(null)";
+    }
   } catch {
     /* noop */
   }
@@ -1576,6 +1754,21 @@ function maybeContinue(t, why) {
         outerHTML: (btn.outerHTML || "").slice(0, 260),
         className: typeof btn.className === "string" ? btn.className : String(btn.className),
         rect: rectStr,
+        hitAtCenter: hitStr,
+        docFocus: (() => {
+          try {
+            return document.hasFocus();
+          } catch {
+            return null;
+          }
+        })(),
+        visibility: (() => {
+          try {
+            return document.visibilityState;
+          } catch {
+            return null;
+          }
+        })(),
         reactHandlers,
       })
   );
@@ -1652,9 +1845,15 @@ function maybeContinue(t, why) {
           } catch {
             /* noop */
           }
+          // Last resort: invoke the React handler directly via the fiber
+          // tree. This bypasses the DOM event pipeline entirely, which is
+          // the only remaining option when the button survives every
+          // dispatched event.
+          const invoked = deepReactActivate(btn2);
+          dbg("maybeContinue: deepReactActivate returned " + String(invoked));
         }
-      } catch {
-        /* noop */
+      } catch (e) {
+        dbg("maybeContinue: second-wave recovery threw " + String((e && e.message) || e));
       }
     }
   }, 300);
