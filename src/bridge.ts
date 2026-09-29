@@ -61,8 +61,7 @@ export class TabBridge {
    * excess turns queue FIFO. See src/core/turngate.ts. */
   readonly turnGate: TurnGate;
   private readonly wsServer: WsServer;
-  private readonly bindTabImpl: (sessionId: string, timeoutMs: number) => Promise<number>;
-  private pendingNoCreate = false;
+  private readonly bindTabImpl: (sessionId: string, timeoutMs: number, opts?: { noCreate?: boolean }) => Promise<number | { tabId: number; dirty?: boolean }>;
 
   constructor(config: Config, adapter?: ChatProviderAdapter) {
     this.config = config;
@@ -87,6 +86,8 @@ export class TabBridge {
       autoCreateTabs: config.autoCreateTabs,
       managedOnly: config.managedOnly,
       warmTabs: config.warmTabs,
+      maxTabs: config.maxTabs ?? 4,
+      tabIdleCloseMs: config.tabIdleCloseMs ?? 15 * 60_000,
     });
     this.adapter = adapter ?? new DeepSeekAdapter(this.pool, { maxPromptChars: config.maxPromptChars });
     this.turnGate = new TurnGate({
@@ -94,13 +95,13 @@ export class TabBridge {
       capacity: config.queueCapacity,
       queueTimeoutMs: config.queueTimeoutMs,
     });
-    this.bindTabImpl = async (sessionId, timeoutMs) => {
+    this.bindTabImpl = async (sessionId, timeoutMs, opts) => {
       const anyAdapter = this.adapter as ChatProviderAdapter & {
         pool?: WorkerPool;
       };
       if (anyAdapter.pool) {
-        const bound = await anyAdapter.pool.bind(sessionId, timeoutMs);
-        return bound.tabId;
+        const bound = await anyAdapter.pool.bind(sessionId, timeoutMs, opts ?? {});
+        return bound.tabId === undefined ? 1 : bound;
       }
       // Pool-less adapters (scripted) use a stable pseudo tab.
       return 1;
@@ -151,6 +152,12 @@ export class TabBridge {
       // longer time-to-first-byte ("thinking"); nothing else changes.
       const gateWaitMs = await this.turnGate.acquire(row.sessionId, params.signal);
       gateHeld = true;
+      // E5: background-class ephemeral traffic binds with noCreate so it can
+      // never force a new tab; it waits only for a free one (fail-fast 429).
+      const noCreate = ephemeral && params.background === true;
+      const bindTab = noCreate
+        ? ((sid: string, ms: number) => this.bindTabImpl(sid, ms, { noCreate: true }))
+        : this.bindTabImpl;
       const out = await runTurn(
         {
           messages: params.messages,
@@ -163,7 +170,8 @@ export class TabBridge {
           turnTimeoutMs: this.config.turnTimeoutMs,
           bindTimeoutMs: this.config.bindTimeoutMs,
           holdbackCeiling: this.config.holdbackCeiling,
-          bindTab: this.bindTabImpl,
+          bindTab,
+          resetOnSeed: this.config.resetOnSeed ?? "auto",
         },
         params.events
       );
@@ -212,6 +220,9 @@ export class TabBridge {
       auto_create_tabs: this.config.autoCreateTabs,
       managed_only: this.config.managedOnly,
       warm_tabs: this.config.warmTabs,
+      reset_on_seed: this.config.resetOnSeed,
+      max_tabs: this.config.maxTabs,
+      tab_idle_close_ms: this.config.tabIdleCloseMs,
       sessions: this.registry.size,
       turn_gate: this.turnGate.stats(),
       worker: this.pool.workerInfo
