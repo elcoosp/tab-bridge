@@ -271,7 +271,7 @@
       let sawDoneMarker = false;
       let sawFinish = false;
       let hintError = null;
-      // v1.2.57: provider-reported token accounting. DeepSeek streams an
+      // v1.2.58: provider-reported token accounting. DeepSeek streams an
       // authoritative cumulative token count (`accumulated_token_usage`),
       // baseline in the initial {v:{response:...}} snapshot, refined by
       // BATCH sub-patches. Per-turn total = final − baseline and INCLUDES
@@ -339,7 +339,7 @@
       }
 
       function applyPatchOp(p, o, v, out) {
-        // v1.2.57: cumulative token counter — arrives as a sub-patch of the
+        // v1.2.58: cumulative token counter — arrives as a sub-patch of the
         // terminal BATCH (no "o"), and possibly as its own frame.
         if (p === "accumulated_token_usage" && typeof v === "number") {
           if (usageBaseline === null) usageBaseline = v;
@@ -580,7 +580,7 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.57",
+    hookVersion: "1.2.58",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,

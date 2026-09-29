@@ -92,7 +92,7 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.57: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.58: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
@@ -1535,7 +1535,7 @@ function emitDelta(t, text) {
  * watchdog, abort) funnels here; the first caller wins.
  */
 /**
- * v1.2.57 — rate-limit recovery with exponential backoff.
+ * v1.2.58 — rate-limit recovery with exponential backoff.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1831,7 +1831,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.57 — ensure the button is on-screen before we compute the click
+  // v1.2.58 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -2003,7 +2003,7 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
-      // v1.2.57: capture the provider-reported token delta for this turn.
+      // v1.2.58: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
       // emit a real total_tokens instead of the chars/4 estimate.
@@ -2292,9 +2292,9 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    rateLimitRetries: 0, // v1.2.57: rate-limit recovery attempts this turn
-    rateLimitRecoveryActive: false, // v1.2.57: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.57: for re-submit
+    rateLimitRetries: 0, // v1.2.58: rate-limit recovery attempts this turn
+    rateLimitRecoveryActive: false, // v1.2.58: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.58: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
