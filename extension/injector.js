@@ -2223,7 +2223,7 @@ function startWatchdog(t) {
     // now guarantees the hook is armed before the click). One retry, then
     // end the turn with whatever was already captured — never hang
     // indefinitely, even if the Continue button persists forever.
-    if (t.awaitContinue && t.lastSseAt < t.awaitContinue && now - t.awaitContinue > 5000) {
+    if (t.awaitContinue && t.lastSseAt < t.awaitContinue && now - t.awaitContinue > 10000) {
       trace("continue-no-stream recovery firing", {
         reqId: t.reqId,
         emitted: t.emitted.length,
@@ -2232,14 +2232,19 @@ function startWatchdog(t) {
         sinceClickMs: now - t.awaitContinue,
       });
       t.awaitContinue = 0;
-      const retried = (t.continues | 0) < 2 && maybeContinue(t, "continue-no-stream");
-      if (!retried) {
-        if (t.emitted.length > 0) {
-          dbg("Continue produced no stream within 5s — ending turn with the captured text", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
-          finishTurn(true);
-        } else {
-          fallbackToDom(t, "continuation produced no stream and no captured text");
-        }
+      const retried = (t.continues | 0) < MAX_CONTINUES && maybeContinue(t, "continue-no-stream");
+      if (retried) return;
+      if (!t.continueGraceUntil) {
+        t.continueGraceUntil = now + 30000;
+        dbg("Continue retries exhausted; holding turn open 30s", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
+        return;
+      }
+      if (now < t.continueGraceUntil) return;
+      if (t.emitted.length > 0) {
+        dbg("Continue grace expired with no stream — ending turn with captured text", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
+        finishTurn(true);
+      } else {
+        fallbackToDom(t, "continuation produced no stream and no captured text");
       }
     }
   }, 2000);
@@ -2368,6 +2373,7 @@ async function handleTurn(msg) {
     domTick: null,
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
+    continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
