@@ -29,12 +29,21 @@ function extractFunction(name: string): string {
   throw new Error(`closing brace for ${name}() not found`);
 }
 
-test("rate-limit constants: MAX_RATE_LIMIT_RETRIES and backoff schedule", () => {
-  assert.match(SRC, /const MAX_RATE_LIMIT_RETRIES = 3;/, "must declare 3 retries");
+test("rate-limit constants: 5-minute window + exponential backoff", () => {
   assert.match(
     SRC,
-    /const RATE_LIMIT_BACKOFF_MS = \[1_000, 4_000, 16_000\];/,
-    "must declare the [1s,4s,16s] exponential backoff schedule"
+    /const RATE_LIMIT_RETRY_WINDOW_MS = 5 \* 60_000;/,
+    "must declare a 5-minute wall-clock window"
+  );
+  assert.match(
+    SRC,
+    /const RATE_LIMIT_BACKOFF_INITIAL_MS = 2_000;/,
+    "must declare a 2s initial backoff"
+  );
+  assert.match(
+    SRC,
+    /const RATE_LIMIT_BACKOFF_MAX_MS = 5 \* 60_000;/,
+    "must cap per-step backoff at the window size"
   );
 });
 
@@ -57,9 +66,23 @@ test("attemptRateLimitRecovery debounces concurrent triggers", () => {
   assert.match(fn, /if \(t\.rateLimitRecoveryActive\) return true;/, "must short-circuit when a retry is already scheduled");
 });
 
-test("attemptRateLimitRecovery is bounded by MAX_RATE_LIMIT_RETRIES", () => {
+test("attemptRateLimitRecovery is bounded by the 5-minute window", () => {
   const fn = extractFunction("attemptRateLimitRecovery");
-  assert.match(fn, /t\.rateLimitRetries > MAX_RATE_LIMIT_RETRIES/, "must give up past the retry ceiling");
+  assert.match(
+    fn,
+    /elapsed >= RATE_LIMIT_RETRY_WINDOW_MS/,
+    "must give up once the wall-clock window has elapsed"
+  );
+  assert.match(
+    fn,
+    /t\.rateLimitFirstAt/,
+    "must stamp the wall-clock window start on the first retry"
+  );
+  assert.match(
+    fn,
+    /Math\.pow\(2, t\.rateLimitRetries - 1\)/,
+    "backoff must double per retry"
+  );
 });
 
 test("all five rate-limit finishTurn sites route through attemptRateLimitRecovery", () => {
