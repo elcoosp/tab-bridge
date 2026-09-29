@@ -904,8 +904,26 @@ function handleInjectorConnect(port, tabId) {
       blog("port message handler threw:", String((e && e.stack) || (e && e.message) || e));
     }
   });
+  port.onDisconnect.addListener(() => {
+    if (portByTab.get(tabId) === port) portByTab.delete(tabId);
+    blog("injector disconnected (tab", tabId + ")");
+    markHealth(tabId, "degraded", "port-disconnected");
+    // Fail every in-flight turn on this tab now — the injector can no
+    // longer answer, and letting them ride to the deadline turns a tab
+    // crash into a 4-minute hang.
+    for (const [reqId, rec] of [...turnByReq]) {
+      if (rec.tabId === tabId && !rec.finished) {
+        rec.finished = true;
+        clearTimeout(rec.timer);
+        if (rec.quietTimer) clearTimeout(rec.quietTimer);
+        turnByReq.delete(reqId);
+        send({ t: "ERROR", reqId, code: "port-lost", detail: "injector port disconnected mid-turn" });
+      }
+    }
+  });
+}
 
-  /**
+/**
  * Trusted click via chrome.debugger + CDP Input.dispatchMouseEvent.
  *
  * A synthetic click produces a MouseEvent with isTrusted: false; some
@@ -1115,25 +1133,6 @@ function handleInjectorMessage(tabId, port, msg) {
         break;
     }
   }
-
-  port.onDisconnect.addListener(() => {
-    if (portByTab.get(tabId) === port) portByTab.delete(tabId);
-    blog("injector disconnected (tab", tabId + ")");
-    markHealth(tabId, "degraded", "port-disconnected");
-    // Fail every in-flight turn on this tab now — the injector can no
-    // longer answer, and letting them ride to the deadline turns a tab
-    // crash into a 4-minute hang.
-    for (const [reqId, rec] of [...turnByReq]) {
-      if (rec.tabId === tabId && !rec.finished) {
-        rec.finished = true;
-        clearTimeout(rec.timer);
-        if (rec.quietTimer) clearTimeout(rec.quietTimer);
-        turnByReq.delete(reqId);
-        send({ t: "ERROR", reqId, code: "port-lost", detail: "injector port disconnected mid-turn" });
-      }
-    }
-  });
-}
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabState.delete(tabId);
