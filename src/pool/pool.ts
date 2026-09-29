@@ -199,7 +199,7 @@ export class WorkerPool extends EventEmitter {
           if (code.includes("rate-limited")) return new Error(`bind-failed: ${code}`);
           // E5: ephemeral background traffic must never grow the pool — a
           // noCreate BIND fails fast instead of waiting out the deadline.
-          if (opts.noCreate) return new Error(`bind-failed: ${code}`);
+          if (opts.noCreate) return new Error(`bind-failed: no-tab-available (no-create)`);
           return null; // no-tab-available and friends: keep waiting for BOUND
         }
       );
