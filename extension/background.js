@@ -17,6 +17,11 @@ const DEFAULT_WS_URL = "ws://127.0.0.1:8789/worker";
 const PROTOCOL_VERSION = 1;
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
+/** Minimum WS uptime for a close to count as "stable" (backoff resets) rather
+ * than a "flap" (backoff grows). 5s cleanly separates the two regimes: a
+ * bridge-refused duplicate dies within milliseconds; a healthy link that
+ * later drops because Chrome reclaimed the SW lives for seconds-to-minutes. */
+const STABLE_CONNECTION_MS = 5000;
 const PING_INTERVAL_MS = 25000;
 const RESET_TIMEOUT_MS = 45000;
 const START_URL = "https://chat.deepseek.com/";
@@ -30,6 +35,9 @@ const RATE_LIMIT_COOLDOWN_MS = 20 * 60 * 1000;
 let ws = null;
 let wsUrl = DEFAULT_WS_URL;
 let backoff = RECONNECT_MIN_MS;
+/** Timestamp of the last successful WS open; used to distinguish a flap
+ * (short-lived connection → grow backoff) from a stable close (reset). */
+let connectedAt = 0;
 let poolConfig = { autoCreateTabs: false, managedOnly: true, warmTabs: 0 };
 let helloOk = false;
 // Stable per-profile identity (loaded from storage.local at boot, default
@@ -126,11 +134,30 @@ try {
 } catch {
   /* noop */
 }
+try {
+  self.addEventListener("error", (ev) => {
+    try {
+      console.error("[tab-bridge-worker] uncaught error:", String((ev && (ev.message || ev.error)) || ev));
+    } catch {
+      /* noop */
+    }
+  });
+} catch {
+  /* noop */
+}
 
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-    return true;
+    try {
+      ws.send(JSON.stringify(obj));
+      return true;
+    } catch (e) {
+      // An uncaught throw here would terminate the service worker, which
+      // closes the WS abruptly (read: read ECONNRESET on the bridge) and
+      // starts a reconnect metronome. Swallow and log instead.
+      blog("send failed:", String((e && e.message) || e));
+      return false;
+    }
   }
   return false;
 }
@@ -143,9 +170,9 @@ function connect() {
     return;
   }
   ws.addEventListener("open", () => {
-    // NOTE: backoff resets only on HELLO_OK below. Resetting it here made a
-    // refused duplicate reconnect metronomically every 1s forever (open fires
-    // before the refusal arrives).
+    // NOTE: backoff does NOT reset here. It resets only when a connection
+    // closes after a stable uptime — see the close handler below.
+    connectedAt = Date.now();
     blog("worker link open ->", wsUrl);
     let extVersion = "unknown";
     try {
@@ -164,7 +191,8 @@ function connect() {
       return;
     }
     if (m && m.t === "HELLO_OK") {
-      backoff = RECONNECT_MIN_MS;
+      // Do NOT reset backoff here. A connection that dies shortly after
+      // HELLO_OK is a flap and must grow backoff; see the close handler.
       helloOk = true;
       poolConfig = m.config || poolConfig;
       blog("bridge HELLO_OK", JSON.stringify(poolConfig));
@@ -216,8 +244,25 @@ function connect() {
       blog("intent dispatch failed:", String((e && e.message) || e));
     }
   });
-  ws.addEventListener("close", () => {
-    blog("worker link closed — reconnecting in", backoff, "ms");
+  ws.addEventListener("close", (ev) => {
+    const uptime = connectedAt > 0 ? Date.now() - connectedAt : 0;
+    connectedAt = 0;
+    const code = ev && typeof ev.code === "number" ? ev.code : null;
+    const reason = ev && typeof ev.reason === "string" ? ev.reason : "";
+    if (uptime >= STABLE_CONNECTION_MS) {
+      // Connection was healthy for a while: this is a normal disconnect,
+      // reset the backoff so the next attempt fires quickly.
+      backoff = RECONNECT_MIN_MS;
+      blog("worker link closed after " + uptime + "ms uptime (code=" + code + ")" +
+           (reason ? " reason=" + reason : "") +
+           " — reconnecting in", backoff, "ms");
+    } else {
+      // Flap: the connection died soon after opening. Do NOT reset backoff
+      // — the next reconnect delay is already doubled by scheduleReconnect.
+      blog("worker link flapped after " + uptime + "ms (code=" + code + ")" +
+           (reason ? " reason=" + reason : "") +
+           " — reconnecting in", backoff, "ms");
+    }
     stopPingLoop();
     scheduleReconnect();
   });
@@ -695,6 +740,17 @@ function handleInjectorConnect(port, tabId) {
   }
 
   port.onMessage.addListener((msg) => {
+    try {
+      handleInjectorMessage(tabId, port, msg);
+    } catch (e) {
+      // An uncaught throw here terminates the service worker, which kills
+      // the WS to the bridge. Swallow and log so the SW survives one bad
+      // message.
+      blog("port message handler threw:", String((e && e.stack) || (e && e.message) || e));
+    }
+  });
+
+  function handleInjectorMessage(tabId, port, msg) {
     switch (msg.t) {
       case "FRAGMENT": {
         const s = fragNote(msg.reqId, msg.text);
@@ -768,7 +824,7 @@ function handleInjectorConnect(port, tabId) {
       default:
         break;
     }
-  });
+  }
 
   port.onDisconnect.addListener(() => {
     if (portByTab.get(tabId) === port) portByTab.delete(tabId);

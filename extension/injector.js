@@ -806,13 +806,32 @@ async function verifySubmitted(composer, baseCount, baseDsCount, stopBefore, had
  * a still-disabled button 15 ms after the prior stream closed and be
  * swallowed silently.
  */
+/**
+ * Wait for the tab to be in a state where a fresh submit can be placed.
+ *
+ * Scope: the ONLY thing this needs to guarantee is that a previous
+ * generation has finished (its stop control is gone) and stayed gone for a
+ * short stability window, so we do not append text to a composer that the
+ * previous turn's completion handler is about to clear.
+ *
+ * The composer is legitimately EMPTY at this point — placeText() has not
+ * run yet — and DeepSeek keeps the send button disabled by design until
+ * there is content. The old condition `!stopBtn && isEnabled(sendBtn)`
+ * therefore never became true on an empty composer, and the loop spun
+ * until timeout: 8s primary + 3s grace re-check = ~11s of dead time on
+ * every turn (measured: turn.accepted 11:38:54.752 -> first FRAGMENT
+ * 11:39:08.757, 14.0s total, ~11s of which was this loop).
+ *
+ * The enabled-state gate on the send button belongs AFTER placeText, and
+ * that is exactly what waitReadyToSubmit() does. This function must not
+ * duplicate it.
+ */
 async function waitStableSend(composer, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let stableSince = 0;
   for (; ;) {
     const stopBtn = findFirst(SELECTORS.stopButton);
-    const btn = findSendButton(composer);
-    const ok = !stopBtn && btn && isEnabled(btn);
+    const ok = !stopBtn;
     if (ok) {
       if (!stableSince) stableSince = Date.now();
       else if (Date.now() - stableSince >= 300) return true;
