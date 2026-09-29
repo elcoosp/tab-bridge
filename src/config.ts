@@ -30,6 +30,14 @@ export interface Config {
   /** Max ms a turn may sit in the generation queue before failing with 503
    * queue_timeout + Retry-After. 0 waits forever. */
   queueTimeoutMs: number;
+  /** WS-D: SEED-into-dirty-tab policy: auto (reset when worker reports dirty)
+   * | always (reset on every SEED) | never (legacy: no dirty-driven reset). */
+  resetOnSeed?: "auto" | "always" | "never";
+  /** E2: cap on worker-managed tabs. 0 = unbounded (legacy). Shipped to the
+   * worker in HELLO_OK; enforced worker-side in allocateTab. */
+  maxTabs?: number;
+  /** E3: worker closes ready+unbound tabs idle beyond this (ms). 0 = never. */
+  tabIdleCloseMs?: number;
 }
 
 export const DEFAULTS: Config = {
@@ -50,6 +58,9 @@ export const DEFAULTS: Config = {
   maxConcurrentTurns: 2,
   queueCapacity: 32,
   queueTimeoutMs: 600_000,
+  resetOnSeed: "auto",
+  maxTabs: 4,
+  tabIdleCloseMs: 15 * 60_000,
 };
 
 export function parseDuration(s: string): number {
@@ -178,6 +189,23 @@ export function parseServeArgs(argv: string[]): Config {
           throw new Error("--queue-timeout-ms must be an integer >= 0 (0 waits forever)");
         }
         break;
+      case "--reset-on-seed": {
+        const mode = val();
+        if (mode !== "auto" && mode !== "always" && mode !== "never") {
+          throw new Error("--reset-on-seed must be auto|always|never");
+        }
+        cfg.resetOnSeed = mode;
+        break;
+      }
+      case "--max-tabs":
+        cfg.maxTabs = Number(val());
+        if (!Number.isInteger(cfg.maxTabs) || cfg.maxTabs < 0) {
+          throw new Error("--max-tabs must be an integer >= 0 (0 = unbounded)");
+        }
+        break;
+      case "--tab-idle-close":
+        cfg.tabIdleCloseMs = parseDuration(val());
+        break;
       default:
         throw new Error(`unknown flag: ${flag}`);
     }
@@ -210,5 +238,8 @@ export function usage(): string {
     "  --max-concurrent-turns=<n>  provider generations in flight at once, 0 disables the gate (default 2)",
     "  --queue-capacity=<n>        max turns waiting in the generation queue (default 32)",
     "  --queue-timeout-ms=<n>      max queue wait before 503 queue_timeout, 0 waits forever (default 600000)",
+    "  --reset-on-seed=<mode>      SEED-into-dirty-tab policy auto|always|never (default auto)",
+    "  --max-tabs=<n>              cap on worker-managed tabs, 0 = unbounded (default 4)",
+    "  --tab-idle-close=<dur>      close ready+unbound tabs idle beyond dur, 0 = never (default 15m)",
   ].join("\n");
 }
