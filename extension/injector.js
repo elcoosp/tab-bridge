@@ -464,6 +464,44 @@ function composerScope(el) {
  * overwrites the edit draft and the submit never fires — the composer then
  * shows the tool-results text with Cancel/Send buttons and no reply streams.
  */
+/**
+ * Labels DeepSeek uses on the retry affordance it renders when a generation
+ * fails (rate-limit hit at generation time, context overflow, model refusal).
+ * The user bubble stays committed, the composer is empty, and only this
+ * control signals that a generation was attempted and failed.
+ */
+const RETRY_LABEL_RE =
+  /^(retry|regenerate|try\s*again|again|重试|重新生成|再试一次|重试一次)$/i;
+
+/**
+ * Scan for DeepSeek's retry affordance. Without this, a silently-failed
+ * generation waits out the DOM tick's 60s nullSince budget and then reports
+ * a generic submit-failed — which lies about the tab state (the user bubble
+ * WAS committed) and forces the caller to retry against the same failure.
+ * A quick scan of button-like elements for the retry labels gets us to a
+ * correct, provider-side error in ~1s.
+ */
+function generationFailedVisible() {
+  let els;
+  try {
+    els = document.querySelectorAll('button, div[role="button"], [role="button"]');
+  } catch {
+    return false;
+  }
+  for (const el of els) {
+    if (!isVisible(el)) continue;
+    let text = "";
+    try {
+      text = (el.textContent || "").trim();
+    } catch {
+      continue;
+    }
+    if (!text || text.length > 24) continue;
+    if (RETRY_LABEL_RE.test(text)) return true;
+  }
+  return false;
+}
+
 function composerInEditMode(composer) {
   if (!composer) return false;
   let scope;
@@ -1227,6 +1265,16 @@ function startDomObserver(t) {
         finishTurn(false, "dom-error", "provider: server temporarily unavailable");
         return;
       }
+      // Failed-generation check next. DeepSeek accepts the submit, commits
+      // the user bubble, then silently refuses to generate (rate limit at
+      // generation time, context overflow, model refusal) and paints a
+      // retry affordance. Failing here in ~1s is both faster and more
+      // honest than waiting out the 60s nullSince budget and reporting a
+      // generic submit-failed that lies about the tab state.
+      if (generationFailedVisible()) {
+        finishTurn(false, "dom-error", "provider: generation failed (retry affordance visible)");
+        return;
+      }
       if (!nullSince) nullSince = Date.now();
       else {
         // No user bubble ever appeared (baseCount === submitCount) means the
@@ -1468,6 +1516,14 @@ async function onNoStream(t, composer, originalText, isRetry) {
   // tool-results attachment as a successful submit.
   if (serverDownVisible()) {
     finishTurn(false, "dom-error", "provider: server temporarily unavailable");
+    return;
+  }
+  // A committed user bubble with a retry affordance and no reply stream
+  // means the generation itself failed on the provider side. Re-submitting
+  // the same prompt would just re-trigger the same failure (rate-limit /
+  // context overflow / refusal); report it now.
+  if (generationFailedVisible()) {
+    finishTurn(false, "dom-error", "provider: generation failed (retry affordance visible)");
     return;
   }
   const domEvidence = dsMessageCount() > (t.dsMessageBase ?? t.submitCount);
