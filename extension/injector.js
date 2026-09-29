@@ -92,6 +92,177 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
+
+// ---------------------------------------------------------------------------
+// Debug instrumentation.
+//
+// Enable verbose tracing from the tab console (DevTools → context selector →
+// the injector's isolated world) by running:
+//     window.__tabBridgeTrace = true
+// Then reproduce the stuck turn. Every decision point in the Continue
+// detection path logs a compact line prefixed [tab-bridge:trace]. `dbg()`
+// (always on) is reserved for lifecycle events worth seeing in every run.
+// ---------------------------------------------------------------------------
+const trace = (...a) => {
+  try {
+    if (window.__tabBridgeTrace === true) console.log("[tab-bridge:trace]", ...a);
+  } catch {
+    /* noop */
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Robust activation for DeepSeek's div[role=button] controls.
+//
+// DeepSeek's design-system "button" is a <div role="button">, not a real
+// <button>. Its click handler may be attached to `click`, to the pointer
+// sequence (pointerdown/pointerup/mousedown/mouseup), or — for keyboard
+// accessibility — to keydown Enter. A bare `el.click()` covers only the
+// click-listener case. syntheticClick fires the full sequence a real user
+// would produce, and keyboardActivate is the fallback when even that fails.
+// ---------------------------------------------------------------------------
+function syntheticClick(el) {
+  if (!el || !el.isConnected) return false;
+  let ok = false;
+  try {
+    el.scrollIntoView({ block: "nearest", behavior: "instant" });
+  } catch {
+    /* scrollIntoView can throw on detached nodes — ignore */
+  }
+  // Native click first: cheapest path, works for the common case.
+  try {
+    el.click();
+    ok = true;
+  } catch {
+    /* fall through to pointer sequence */
+  }
+  // Full pointer sequence for handlers wired to pointerdown/up.
+  try {
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      clientX: x,
+      clientY: y,
+      button: 0,
+    };
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...base, buttons: 1 }));
+    el.dispatchEvent(new MouseEvent("mousedown", { ...base, buttons: 1 }));
+    el.dispatchEvent(new PointerEvent("pointerup", { ...base, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("mouseup", { ...base, buttons: 0 }));
+    el.dispatchEvent(new MouseEvent("click", { ...base, buttons: 0 }));
+    ok = true;
+  } catch {
+    /* PointerEvent may be missing on very old Chrome — the .click() above
+       already fired, so this is a soft failure */
+  }
+  return ok;
+}
+
+function keyboardActivate(el) {
+  if (!el || !el.isConnected) return false;
+  try {
+    el.focus();
+  } catch {
+    return false;
+  }
+  try {
+    const key = (type) =>
+      new KeyboardEvent(type, {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+      });
+    el.dispatchEvent(key("keydown"));
+    el.dispatchEvent(key("keyup"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// On-demand state dump. From the tab console (injector's isolated-world
+// context): run `__tabBridgeState()`. Use this the moment a turn looks
+// stuck — the snapshot says whether the SSE stream is silent, whether the
+// Continue button is present, and whether a continue click is in flight.
+window.__tabBridgeState = () => {
+  let continueLabel = null;
+  let continueFound = false;
+  try {
+    const btn = findContinueButton();
+    continueFound = !!btn;
+    continueLabel = btn ? (btn.textContent || "").trim().slice(0, 60) : null;
+  } catch (e) {
+    continueLabel = "ERR: " + String((e && e.message) || e);
+  }
+  let composerLen = -1;
+  try {
+    const c = findFirst(SELECTORS.composer);
+    composerLen = c ? readComposer(c).length : -1;
+  } catch {
+    /* noop */
+  }
+  let stopPresent = false;
+  try {
+    stopPresent = !!findFirst(SELECTORS.stopButton);
+  } catch {
+    /* noop */
+  }
+  let msgCount = -1;
+  try {
+    msgCount = dsMessageCount();
+  } catch {
+    /* noop */
+  }
+  return {
+    version: typeof INJECTOR_VERSION !== "undefined" ? INJECTOR_VERSION : "?",
+    bundle: typeof SELECTOR_BUNDLE !== "undefined" ? SELECTOR_BUNDLE : "?",
+    portConnected: port !== null,
+    hookPresent: sseHookPresent,
+    turn: turn
+      ? {
+          reqId: turn.reqId,
+          mode: turn.mode,
+          emitted: turn.emitted.length,
+          startedAt: turn.startedAt,
+          sinceLastSseMs: turn.lastSseAt ? Date.now() - turn.lastSseAt : null,
+          awaitContinueMs: turn.awaitContinue ? Date.now() - turn.awaitContinue : 0,
+          continues: turn.continues | 0,
+          finished: turn.finished,
+          unverified: !!turn.unverified,
+        }
+      : null,
+    continueButton: { found: continueFound, label: continueLabel },
+    composerLen,
+    stopButtonPresent: stopPresent,
+    dsMessageCount: msgCount,
+    traceEnabled: window.__tabBridgeTrace === true,
+  };
+};
+
+// Manual Continue trigger. From the tab console:
+//   __tabBridgeForceContinue()
+// Useful when the auto-detect hasn't fired yet, or to verify the click
+// itself works before assuming the detection logic is the problem.
+window.__tabBridgeForceContinue = () => {
+  if (!turn) return "no active turn";
+  const btn = findContinueButton();
+  if (!btn) return "no Continue button found";
+  const clicked = syntheticClick(btn);
+  const kb = clicked ? false : keyboardActivate(btn);
+  return {
+    reqId: turn.reqId,
+    label: (btn.textContent || "").trim().slice(0, 60),
+    clicked,
+    keyboardActivated: kb,
+  };
+};
 /** Provider outage banner text (exact). */
 const SERVER_DOWN_TEXT = "Server is temporarily unavailable.";
 
@@ -183,8 +354,12 @@ function findContinueButton() {
   try {
     els = document.querySelectorAll('div[role="button"], button');
   } catch {
+    trace("findContinueButton: querySelectorAll threw");
     return null;
   }
+  // Bounded candidate census, capped at 12 entries, so trace output stays
+  // readable even on a page with many buttons.
+  const census = [];
   for (const el of els) {
     if (!isVisible(el)) continue;
     let label = "";
@@ -197,11 +372,17 @@ function findContinueButton() {
       continue;
     }
     if (!label) continue;
-    // Hard cap: a real Continue control's label is 1-3 words. Anything
-    // longer is an assistant turn that happens to contain the word.
-    if (label.length > 40) continue;
-    if (CONTINUE_RE.test(label)) return el;
+    if (label.length > 40) {
+      if (census.length < 12) census.push({ label: label.slice(0, 60), why: "too-long" });
+      continue;
+    }
+    if (CONTINUE_RE.test(label)) {
+      trace("findContinueButton: hit", { label });
+      return el;
+    }
+    if (census.length < 12) census.push({ label, why: "no-match" });
   }
+  trace("findContinueButton: miss", { scanned: els.length, candidates: census });
   return null;
 }
 
@@ -1069,6 +1250,15 @@ function stripThinkBlocks(text) {
 function finishTurn(ok, code, detail, aborted, extra) {
   const t = turn;
   if (!t || t.finished) return;
+  trace("finishTurn", {
+    ok,
+    code,
+    detail: typeof detail === "string" ? detail.slice(0, 120) : detail,
+    aborted,
+    emitted: t.emitted.length,
+    continues: t.continues | 0,
+    mode: t.mode,
+  });
   t.finished = true;
   if (t.fallbackTimer) clearTimeout(t.fallbackTimer);
   if (t.watchdog) clearInterval(t.watchdog);
@@ -1125,17 +1315,32 @@ function fallbackToDom(t, why) {
  * returns false when no button is present or the budget is spent.
  */
 function maybeContinue(t, why) {
-  if (!t || t.finished || (t.continues | 0) >= MAX_CONTINUES) return false;
+  if (!t || t.finished || (t.continues | 0) >= MAX_CONTINUES) {
+    trace("maybeContinue: skip", {
+      why,
+      finished: t ? t.finished : null,
+      continues: t ? t.continues | 0 : null,
+    });
+    return false;
+  }
   const btn = findContinueButton();
-  if (!btn) return false;
+  if (!btn) {
+    trace("maybeContinue: no Continue button found", { why });
+    return false;
+  }
   t.continues = (t.continues | 0) + 1;
   t.awaitContinue = Date.now();
   dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
-  try {
-    btn.click();
-  } catch {
-    /* click-through fallback below */
-  }
+  // Full pointer sequence, then a keyboard fallback if nothing dispatched.
+  const clicked = syntheticClick(btn);
+  const keyboardActivated = clicked ? false : keyboardActivate(btn);
+  trace("maybeContinue: activated", {
+    why,
+    continues: t.continues,
+    clicked,
+    keyboardActivated,
+    label: (btn.textContent || "").trim().slice(0, 40),
+  });
   // Re-arm: the continuation POST must be captured even though this arm
   // already spent its single capture. Async delivery is fine — DeepSeek
   // takes well over an event-loop turn to fire the request.
@@ -1334,6 +1539,13 @@ window.addEventListener("message", (ev) => {
   if (ev.source !== window) return;
   const d = ev.data;
   if (!d || d.source !== "tab-bridge-sse") return;
+  trace("sse-hook", {
+    type: d.type,
+    turnId: d.turnId,
+    chars: typeof d.text === "string" ? d.text.length : undefined,
+    err: typeof d.error === "string" ? d.error.slice(0, 60) : undefined,
+    status: typeof d.status === "number" ? d.status : undefined,
+  });
   if (d.type === "hello") {
     const wasAbsent = !sseHookPresent;
     sseHookPresent = true;
@@ -1459,6 +1671,16 @@ function startWatchdog(t) {
       return;
     }
     const now = Date.now();
+    trace("watchdog tick", {
+      reqId: t.reqId,
+      mode: t.mode,
+      emitted: t.emitted.length,
+      sinceLastSseMs: t.lastSseAt ? now - t.lastSseAt : null,
+      awaitContinueMs: t.awaitContinue ? now - t.awaitContinue : 0,
+      continues: t.continues | 0,
+      deadlineInMs: t.deadline - now,
+      unverified: !!t.unverified,
+    });
     const hit = submitRateLimitHit(t.submitCount);
     if (hit) {
       finishTurn(false, "rate_limited", "provider notice: messages too frequent");
@@ -1503,6 +1725,13 @@ function startWatchdog(t) {
     // (bounded); button gone with nothing new: end with what we captured.
     // Stream activity after the click disarms this entirely.
     if (t.awaitContinue && t.lastSseAt < t.awaitContinue && now - t.awaitContinue > 30000) {
+      trace("continue-no-stream recovery firing", {
+        reqId: t.reqId,
+        emitted: t.emitted.length,
+        continues: t.continues | 0,
+        sinceLastSseMs: t.lastSseAt ? now - t.lastSseAt : null,
+        sinceClickMs: now - t.awaitContinue,
+      });
       t.awaitContinue = 0;
       if (!maybeContinue(t, "continue-no-stream")) {
         if (t.emitted.length > 0) finishTurn(true);
