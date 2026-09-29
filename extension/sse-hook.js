@@ -554,7 +554,7 @@
   // NOTE: keep hookVersion in sync with manifest.json (MAIN world cannot
   // read the manifest; the injector reports its own version live).
   const diag = {
-    hookVersion: "1.2.31",
+    hookVersion: "1.2.32",
     installedAt: new Date().toISOString(),
     arms: 0,
     lastArm: null,

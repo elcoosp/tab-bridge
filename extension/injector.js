@@ -56,7 +56,7 @@ const SUBMIT_READY_TIMEOUT_MS = 90_000;
 /** If no send button was ever found, fall back to Enter after this long. */
 const NO_BUTTON_FALLBACK_MS = 8000;
 /** Window granted to the provider to start rendering the reply bubble. */
-const REPLY_BASELINE_SETTLE_MS = 1000;
+const REPLY_BASELINE_SETTLE_MS = 400;
 /** If no completion stream attached this long after a verified submit,
  * hand capture over to the DOM observer. */
 const SSE_FALLBACK_AFTER_MS = 15_000;
@@ -671,13 +671,13 @@ async function placeText(composer, text) {
     } catch {
       /* ClipboardEvent/DataTransfer unavailable — fall back below */
     }
-    await sleep(500);
+    await sleep(400);
     const pasted = readComposer(composer);
     if (pasted.length === 0) return "file"; // handler consumed it (attachment)
     if (pasted === text) return "inline";
   }
   setComposerValue(composer, text);
-  await sleep(350);
+  await sleep(200);
   const val = readComposer(composer);
   if (val.length === 0 && text.length > 400) return "file"; // converted by the app
   if (val.length === 0) return "ignored";
@@ -815,7 +815,7 @@ async function waitStableSend(composer, timeoutMs) {
     const ok = !stopBtn && btn && isEnabled(btn);
     if (ok) {
       if (!stableSince) stableSince = Date.now();
-      else if (Date.now() - stableSince >= 1000) return true;
+      else if (Date.now() - stableSince >= 300) return true;
     } else {
       stableSince = 0;
     }
@@ -977,7 +977,7 @@ function emitDelta(t, text) {
   t.emitted += text;
   if (!t.loggedFirst) {
     t.loggedFirst = true;
-    dbg("first fragment for", t.reqId, `(mode=${t.mode}, ${text.length} chars)`);
+    dbg("first fragment " + (Date.now() - t.startedAt) + "ms after TURN for", t.reqId, `(mode=${t.mode}, ${text.length} chars)`);
   }
   report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
 }
@@ -1576,7 +1576,7 @@ async function handleTurn(msg) {
       return;
     }
     t.unverified = submitted.unverified === true;
-    dbg("submitted (paste-mode=" + submitted.mode + ", capture=" + t.mode + (t.unverified ? ", unverified" : "") + ")");
+    dbg("submitted in " + (Date.now() - t.startedAt) + "ms (paste-mode=" + submitted.mode + ", capture=" + t.mode + (t.unverified ? ", unverified" : "") + ")");
     // Let the user bubble render before freezing the reply baseline.
     await sleep(REPLY_BASELINE_SETTLE_MS);
     t.baseCount = conversationNodes().length;
