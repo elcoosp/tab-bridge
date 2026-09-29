@@ -37,8 +37,9 @@ export interface TurnRequest {
   bindTimeoutMs: number;
   /** Holdback ceiling override (0/unset = library default). */
   holdbackCeiling?: number;
-  /** Binds a session to a managed tab (pool-backed deployments). */
-  bindTab: (sessionId: string, timeoutMs: number) => Promise<number>;
+  /** Binds a session to a managed tab (pool-backed deployments). May return
+   * the tab id or the full bind observation (carries worker dirty flag). */
+  bindTab: (sessionId: string, timeoutMs: number) => Promise<number | { tabId: number; dirty?: boolean }>;
   /** WS-D: SEED-into-dirty-tab policy. auto = reset when the worker reports
    * the tab dirty (default); always = reset on every SEED; never = legacy. */
   resetOnSeed?: "auto" | "always" | "never";
@@ -131,18 +132,14 @@ export function summarizeMessages(messages: readonly ChatMessage[]): string {
 }
 
 async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<ManagedTab> {
-  let dirty: boolean | undefined;
+  let dirty = false;
+  const takeBind = (bound: number | { tabId: number; dirty?: boolean }): number => {
+    if (typeof bound === "number") return bound;
+    if (bound.dirty === true) dirty = true;
+    return bound.tabId;
+  };
   if (row.tabId === null) {
-    const bound = await req.bindTab(row.sessionId, req.bindTimeoutMs);
-    // Pool-backed bindTab returns a tab id (number) for compat; the
-    // WorkerPool.bind shape { tabId, dirty } is unwrapped by the caller in
-    // bridge.ts — here we accept either form.
-    if (typeof bound === "number") {
-      row.tabId = bound;
-    } else {
-      row.tabId = (bound as unknown as { tabId: number }).tabId;
-      dirty = (bound as unknown as { dirty?: boolean }).dirty;
-    }
+    row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs));
   }
   const ready = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
   if (!ready.ok) {
@@ -151,14 +148,15 @@ async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<Man
     if (detail === "rate_limited") throw new Error("provider-rate-limited");
     if (detail === "tab-not-known-to-worker") {
       // Tab died while we held the row: re-bind once, then re-check.
-      row.tabId = await req.bindTab(row.sessionId, req.bindTimeoutMs);
+      // A re-bind lands on some (possibly dirty) tab — track it as above.
+      row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs));
       const again = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
       if (!again.ok) throw new Error(`not-ready:${again.detail ?? "unknown"}`);
     } else {
       throw new Error(`not-ready:${detail}`);
     }
   }
-  return tabOf(row.tabId as number, dirty === true);
+  return tabOf(row.tabId as number, dirty);
 }
 
 async function resetOrThrow(adapter: ChatProviderAdapter, tab: ManagedTab): Promise<void> {
