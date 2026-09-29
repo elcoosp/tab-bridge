@@ -36,8 +36,14 @@ export function renderToolProtocolBlock(tools: ToolSpec[]): string {
   lines.push('{"name": "tool_name", "arguments": {"arg": "value"}}');
   lines.push("```");
   lines.push(
-    "Rules: one JSON object per block; emit one block per call, back to back for parallel calls; " +
-      "no prose inside a block; after emitting blocks, STOP and wait for results. Unknown tools are errors."
+    "Rules: one JSON object per block; no prose inside a block; unknown tools are errors."
+  );
+  lines.push(
+    "BATCHING IS MANDATORY: emit EVERY independent tool_call block you already know you will need " +
+      "in the SAME reply, back to back, before you stop. Parallel calls run together, and the " +
+      "provider is rate-limited per message, so one batched reply that carries N calls is strictly " +
+      "more valuable than N single-call turns. Do not space calls out one turn at a time. Only stop " +
+      "to wait for results when you genuinely cannot decide the next call without them."
   );
   lines.push("=== TOOLS ===");
   if (tools.length === 0) lines.push("(no tools declared; answer in plain text)");
@@ -80,8 +86,12 @@ export function compileSeed(
   for (const m of messages) out.push(renderMessageForTranscript(m));
   out.push(
     "=== ASSISTANT CUE ===\n" +
-      "Continue the transcript above as the assistant. Follow the TOOL PROTOCOL exactly; " +
-      "when you need a tool, emit fenced tool_call blocks and stop; otherwise answer in plain text."
+      "Continue the transcript above as the assistant. Follow the TOOL PROTOCOL exactly. " +
+      "When you need tools, emit EVERY independent tool_call block you already know you will " +
+      "need in the SAME reply — back to back, batched, before stopping. The bridge runs those " +
+      "calls in parallel and the provider is rate-limited per message, so a single batched reply " +
+      "is strictly more valuable than several single-call turns. Stop only when you genuinely " +
+      "need the results to decide the next call; otherwise answer in plain text."
   );
   return out.join("\n\n");
 }
@@ -105,7 +115,10 @@ export function compileInjectResults(results: readonly ChatMessage[]): string {
   out.push(
     "=== ASSISTANT CUE ===\n" +
       "Continue the transcript as the assistant given the tool results above. " +
-      "Emit further tool_call blocks if needed, otherwise answer in plain text."
+      "SAME BATCHING RULE as before: emit EVERY independent tool_call block you already know " +
+      "you will need in a SINGLE reply — back to back, batched, before stopping. Parallel calls " +
+      "are executed together and the provider is rate-limited per message; do not spend one turn " +
+      "per call. Answer in plain text only when no further calls are needed."
   );
   return out.join("\n\n");
 }
@@ -125,6 +138,8 @@ export function compileRepair(offendingOutput: string, validationError: string):
     offendingOutput,
     "-----",
     "Reply again. To call a tool, output a fenced ```tool_call block containing one JSON object " +
-      'with "name" and "arguments". No prose inside the block. If no tool is needed, answer in plain text.',
+      'with "name" and "arguments". No prose inside the block. You may (and should) emit several ' +
+      "such blocks back to back in the same reply when you need several independent tools — " +
+      "batching is preferred. If no tool is needed, answer in plain text.",
   ].join("\n");
 }

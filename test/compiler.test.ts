@@ -86,6 +86,30 @@ test("repair prompt quotes the offending output and names the error", () => {
   assert.ok(r.includes("bad output"));
 });
 
+test("seed prompt instructs the model to batch as many parallel tool calls as possible", () => {
+  const seed = compileSeed([{ role: "user", content: "q" }], TOOLS);
+  assert.match(seed, /BATCHING IS MANDATORY/i, "protocol block must contain the batching rule");
+  assert.match(seed, /rate-limited per message/i, "protocol block must explain the rate-limit rationale");
+  assert.match(seed, /EVERY independent tool_call block/i, "protocol block must say EVERY independent block");
+  const cueIdx = seed.indexOf("=== ASSISTANT CUE ===");
+  assert.notEqual(cueIdx, -1, "seed must end with an ASSISTANT CUE");
+  const cue = seed.slice(cueIdx);
+  assert.match(cue, /EVERY independent tool_call block/i, "seed cue must repeat the batching rule");
+  assert.match(cue, /rate-limited per message/i, "seed cue must repeat the rate-limit rationale");
+});
+
+test("inject-results cue reiterates the batching rule", () => {
+  const out = compileInjectResults([{ role: "tool", content: "x", tool_call_id: "t" }]);
+  assert.match(out, /SAME BATCHING RULE/i, "inject-results cue must reiterate the batching rule");
+  assert.match(out, /EVERY independent tool_call block/i, "inject-results cue must say EVERY independent block");
+});
+
+test("repair prompt also nudges batching", () => {
+  const r = compileRepair("bad", "unknown tool");
+  assert.match(r, /batching is preferred/i, "repair prompt must nudge batching");
+  assert.match(r, /several such blocks back to back/i, "repair prompt must show how to batch");
+});
+
 test("tool schema renderer truncates at budget", () => {
   const big: ToolSpec = {
     type: "function",
