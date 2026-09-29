@@ -1,0 +1,77 @@
+// Regression: bounded rate-limit recovery with exponential backoff.
+//
+// DeepSeek's "Messages too frequent" flag is often transient — a burst hits
+// the account window for seconds, then clears. Without a bounded retry, the
+// worker marks the tab rate_limited for 20 minutes, forcing every subsequent
+// turn through the cooldown. Three retries with exponential backoff absorb
+// the transient burst in-place; only a persistent limit falls through.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const SRC = readFileSync(join(here, "../../extension/injector.js"), "utf8");
+
+function extractFunction(name: string): string {
+  const re = new RegExp(`^(?:async\\s+)?function\\s+${name}\\s*\\(`, "m");
+  const m = re.exec(SRC);
+  if (!m) throw new Error(`function ${name}() not found — injector structure drifted`);
+  let depth = 0;
+  let started = false;
+  for (let i = m.index; i < SRC.length; i++) {
+    const ch = SRC[i];
+    if (ch === "{") { depth++; started = true; }
+    else if (ch === "}") { depth--; if (started && depth === 0) return SRC.slice(m.index, i + 1); }
+  }
+  throw new Error(`closing brace for ${name}() not found`);
+}
+
+test("rate-limit constants: MAX_RATE_LIMIT_RETRIES and backoff schedule", () => {
+  assert.match(SRC, /const MAX_RATE_LIMIT_RETRIES = 3;/, "must declare 3 retries");
+  assert.match(
+    SRC,
+    /const RATE_LIMIT_BACKOFF_MS = \[1_000, 4_000, 16_000\];/,
+    "must declare the [1s,4s,16s] exponential backoff schedule"
+  );
+});
+
+test("attemptRateLimitRecovery is declared and prefers the on-screen retry affordance", () => {
+  const fn = extractFunction("attemptRateLimitRecovery");
+  assert.match(fn, /findContinueButton\(\)/, "must check for an on-screen retry button first");
+  assert.match(fn, /maybeContinue\(t, "rate-limit-retry"\)/, "must click it via maybeContinue (trusted debugger path)");
+});
+
+test("attemptRateLimitRecovery falls back to re-submitting the stored prompt", () => {
+  const fn = extractFunction("attemptRateLimitRecovery");
+  assert.match(fn, /t\.promptText/, "must read the stored prompt text");
+  assert.match(fn, /submitPrompt\(/, "must call submitPrompt on the fallback path");
+  assert.match(fn, /hookArmSync\(/, "must re-arm the SSE hook before re-submitting");
+});
+
+test("attemptRateLimitRecovery debounces concurrent triggers", () => {
+  const fn = extractFunction("attemptRateLimitRecovery");
+  assert.match(fn, /t\.rateLimitRecoveryActive/, "must have a debounce flag");
+  assert.match(fn, /if \(t\.rateLimitRecoveryActive\) return true;/, "must short-circuit when a retry is already scheduled");
+});
+
+test("attemptRateLimitRecovery is bounded by MAX_RATE_LIMIT_RETRIES", () => {
+  const fn = extractFunction("attemptRateLimitRecovery");
+  assert.match(fn, /t\.rateLimitRetries > MAX_RATE_LIMIT_RETRIES/, "must give up past the retry ceiling");
+});
+
+test("all five rate-limit finishTurn sites route through attemptRateLimitRecovery", () => {
+  assert.match(SRC, /attemptRateLimitRecovery\(t, "sse-hint"/, "SSE hint-error must call the helper");
+  assert.match(SRC, /attemptRateLimitRecovery\(t, "sse-complete-hint"/, "SSE complete hintError must call the helper");
+  assert.match(SRC, /attemptRateLimitRecovery\(t, "http-429"/, "HTTP 429 must call the helper");
+  assert.match(SRC, /attemptRateLimitRecovery\(t, "toast"/, "watchdog toast must call the helper");
+  assert.match(SRC, /attemptRateLimitRecovery\(t, "submit-rejected"/, "submit rejection must call the helper");
+});
+
+test("turn-state carries the retry bookkeeping fields", () => {
+  assert.match(SRC, /rateLimitRetries: 0,/, "turn state must init rateLimitRetries");
+  assert.match(SRC, /rateLimitRecoveryActive: false,/, "turn state must init the debounce flag");
+  assert.match(SRC, /promptText: typeof msg\.text === "string" \? msg\.text : ""/, "turn state must capture the prompt text");
+});
