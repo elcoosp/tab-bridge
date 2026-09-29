@@ -264,6 +264,13 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
   const tools = parseTools(body.tools);
   const stream = body.stream === true;
   const sessionId = resolveSessionKey(req, body);
+  // E5: kod background-class traffic (metadata.tab_bridge_class =
+  // "background") binds with noCreate when ephemeral, so background load can
+  // never ratchet the tab count.
+  const background =
+    body.metadata !== null &&
+    typeof body.metadata === "object" &&
+    (body.metadata as Record<string, unknown>).tab_bridge_class === "background";
 
   // 'close' fires on premature disconnect AND after a normal finish; the
   // generation gate only consults the signal while the request is queued,
@@ -283,6 +290,7 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
         think,
         sessionId,
         signal: ac.signal,
+        ...(background ? { background: true as const } : {}),
       } satisfies ChatParams);
     } catch (e) {
       if (e instanceof BridgeError && e.code === "client_gone") {
@@ -371,6 +379,7 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
       sessionId,
       events,
       signal: ac.signal,
+      ...(background ? { background: true as const } : {}),
     } satisfies ChatParams);
     // Final frames: usage chunk with empty choices, then finish_reason, [DONE].
     sse.sendChoice(
