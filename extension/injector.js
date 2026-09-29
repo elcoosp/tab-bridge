@@ -63,6 +63,15 @@ const SSE_FALLBACK_AFTER_MS = 15_000;
 /** SSE stream silence allowed before the turn errors out (bridge deadline
  * remains the outer bound). */
 const SSE_IDLE_TIMEOUT_MS = 120_000;
+/**
+ * Shorter silence threshold after which we look for DeepSeek's Continue
+ * affordance on every watchdog tick. DeepSeek halts mid-generation and
+ * renders a Continue button without sending an SSE `complete` event — the
+ * stream just goes silent. Waiting the full 120s before clicking leaves
+ * the caller staring at a stopped think block; 3s is enough to distinguish
+ * a genuine pause from a real halt.
+ */
+const CONTINUE_IDLE_THRESHOLD_MS = 3_000;
 
 const RATE_LIMIT_RE =
   /(?:messages?\s*(?:are\s*)?too\s*frequent|too\s*many\s*messages|too\s*many\s*requests|rate[\s_-]*limits?(?:\s*(?:reached|exceeded|hit))?|消息发送过于频繁|发送消息过于频繁|发送太频繁|操作过于频繁|请求过于频繁|频率过高)/i;
@@ -1462,6 +1471,25 @@ function startWatchdog(t) {
     if (now > t.deadline) {
       finishTurn(false, "timeout", `turn exceeded ${t.opts.timeoutMs || 240000}ms`);
       return;
+    }
+    // Fast Continue detection. DeepSeek sometimes halts mid-generation
+    // (token budget, provider hiccup, a11y-side stop) WITHOUT sending an
+    // SSE `complete` — the stream just goes silent and a Continue button
+    // appears next to the last message. The 120s SSE_IDLE_TIMEOUT_MS is
+    // far too slow: by then the caller has been staring at a stopped
+    // think block for two minutes. On every 2s tick, if the SSE stream
+    // has been quiet for > CONTINUE_IDLE_THRESHOLD_MS and the Continue
+    // button is visible, click it now and re-arm for the continuation
+    // POST. maybeContinue re-arms the hook and sets t.awaitContinue, so a
+    // click that fails to produce a stream still falls through to the
+    // existing continue-no-stream recovery below.
+    if (
+      t.mode === "sse" &&
+      t.lastSseAt &&
+      !t.awaitContinue &&
+      now - t.lastSseAt > CONTINUE_IDLE_THRESHOLD_MS
+    ) {
+      if (maybeContinue(t, "sse-quiet-continue")) return;
     }
     if (t.mode === "sse" && t.lastSseAt && now - t.lastSseAt > SSE_IDLE_TIMEOUT_MS) {
       // A visible Continue means halted, not dead: resume instead of timing out.
