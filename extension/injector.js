@@ -92,7 +92,7 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.54: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.55: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
@@ -641,6 +641,19 @@ function findNewChatByLabel() {
  * to include the whole conversation.
  */
 function serverDownVisible() {
+  // A visible Continue / retry affordance means the generation HALTED
+  // mid-answer with more available — the tab is healthy, just paused. Never
+  // misclassify a resumable halt as a provider outage: previously
+  // serverDownVisible won the tie, finishTurn fired as dom-error, the
+  // bridge scheduled a RESET_RESEED, and the user's real answer sat behind
+  // an unclicked Continue button while the pool tab was torn down (empty
+  // tab, harness hang, SW flap cascade). All four callers — settleTurn,
+  // the DOM tick text===null path, the SSE complete-empty path, and
+  // onNoStream — inherit this guard automatically.
+  if (findContinueButton()) {
+    trace("serverDownVisible: suppressed — Continue button visible");
+    return false;
+  }
   let els;
   try {
     els = document.querySelectorAll("span, div, p");
@@ -1537,7 +1550,7 @@ function stripThinkBlocks(text) {
  * watchdog, abort) funnels here; the first caller wins.
  */
 /**
- * v1.2.54 — rate-limit recovery with exponential backoff.
+ * v1.2.55 — rate-limit recovery with exponential backoff.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1671,7 +1684,7 @@ function fallbackToDom(t, why) {
 }
 
 /**
- * v1.2.54 — DOM continuation.
+ * v1.2.55 — DOM continuation.
  *
  * DeepSeek halted, the trusted Continue click landed, but the continuation
  * POST (if any) went over a transport the SSE hook does not intercept: the
@@ -1864,7 +1877,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.54 — ensure the button is on-screen before we compute the click
+  // v1.2.55 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -1952,7 +1965,7 @@ function maybeContinue(t, why) {
       );
     }
     if (r.ok) {
-      // v1.2.54 DOM continuation. The trusted click landed but the log
+      // v1.2.55 DOM continuation. The trusted click landed but the log
       // shows `streamAfterClick:false` even when `stillThere:false`: the
       // continuation travels over a transport the SSE hook does not see.
       // Give the stream 1.5s to show up; if it does not, switch the turn
@@ -2005,7 +2018,7 @@ function startDomObserver(t, opts) {
     // 1.2.6 boot-race fix); this is only a prose safety net.
     text = stripThinkBlocks(text);
     if (continuationMode) {
-      // v1.2.54 DOM continuation. The SSE path already streamed the partial
+      // v1.2.55 DOM continuation. The SSE path already streamed the partial
       // answer, DeepSeek halted, and its Continue click went over a transport
       // the hook does not intercept. Read the growth of the assistant bubble
       // as continued text; append it to what we already emitted so the caller
@@ -2126,7 +2139,7 @@ function startDomObserver(t, opts) {
       clearInterval(tick);
       return;
     }
-    // v1.2.54 — multi-halt support while in DOM continuation mode. If
+    // v1.2.55 — multi-halt support while in DOM continuation mode. If
     // DeepSeek halts AGAIN after a previous resume, the Continue button
     // reappears. Click it once more via the trusted debugger path (bounded
     // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
@@ -2197,7 +2210,7 @@ function startDomObserver(t, opts) {
       return;
     }
     nullSince = 0;
-    // v1.2.54 continuation bailout: if the Continue button persists past
+    // v1.2.55 continuation bailout: if the Continue button persists past
     // MAX_CONTINUES trusted-click retries, finish with what we captured
     // rather than hanging until the turn deadline.
     if (
@@ -2582,11 +2595,11 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    domContinuation: false, // v1.2.54: DOM-continuation mode active for this turn
-    domContinuationClickAt: 0, // v1.2.54: last DOM-continuation Continue click (cooldown)
-    rateLimitRetries: 0, // v1.2.54: rate-limit recovery attempts this turn
-    rateLimitRecoveryActive: false, // v1.2.54: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.54: for re-submit
+    domContinuation: false, // v1.2.55: DOM-continuation mode active for this turn
+    domContinuationClickAt: 0, // v1.2.55: last DOM-continuation Continue click (cooldown)
+    rateLimitRetries: 0, // v1.2.55: rate-limit recovery attempts this turn
+    rateLimitRecoveryActive: false, // v1.2.55: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.55: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);

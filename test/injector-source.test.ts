@@ -48,11 +48,23 @@ function extractFunction(name: string): string {
  * only needs `querySelectorAll`, which must return objects shaped like
  * real elements: `{ children: any[], textContent: string }`.
  */
-function makeServerDownVisible(documentMock: { querySelectorAll: (sel: string) => Array<{ children: unknown[]; textContent: string }> }): () => boolean {
+function makeServerDownVisible(
+  documentMock: { querySelectorAll: (sel: string) => Array<{ children: unknown[]; textContent: string }> },
+  // serverDownVisible consults findContinueButton() first (v1.2.55): a visible
+  // Continue/retry affordance means the generation HALTED, not that the
+  // provider is down. Default to "no button on screen" so the banner-scan
+  // tests below still exercise the raw detection path unchanged.
+  findContinueButtonMock: () => unknown = () => null
+): () => boolean {
   const fn = extractFunction("serverDownVisible");
   // eslint-disable-next-line @typescript-eslint/no-implied-eval
-  const factory = new Function("document", `${fn}\nreturn serverDownVisible;`);
-  return factory(documentMock) as () => boolean;
+  const factory = new Function(
+    "document",
+    "findContinueButton",
+    "trace",
+    `${fn}\nreturn serverDownVisible;`
+  );
+  return factory(documentMock, findContinueButtonMock, () => {}) as () => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +135,34 @@ test("regression: serverDownVisible returns false when the banner is absent", ()
     ],
   });
   assert.equal(vis(), false);
+});
+
+test("regression: serverDownVisible defers when a Continue button is on screen", () => {
+  // v1.2.55: a visible Continue/retry affordance means the generation HALTED
+  // mid-answer — the tab is healthy, just paused. serverDownVisible must
+  // return false so the caller routes through maybeContinue instead of
+  // misclassifying a resumable halt as a provider outage (which previously
+  // triggered a RESET_RESEED and stranded the user's answer behind an
+  // unclicked Continue button while the pool tab was emptied).
+  const banner = { children: [], textContent: "Server is temporarily unavailable." };
+  const vis = makeServerDownVisible(
+    { querySelectorAll: () => [banner] },
+    () => ({ tagName: "DIV" }) // findContinueButton returns a button node
+  );
+  assert.equal(
+    vis(),
+    false,
+    "a visible Continue button must suppress the server-down signal, even when the banner is also present"
+  );
+});
+
+test("regression: serverDownVisible falls through to the banner scan when no Continue button is on screen", () => {
+  const banner = { children: [], textContent: "Server is temporarily unavailable." };
+  const vis = makeServerDownVisible(
+    { querySelectorAll: () => [banner] },
+    () => null // no Continue button anywhere
+  );
+  assert.equal(vis(), true, "with no Continue button present, the banner must still classify as server-down");
 });
 
 // ---------------------------------------------------------------------------
@@ -247,5 +287,23 @@ test("regression: composer and sendButton selectors do not depend on generated h
     withoutComments,
     /_\$?\{?[0-9a-f]{7,8}\b/,
     "SELECTORS must never reference generated hash class names"
+  );
+});
+
+test("regression: serverDownVisible defers to a visible Continue button", () => {
+  // A visible Continue / retry affordance means the generation halted with
+  // more available — the tab is healthy, just paused. serverDownVisible must
+  // return false so the turn routes through maybeContinue instead of being
+  // misclassified as a provider outage (which triggers a RESET_RESEED and
+  // strands the user's answer behind an unclicked Continue button).
+  const fn = extractFunction("serverDownVisible");
+  assert.match(fn, /findContinueButton\(\)/, "serverDownVisible must consult findContinueButton");
+  const contIdx = fn.indexOf("findContinueButton()");
+  const needleIdx = fn.indexOf("Server is temporarily unavailable");
+  assert.notEqual(contIdx, -1, "must call findContinueButton");
+  assert.notEqual(needleIdx, -1, "must still contain the server-down needle");
+  assert.ok(
+    contIdx < needleIdx,
+    "the Continue-button guard must run BEFORE the server-down text scan"
   );
 });
