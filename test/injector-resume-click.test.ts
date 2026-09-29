@@ -52,10 +52,10 @@ test("regression: findContinueButton also matches the icon-only retry button", (
 
 test("regression: maybeContinue fires BOTH click and keyboard unconditionally", () => {
   const fn = extractFunction("maybeContinue");
-  assert.match(fn, /syntheticClick\(btn\)/, "maybeContinue must call syntheticClick(btn)");
-  assert.match(fn, /keyboardActivate\(btn\)/, "maybeContinue must call keyboardActivate(btn)");
-  // And it must NOT gate keyboardActivate on `!clicked` — that gate is the
-  // exact bug that meant the Enter path almost never ran.
+  // The focus-steal rewrite captures the button as `btnRef`. Either name
+  // is fine; what matters is both activation paths are called.
+  assert.match(fn, /syntheticClick\(btn(Ref)?\)/, "maybeContinue must call syntheticClick(btn)");
+  assert.match(fn, /keyboardActivate\(btn(Ref)?\)/, "maybeContinue must call keyboardActivate(btn)");
   assert.doesNotMatch(
     fn,
     /keyboardActivated\s*=\s*clicked\s*\?\s*false\s*:\s*keyboardActivate/,

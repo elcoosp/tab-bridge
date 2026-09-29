@@ -64,8 +64,10 @@ test("instrumentation: window.__tabBridgeState and __tabBridgeForceContinue are 
 
 test("instrumentation: maybeContinue uses syntheticClick and keyboard fallback", () => {
   const fn = extractFunction("maybeContinue");
-  assert.match(fn, /syntheticClick\(btn\)/, "maybeContinue must call syntheticClick(btn)");
-  assert.match(fn, /keyboardActivate\(btn\)/, "maybeContinue must fall back to keyboardActivate(btn)");
+  // The focus-steal rewrite captures the button as `btnRef` so it can be
+  // re-checked inside a setTimeout. Either name is fine.
+  assert.match(fn, /syntheticClick\(btn(Ref)?\)/, "maybeContinue must call syntheticClick(btn)");
+  assert.match(fn, /keyboardActivate\(btn(Ref)?\)/, "maybeContinue must call keyboardActivate(btn)");
   assert.doesNotMatch(
     fn,
     /btn\.click\(\)/,

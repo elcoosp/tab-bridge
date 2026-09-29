@@ -1717,10 +1717,7 @@ function maybeContinue(t, why) {
     trace("maybeContinue: no Continue button found", { why });
     return false;
   }
-  // ALWAYS-ON diagnostic: dump the button's shape, parentage, and React
-  // event handlers as a JSON STRING. Passing an object as the second arg
-  // to console.log makes DevTools collapse it to "Object"; the string is
-  // the whole point of the diagnostic, so it must not be collapsible.
+  // Diagnostic dump (JSON string so DevTools cannot collapse it).
   let reactHandlers = "(unknown)";
   try {
     reactHandlers = dumpReactHandlers(btn);
@@ -1731,7 +1728,12 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   try {
     const r = btn.getBoundingClientRect();
-    rectStr = JSON.stringify({ x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) });
+    rectStr = JSON.stringify({
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+    });
     const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     if (hit) {
       const tag = hit.tagName.toLowerCase();
@@ -1774,89 +1776,88 @@ function maybeContinue(t, why) {
   );
   t.continues = (t.continues | 0) + 1;
   t.awaitContinue = Date.now();
-  dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
-  // Sync arm BEFORE click (see previous version's docstring for why this
-  // matters), then async arm as a belt-and-braces.
-  hookArmSync(t.reqId, t.opts.timeoutMs || 240000);
-  hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
-  // Fire BOTH activation strategies unconditionally.
-  const clicked = syntheticClick(btn);
-  const keyboardActivated = keyboardActivate(btn);
-  dbg(
-    "maybeContinue: activated " +
-      JSON.stringify({
-        why,
-        continues: t.continues,
-        clicked,
-        keyboardActivated,
-        label: (btn.textContent || "").trim().slice(0, 40),
-      })
-  );
-  // Post-click verification: poll for the button's disappearance. If
-  // React handled the click, it re-renders the button away within ~1
-  // frame. If it's still there after 300ms, the click dispatched but
-  // did not register — the second-wave activation (see the retry
-  // branch below) will try a focus + Enter-only path with no click.
+  const reqId = t.reqId;
+  const timeoutMs = t.opts.timeoutMs || 240000;
   const btnRef = btn;
+  dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
+  // Ask the SW to briefly focus the pool window. A synthetic click from
+  // an unfocused window is refused by any handler that checks
+  // document.hasFocus() — this is the one thing our dispatch cannot
+  // otherwise provide. The SW records the user's current window and
+  // restores it after the click has been dispatched (see RESTORE_FOCUS).
+  try {
+    report("FOCUS_POOL_WINDOW");
+  } catch {
+    /* noop */
+  }
+  // Wait for the SW to focus the window before dispatching. 200ms is ample
+  // for chrome.windows.update on a small window; if the window is already
+  // focused this is a no-op that returns much faster.
   setTimeout(() => {
-    if (!t || t.finished) return;
-    let stillThere = false;
-    let nowLabel = "";
-    try {
-      stillThere = btnRef.isConnected;
-      nowLabel = stillThere ? (btnRef.textContent || "").trim().slice(0, 40) : "";
-    } catch {
-      /* noop */
+    if (!t || t.finished) {
+      try { report("RESTORE_FOCUS"); } catch { /* noop */ }
+      return;
     }
-    const streamAfterClick = t.lastSseAt > t.awaitContinue;
+    hookArmSync(reqId, timeoutMs);
+    hookPost({ type: "arm", turnId: reqId, timeoutMs });
+    const clicked = syntheticClick(btnRef);
+    const keyboardActivated = keyboardActivate(btnRef);
     dbg(
-      "maybeContinue: post-click state " +
-        JSON.stringify({ reqId: t.reqId, stillThere, label: nowLabel, streamAfterClick })
+      "maybeContinue: activated " +
+        JSON.stringify({ why, continues: t.continues, clicked, keyboardActivated })
     );
-    // Second-wave recovery: if the button survived, fire the keyboard
-    // path by itself with focus and WITHOUT the click sequence — some
-    // React builds handle Enter-on-focused-role=button but ignore a
-    // programmatic click (usually due to a focus requirement in the
-    // component's own onClick guard). Non-fatal: the existing
-    // continue-no-stream watchdog picks up if this also misses.
-    if (stillThere && t.lastSseAt <= t.awaitContinue) {
-      try {
-        const btn2 = findContinueButton();
-        if (btn2) {
-          dbg("maybeContinue: retrying with focus + Enter only");
-          try {
-            btn2.focus();
-          } catch {
-            /* noop */
-          }
-          try {
-            btn2.dispatchEvent(
-              new KeyboardEvent("keydown", {
-                key: "Enter", code: "Enter", keyCode: 13, which: 13,
-                bubbles: true, cancelable: true,
-              })
-            );
-            btn2.dispatchEvent(
-              new KeyboardEvent("keyup", {
-                key: "Enter", code: "Enter", keyCode: 13, which: 13,
-                bubbles: true, cancelable: true,
-              })
-            );
-          } catch {
-            /* noop */
-          }
-          // Last resort: invoke the React handler directly via the fiber
-          // tree. This bypasses the DOM event pipeline entirely, which is
-          // the only remaining option when the button survives every
-          // dispatched event.
-          const invoked = deepReactActivate(btn2);
-          dbg("maybeContinue: deepReactActivate returned " + String(invoked));
-        }
-      } catch (e) {
-        dbg("maybeContinue: second-wave recovery threw " + String((e && e.message) || e));
+    // 400ms is enough for React to re-render the button away on success.
+    // If it is still there, fall through to a focus+Enter retry, then
+    // restore the user's focus regardless.
+    setTimeout(() => {
+      if (!t || t.finished) {
+        try { report("RESTORE_FOCUS"); } catch { /* noop */ }
+        return;
       }
-    }
-  }, 300);
+      let stillThere = false;
+      let nowLabel = "";
+      try {
+        stillThere = btnRef.isConnected;
+        nowLabel = stillThere ? (btnRef.textContent || "").trim().slice(0, 40) : "";
+      } catch {
+        /* noop */
+      }
+      const streamAfterClick = t.lastSseAt > t.awaitContinue;
+      dbg(
+        "maybeContinue: post-click state " +
+          JSON.stringify({ reqId, stillThere, label: nowLabel, streamAfterClick })
+      );
+      if (stillThere && t.lastSseAt <= t.awaitContinue) {
+        try {
+          const btn2 = findContinueButton();
+          if (btn2) {
+            dbg("maybeContinue: retrying with focus + Enter only");
+            try { btn2.focus(); } catch { /* noop */ }
+            try {
+              btn2.dispatchEvent(new KeyboardEvent("keydown", {
+                key: "Enter", code: "Enter", keyCode: 13, which: 13,
+                bubbles: true, cancelable: true,
+              }));
+              btn2.dispatchEvent(new KeyboardEvent("keyup", {
+                key: "Enter", code: "Enter", keyCode: 13, which: 13,
+                bubbles: true, cancelable: true,
+              }));
+            } catch { /* noop */ }
+          }
+        } catch { /* noop */ }
+      }
+          // Last resort: invoke the React handler directly via the fiber
+          // tree. Only reached when the button survived both a genuine
+          // focused click and a focus+Enter — i.e. when the DOM event
+          // pipeline has been exhausted.
+          try {
+            const invoked = deepReactActivate(btn2);
+            dbg("maybeContinue: deepReactActivate returned " + String(invoked));
+          } catch { /* noop */ }
+      // Give focus back to whatever the user was on.
+      try { report("RESTORE_FOCUS"); } catch { /* noop */ }
+    }, 400);
+  }, 200);
   return true;
 }
 

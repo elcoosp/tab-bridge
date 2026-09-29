@@ -48,6 +48,10 @@ let connectedAt = 0;
  * different window after Chrome reassigns them).
  */
 let poolWindowId = null;
+/** Window id that had OS focus before we briefly focused the pool window,
+ * so we can restore it after the injector's Continue click. Null when we
+ * have not stolen focus. */
+let priorFocusedWindowId = null;
 let poolConfig = { autoCreateTabs: false, managedOnly: true, warmTabs: 0 };
 let helloOk = false;
 // Stable per-profile identity (loaded from storage.local at boot, default
@@ -380,6 +384,39 @@ async function ensurePoolWindow() {
   }
   blog("pool window created:", poolWindowId);
   return poolWindowId;
+}
+
+/**
+ * Briefly focus the pool window so the DeepSeek tab's document.hasFocus()
+ * returns true. A synthetic click from an unfocused window is refused by
+ * many defensive handlers — this is the one signal a synthetic event
+ * cannot otherwise provide. Restored by restorePriorFocus() once the
+ * injector has finished dispatching.
+ */
+async function focusPoolForInjection() {
+  if (poolWindowId === null) return;
+  try {
+    const current = await chrome.windows.getLastFocused();
+    if (current && typeof current.id === "number" && current.id !== poolWindowId) {
+      priorFocusedWindowId = current.id;
+    }
+    await chrome.windows.update(poolWindowId, { focused: true });
+    blog("pool window focused for injection:", poolWindowId);
+  } catch (e) {
+    blog("focus pool window failed:", String((e && e.message) || e));
+  }
+}
+
+async function restorePriorFocus() {
+  const target = priorFocusedWindowId;
+  priorFocusedWindowId = null;
+  if (target === null) return;
+  try {
+    await chrome.windows.update(target, { focused: true });
+    blog("focus restored to window:", target);
+  } catch {
+    /* window may have been closed — ignore */
+  }
 }
 
 async function allocateTab(sessionId) {
@@ -822,6 +859,16 @@ function handleInjectorConnect(port, tabId) {
   });
 
   function handleInjectorMessage(tabId, port, msg) {
+  // Focus-management messages are handled out of band: they are not turn
+  // events and must not go through the turn state machine.
+  if (msg.t === "FOCUS_POOL_WINDOW") {
+    void focusPoolForInjection();
+    return;
+  }
+  if (msg.t === "RESTORE_FOCUS") {
+    void restorePriorFocus();
+    return;
+  }
     switch (msg.t) {
       case "FRAGMENT": {
         const s = fragNote(msg.reqId, msg.text);
