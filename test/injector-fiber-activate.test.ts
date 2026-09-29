@@ -6,7 +6,12 @@
 //   maybeContinue: post-click state {"stillThere":true,"streamAfterClick":false}
 //
 // The button survived every dispatched event and its own node had no React
-// props. This suite asserts the new countermeasures exist and are wired in.
+// props. This suite asserts the countermeasures exist and are wired in.
+//
+// The "second-wave deepReactActivate" test was removed in v1.2.44: the
+// fiber-walking hack returns false for this DeepSeek build and the primary
+// path is now a trusted click via chrome.debugger. deepReactActivate is
+// kept as an unused-but-available helper.
 //
 // Reads extension/injector.js as source.
 
@@ -51,15 +56,6 @@ test("regression: deepReactActivate walks the fiber return chain", () => {
   assert.match(fn, /\.return/, "deepReactActivate must walk the fiber's return chain");
   assert.match(fn, /onClick/, "deepReactActivate must look for onClick");
   assert.match(fn, /onPointerUp/, "deepReactActivate must look for onPointerUp");
-});
-
-test("regression: maybeContinue calls deepReactActivate in second-wave recovery", () => {
-  const fn = extractFunction("maybeContinue");
-  assert.match(
-    fn,
-    /deepReactActivate\(btn2\)/,
-    "maybeContinue must call deepReactActivate(btn2) after focus+Enter also fails"
-  );
 });
 
 test("regression: button diagnostic includes hitAtCenter and focus state", () => {

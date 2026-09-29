@@ -858,7 +858,85 @@ function handleInjectorConnect(port, tabId) {
     }
   });
 
-  function handleInjectorMessage(tabId, port, msg) {
+  /**
+ * Trusted click via chrome.debugger + CDP Input.dispatchMouseEvent.
+ *
+ * A synthetic click produces a MouseEvent with isTrusted: false; some
+ * handlers refuse such events on principle. chrome.debugger sends the
+ * event through Chrome's own input pipeline, so isTrusted is true — the
+ * same primitive Puppeteer uses. Attach is per-tab and short-lived: we
+ * attach, dispatch mouseMoved + mousePressed + mouseReleased, then
+ * detach. If DevTools is already attached to the target tab, attach
+ * fails with "Another debugger is already attached" — the injector falls
+ * back to a synthetic click in that case.
+ */
+function debuggerAttach(target, version) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.attach(target, version, () => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve();
+    });
+  });
+}
+function debuggerSend(target, method, params) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand(target, method, params, (result) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message));
+      else resolve(result);
+    });
+  });
+}
+function debuggerDetach(target) {
+  return new Promise((resolve) => {
+    chrome.debugger.detach(target, () => {
+      // Ignore lastError — detach is best-effort.
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
+async function debuggerClick(tabId, x, y) {
+  const target = { tabId };
+  try {
+    await debuggerAttach(target, "1.3");
+  } catch (e) {
+    return { ok: false, error: "attach: " + String((e && e.message) || e) };
+  }
+  try {
+    const base = { x, y, button: "left", clickCount: 1, buttons: 1 };
+    await debuggerSend(target, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x, y, button: "none", clickCount: 0, buttons: 0,
+    });
+    await debuggerSend(target, "Input.dispatchMouseEvent", {
+      ...base, type: "mousePressed",
+    });
+    await debuggerSend(target, "Input.dispatchMouseEvent", {
+      ...base, type: "mouseReleased", buttons: 0,
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: "dispatch: " + String((e && e.message) || e) };
+  } finally {
+    await debuggerDetach(target);
+  }
+}
+
+function handleInjectorMessage(tabId, port, msg) {
+  if (msg.t === "DEBUGGER_CLICK") {
+    void debuggerClick(tabId, msg.x, msg.y).then((r) => {
+      try {
+        port.postMessage({
+          t: "DEBUGGER_CLICK_RESULT",
+          reqId: msg.reqId,
+          ok: !!r.ok,
+          error: r.error || null,
+        });
+      } catch { /* port closed */ }
+    });
+    return;
+  }
   // Focus-management messages are handled out of band: they are not turn
   // events and must not go through the turn state machine.
   if (msg.t === "FOCUS_POOL_WINDOW") {

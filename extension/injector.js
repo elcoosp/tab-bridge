@@ -1703,6 +1703,40 @@ function deepReactActivate(el) {
   return false;
 }
 
+/** Ask the SW to click at (x, y) with a genuinely trusted mouse event
+ * (chrome.debugger + CDP). Resolves with {ok, error}. Falls back to
+ * synthetic clicks on the injector side when the debugger cannot attach
+ * (usually because DevTools is open on the target tab). */
+function debuggerClickViaSW(x, y, timeoutMs) {
+  const limit = typeof timeoutMs === "number" ? timeoutMs : 3000;
+  return new Promise((resolve) => {
+    if (!port) {
+      resolve({ ok: false, error: "no-port" });
+      return;
+    }
+    const reqId = "dbg_" + Math.random().toString(36).slice(2, 10);
+    let done = false;
+    let timer = null;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      try { port.onMessage.removeListener(handler); } catch { /* noop */ }
+      resolve(r);
+    };
+    const handler = (msg) => {
+      if (!msg || msg.t !== "DEBUGGER_CLICK_RESULT" || msg.reqId !== reqId) return;
+      finish({ ok: !!msg.ok, error: msg.error || null });
+    };
+    try { port.onMessage.addListener(handler); } catch {
+      finish({ ok: false, error: "listen-failed" });
+      return;
+    }
+    timer = setTimeout(() => finish({ ok: false, error: "timeout" }), limit);
+    report("DEBUGGER_CLICK", { reqId, x: Math.round(x), y: Math.round(y) });
+  });
+}
+
 function maybeContinue(t, why) {
   if (!t || t.finished || (t.continues | 0) >= MAX_CONTINUES) {
     trace("maybeContinue: skip", {
@@ -1717,7 +1751,7 @@ function maybeContinue(t, why) {
     trace("maybeContinue: no Continue button found", { why });
     return false;
   }
-  // Diagnostic dump (JSON string so DevTools cannot collapse it).
+  // Diagnostic dump.
   let reactHandlers = "(unknown)";
   try {
     reactHandlers = dumpReactHandlers(btn);
@@ -1726,21 +1760,21 @@ function maybeContinue(t, why) {
   }
   let rectStr = "{}";
   let hitStr = "(unknown)";
+  let cx = 0;
+  let cy = 0;
   try {
     const r = btn.getBoundingClientRect();
     rectStr = JSON.stringify({
-      x: Math.round(r.x),
-      y: Math.round(r.y),
-      w: Math.round(r.width),
-      h: Math.round(r.height),
+      x: Math.round(r.x), y: Math.round(r.y),
+      w: Math.round(r.width), h: Math.round(r.height),
     });
-    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    cx = r.left + r.width / 2;
+    cy = r.top + r.height / 2;
+    const hit = document.elementFromPoint(cx, cy);
     if (hit) {
       const tag = hit.tagName.toLowerCase();
-      const cls =
-        typeof hit.className === "string" && hit.className
-          ? "." + hit.className.trim().split(/\s+/)[0]
-          : "";
+      const cls = typeof hit.className === "string" && hit.className
+        ? "." + hit.className.trim().split(/\s+/)[0] : "";
       const isSelf = hit === btn || btn.contains(hit);
       hitStr = (isSelf ? "self" : "other") + ":" + tag + cls;
     } else {
@@ -1757,20 +1791,8 @@ function maybeContinue(t, why) {
         className: typeof btn.className === "string" ? btn.className : String(btn.className),
         rect: rectStr,
         hitAtCenter: hitStr,
-        docFocus: (() => {
-          try {
-            return document.hasFocus();
-          } catch {
-            return null;
-          }
-        })(),
-        visibility: (() => {
-          try {
-            return document.visibilityState;
-          } catch {
-            return null;
-          }
-        })(),
+        docFocus: (typeof document.hasFocus === "function" ? document.hasFocus() : null),
+        visibilityState: document.visibilityState,
         reactHandlers,
       })
   );
@@ -1780,84 +1802,46 @@ function maybeContinue(t, why) {
   const timeoutMs = t.opts.timeoutMs || 240000;
   const btnRef = btn;
   dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
-  // Ask the SW to briefly focus the pool window. A synthetic click from
-  // an unfocused window is refused by any handler that checks
-  // document.hasFocus() — this is the one thing our dispatch cannot
-  // otherwise provide. The SW records the user's current window and
-  // restores it after the click has been dispatched (see RESTORE_FOCUS).
-  try {
-    report("FOCUS_POOL_WINDOW");
-  } catch {
-    /* noop */
-  }
-  // Wait for the SW to focus the window before dispatching. 200ms is ample
-  // for chrome.windows.update on a small window; if the window is already
-  // focused this is a no-op that returns much faster.
-  setTimeout(() => {
-    if (!t || t.finished) {
-      try { report("RESTORE_FOCUS"); } catch { /* noop */ }
-      return;
+
+  // Arm the SSE hook BEFORE dispatching. DeepSeek fires the continuation
+  // POST synchronously from the click handler, so the hook must be armed
+  // in the same task. hookArmSync uses a CustomEvent delivered synchronously
+  // across the isolated/main-world boundary.
+  hookArmSync(reqId, timeoutMs);
+  hookPost({ type: "arm", turnId: reqId, timeoutMs });
+
+  // Primary path: trusted click via chrome.debugger. Produces
+  // isTrusted: true events that any handler accepts.
+  debuggerClickViaSW(cx, cy, 3000).then((r) => {
+    dbg("maybeContinue: debugger click result " + JSON.stringify(r));
+    if (!r.ok) {
+      // Fallback: synthetic dispatch. Covered by our earlier patches
+      // (multi-target, detail:1, pointer sequence). Works for handlers
+      // that don't check isTrusted.
+      dbg("maybeContinue: falling back to synthetic click");
+      const clicked = syntheticClick(btnRef);
+      const keyboardActivated = keyboardActivate(btnRef);
+      dbg(
+        "maybeContinue: synthetic fallback " +
+          JSON.stringify({ clicked, keyboardActivated })
+      );
     }
-    hookArmSync(reqId, timeoutMs);
-    hookPost({ type: "arm", turnId: reqId, timeoutMs });
-    const clicked = syntheticClick(btnRef);
-    const keyboardActivated = keyboardActivate(btnRef);
-    dbg(
-      "maybeContinue: activated " +
-        JSON.stringify({ why, continues: t.continues, clicked, keyboardActivated })
-    );
-    // 400ms is enough for React to re-render the button away on success.
-    // If it is still there, fall through to a focus+Enter retry, then
-    // restore the user's focus regardless.
+    // Post-dispatch verification: did the button disappear?
     setTimeout(() => {
-      if (!t || t.finished) {
-        try { report("RESTORE_FOCUS"); } catch { /* noop */ }
-        return;
-      }
+      if (!t || t.finished) return;
       let stillThere = false;
       let nowLabel = "";
       try {
         stillThere = btnRef.isConnected;
         nowLabel = stillThere ? (btnRef.textContent || "").trim().slice(0, 40) : "";
-      } catch {
-        /* noop */
-      }
+      } catch { /* noop */ }
       const streamAfterClick = t.lastSseAt > t.awaitContinue;
       dbg(
         "maybeContinue: post-click state " +
           JSON.stringify({ reqId, stillThere, label: nowLabel, streamAfterClick })
       );
-      if (stillThere && t.lastSseAt <= t.awaitContinue) {
-        try {
-          const btn2 = findContinueButton();
-          if (btn2) {
-            dbg("maybeContinue: retrying with focus + Enter only");
-            try { btn2.focus(); } catch { /* noop */ }
-            try {
-              btn2.dispatchEvent(new KeyboardEvent("keydown", {
-                key: "Enter", code: "Enter", keyCode: 13, which: 13,
-                bubbles: true, cancelable: true,
-              }));
-              btn2.dispatchEvent(new KeyboardEvent("keyup", {
-                key: "Enter", code: "Enter", keyCode: 13, which: 13,
-                bubbles: true, cancelable: true,
-              }));
-            } catch { /* noop */ }
-          }
-        } catch { /* noop */ }
-      }
-          // Last resort: invoke the React handler directly via the fiber
-          // tree. Only reached when the button survived both a genuine
-          // focused click and a focus+Enter — i.e. when the DOM event
-          // pipeline has been exhausted.
-          try {
-            const invoked = deepReactActivate(btn2);
-            dbg("maybeContinue: deepReactActivate returned " + String(invoked));
-          } catch { /* noop */ }
-      // Give focus back to whatever the user was on.
-      try { report("RESTORE_FOCUS"); } catch { /* noop */ }
-    }, 400);
-  }, 200);
+    }, 500);
+  });
   return true;
 }
 

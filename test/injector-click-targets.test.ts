@@ -4,14 +4,12 @@
 // The log showed `maybeContinue: button Object / clicking Continue (1/5,
 // sse-complete) / maybeContinue: activated Object` firing, but the button
 // remained visible in the screenshot and no continuation POST followed.
-// Two likely causes:
 //
-//   1. Object-arg logging collapses the diagnostic to "Object" in DevTools,
-//      hiding clicked/keyboardActivated/reactHandlers from the operator.
-//   2. A single el.click() on the outer div misses DeepSeek builds whose
-//      handler lives on a nested element (the ds-button__content span) or
-//      whose synthetic dispatch requires a raw Event("click") rather than
-//      a MouseEvent.
+// v1.2.44 switches the primary click path to chrome.debugger +
+// CDP Input.dispatchMouseEvent, which produces isTrusted: true events.
+// The old synthetic fallback remains for handlers that do not check
+// isTrusted. The focus-steal retry test was removed: the hypothesis was
+// wrong and the focus path was stripped from maybeContinue.
 //
 // This suite reads extension/injector.js as source and asserts the
 // invariant.
@@ -65,28 +63,17 @@ test("regression: maybeContinue logs diagnostics as JSON strings", () => {
     /dbg\(\s*"maybeContinue: button "\s*\+\s*JSON\.stringify\(/,
     "button diagnostic must be a JSON string, not an object (DevTools collapses objects)"
   );
+  // Activation diagnostic is emitted either as "activated" (synthetic
+  // fallback succeeded) or "synthetic fallback" (debugger path failed).
+  // Both shapes must be JSON-stringified so DevTools cannot collapse them.
   assert.match(
     fn,
-    /dbg\(\s*"maybeContinue: activated "\s*\+\s*JSON\.stringify\(/,
+    /dbg\(\s*"maybeContinue: (activated|synthetic fallback) "\s*\+\s*JSON\.stringify\(/,
     "activation diagnostic must be a JSON string"
   );
   assert.match(
     fn,
     /maybeContinue: post-click state "\s*\+\s*JSON\.stringify\(/,
     "post-click diagnostic must be a JSON string"
-  );
-});
-
-test("regression: maybeContinue retries with focus + Enter when button persists", () => {
-  const fn = extractFunction("maybeContinue");
-  assert.match(
-    fn,
-    /focus \+ Enter only/,
-    "maybeContinue must have a second-wave recovery that tries focus + Enter alone"
-  );
-  assert.match(
-    fn,
-    /btn2\.focus\(\)/,
-    "second-wave recovery must focus the button before dispatching Enter"
   );
 });
