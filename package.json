@@ -1,6 +1,6 @@
 {
   "name": "tab-bridge",
-  "version": "1.2.39",
+  "version": "1.2.40",
   "description": "OpenAI-compatible facade over a stateful browser chat tab (DeepSeek v1). Bridge + Chrome extension + tests.",
   "type": "module",
   "private": true,

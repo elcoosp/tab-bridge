@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Bridge Worker (DeepSeek)",
-  "version": "1.2.39",
+  "version": "1.2.40",
   "description": "Chrome-side worker for Tab Bridge: drives a managed DeepSeek chat tab over the bridge worker-link protocol (BIND/SEND/RESET intents, FRAGMENT observations). Replies are captured from the completion SSE stream (MAIN-world fetch hook) with a DOM observer fallback.",
   "minimum_chrome_version": "116",
   "permissions": [

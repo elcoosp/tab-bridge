@@ -162,6 +162,34 @@ function syntheticClick(el) {
   return ok;
 }
 
+/**
+ * List the React event-handler props attached to an element. React keeps
+ * these on the DOM node itself under keys like `__reactProps$xxx`. Returns
+ * a comma-separated list of handler names, or a diagnostic string when
+ * nothing is found.
+ */
+function dumpReactHandlers(el) {
+  let key = null;
+  try {
+    const keys = Object.keys(el);
+    key = keys.find((k) => k.startsWith("__reactProps") || k.startsWith("__reactEventHandlers"));
+  } catch {
+    return "(no keys)";
+  }
+  if (!key) return "(no react props)";
+  const props = el[key];
+  if (!props || typeof props !== "object") return "(props not an object)";
+  const out = [];
+  try {
+    for (const name of Object.keys(props)) {
+      if (/^on[A-Z]/.test(name)) out.push(name);
+    }
+  } catch {
+    return "(iteration error)";
+  }
+  return out.length > 0 ? out.join(",") : "(no handler props)";
+}
+
 function keyboardActivate(el) {
   if (!el || !el.isConnected) return false;
   try {
@@ -250,6 +278,50 @@ window.__tabBridgeState = () => {
 //   __tabBridgeForceContinue()
 // Useful when the auto-detect hasn't fired yet, or to verify the click
 // itself works before assuming the detection logic is the problem.
+/**
+ * Manual resume trigger. From the isolated-world DevTools console:
+ *   __tabBridgeClickResume()
+ * Returns a structured report — what was found, what dispatched, and
+ * whether the button disappeared afterwards. Use this when the auto-detect
+ * seems not to fire, to isolate detection failures from click failures.
+ */
+window.__tabBridgeClickResume = () => {
+  const btn = findContinueButton();
+  if (!btn) {
+    return {
+      found: false,
+      state: typeof window.__tabBridgeState === "function" ? window.__tabBridgeState() : null,
+    };
+  }
+  let reactHandlers = "(unknown)";
+  try {
+    reactHandlers = dumpReactHandlers(btn);
+  } catch (e) {
+    reactHandlers = "ERR: " + String((e && e.message) || e);
+  }
+  const before = {
+    outerHTML: (btn.outerHTML || "").slice(0, 220),
+    className: typeof btn.className === "string" ? btn.className : String(btn.className),
+    reactHandlers,
+  };
+  // Arm both paths synchronously in case the click fires a POST.
+  if (turn) {
+    hookArmSync(turn.reqId, turn.opts.timeoutMs || 240000);
+    hookPost({ type: "arm", turnId: turn.reqId, timeoutMs: turn.opts.timeoutMs || 240000 });
+  }
+  const clicked = syntheticClick(btn);
+  const keyboardActivated = keyboardActivate(btn);
+  return {
+    found: true,
+    before,
+    clicked,
+    keyboardActivated,
+    // Note: check `btn.isConnected` ~500ms after this call to see whether
+    // React re-rendered the button away (which means the click registered).
+    wasConnectedAtReturn: btn.isConnected,
+  };
+};
+
 window.__tabBridgeForceContinue = () => {
   if (!turn) return "no active turn";
   const btn = findContinueButton();
@@ -350,6 +422,9 @@ function findAll(selectorList) {
  * Only one is ever present; invisible matches don't count.
  */
 function findContinueButton() {
+  // Pass 1: text-labelled resume control. DeepSeek's labelled Continue
+  // button is a div[role=button] whose span.ds-button__content reads
+  // "Continue" (with locale/CJK variants).
   let els;
   try {
     els = document.querySelectorAll('div[role="button"], button');
@@ -357,15 +432,11 @@ function findContinueButton() {
     trace("findContinueButton: querySelectorAll threw");
     return null;
   }
-  // Bounded candidate census, capped at 12 entries, so trace output stays
-  // readable even on a page with many buttons.
   const census = [];
   for (const el of els) {
     if (!isVisible(el)) continue;
     let label = "";
     try {
-      // Prefer the design-system label span; fall back to the element's own
-      // text (some builds omit the wrapper span).
       const span = el.querySelector("span.ds-button__content");
       label = ((span || el).textContent || "").trim();
     } catch {
@@ -377,12 +448,41 @@ function findContinueButton() {
       continue;
     }
     if (CONTINUE_RE.test(label)) {
-      trace("findContinueButton: hit", { label });
+      trace("findContinueButton: hit (label)", { label });
       return el;
     }
     if (census.length < 12) census.push({ label, why: "no-match" });
   }
-  trace("findContinueButton: miss", { scanned: els.length, candidates: census });
+  // Pass 2: icon-only warning-circle retry button. DeepSeek renders this
+  // alternative resume control after some halts — a circular
+  // warning-coloured button with a reload-arrow svg and NO text label:
+  //   <div role="button" class="ds-button ds-button--warning
+  //        ds-button--filled ds-button--circle ds-button--xs …">
+  //     <svg>…reload path…</svg>
+  //   </div>
+  // The --warning + --circle combination is unique in the DOM (send button
+  // uses --primary + --circle; warning toasts use --warning without
+  // --circle). Requiring an svg child further disambiguates.
+  let iconEls;
+  try {
+    iconEls = document.querySelectorAll(
+      'div[role="button"].ds-button--warning.ds-button--circle, ' +
+        'button.ds-button--warning.ds-button--circle'
+    );
+  } catch {
+    iconEls = [];
+  }
+  for (const el of iconEls) {
+    if (!isVisible(el)) continue;
+    if (!el.querySelector("svg")) continue;
+    trace("findContinueButton: hit (icon retry)");
+    return el;
+  }
+  trace("findContinueButton: miss", {
+    scanned: els.length,
+    candidates: census,
+    iconRetryCandidates: iconEls.length,
+  });
   return null;
 }
 
@@ -1399,30 +1499,74 @@ function maybeContinue(t, why) {
     trace("maybeContinue: no Continue button found", { why });
     return false;
   }
+  // ALWAYS-ON diagnostic: dump the button's shape, parentage, and React
+  // event handlers, so a stuck repro tells us exactly what we found and
+  // which handlers we should be firing.
+  let reactHandlers = "(unknown)";
+  try {
+    reactHandlers = dumpReactHandlers(btn);
+  } catch (e) {
+    reactHandlers = "ERR: " + String((e && e.message) || e);
+  }
+  let rect = null;
+  try {
+    const r = btn.getBoundingClientRect();
+    rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+  } catch {
+    /* noop */
+  }
+  dbg("maybeContinue: button", {
+    why,
+    outerHTML: (btn.outerHTML || "").slice(0, 220),
+    className: typeof btn.className === "string" ? btn.className : String(btn.className),
+    rect,
+    reactHandlers,
+  });
   t.continues = (t.continues | 0) + 1;
   t.awaitContinue = Date.now();
   dbg("clicking Continue", `(${t.continues}/${MAX_CONTINUES}, ${why})`);
-  // Arm the hook SYNCHRONOUSLY before clicking. DeepSeek's Continue button
-  // fires /api/v0/chat/completion from within its click handler, in the
-  // same task as the click. window.postMessage (the async path) is
-  // delivered on a later task, so it misses that POST entirely — the hook
-  // is still unarmed when the fetch fires. hookArmSync uses a
-  // CustomEvent on window, whose listener in the MAIN world runs
-  // synchronously within dispatchEvent, guaranteeing the hook is armed
-  // before control returns here. The async arm below is kept as a
-  // belt-and-braces for any MAIN-world hook build that pre-dates the sync
-  // listener.
+  // Sync arm BEFORE click (see previous version's docstring for why this
+  // matters), then async arm as a belt-and-braces.
   hookArmSync(t.reqId, t.opts.timeoutMs || 240000);
   hookPost({ type: "arm", turnId: t.reqId, timeoutMs: t.opts.timeoutMs || 240000 });
+  // Fire BOTH activation strategies unconditionally. `el.click()` on a
+  // div[role=button] never throws, so gating keyboardActivate on
+  // `!clicked` meant it almost never ran — yet DeepSeek's tabindex=0
+  // role=button controls are documented as keyboard-activatable, and some
+  // builds respond to Enter but not click. DeepSeek's handler is
+  // idempotent for a single in-flight resume, so firing both is safe.
   const clicked = syntheticClick(btn);
-  const keyboardActivated = clicked ? false : keyboardActivate(btn);
-  trace("maybeContinue: activated", {
+  const keyboardActivated = keyboardActivate(btn);
+  dbg("maybeContinue: activated", {
     why,
     continues: t.continues,
     clicked,
     keyboardActivated,
     label: (btn.textContent || "").trim().slice(0, 40),
   });
+  // Post-click verification: 500ms later, check whether the button
+  // disappeared (React handled the click and re-rendered) or is still
+  // there (the click did not register). This is the definitive signal
+  // for the next repro.
+  const btnRef = btn;
+  setTimeout(() => {
+    if (!t || t.finished) return;
+    let stillThere = false;
+    let nowLabel = "";
+    try {
+      stillThere = btnRef.isConnected;
+      nowLabel = stillThere ? (btnRef.textContent || "").trim().slice(0, 40) : "";
+    } catch {
+      /* noop */
+    }
+    const streamAfterClick = t.lastSseAt > t.awaitContinue;
+    dbg("maybeContinue: post-click state", {
+      reqId: t.reqId,
+      stillThere,
+      label: nowLabel,
+      streamAfterClick,
+    });
+  }, 500);
   return true;
 }
 
