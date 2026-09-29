@@ -1591,6 +1591,28 @@ function fallbackToDom(t, why) {
 }
 
 /**
+ * v1.2.46 — DOM continuation.
+ *
+ * DeepSeek halted, the trusted Continue click landed, but the continuation
+ * POST (if any) went over a transport the SSE hook does not intercept: the
+ * caller would otherwise be handed the partial answer and the turn would
+ * time out at the 120s idle ceiling. Switch to DOM reading instead — the
+ * continuation is rendered in the same assistant bubble (or a new one), so
+ * the existing DOM observer's growth-diff supplies the missing text as
+ * ordinary fragments appended to `t.emitted`. The caller sees one continuous
+ * response: partial + continued, one turn, no timeout, no partial yield.
+ */
+function startDomContinuation(t) {
+  if (!t || t.finished || t.domObserver) return;
+  dbg("DOM continuation engaged for", t.reqId, `(partial=${t.emitted.length} chars)`);
+  t.mode = "dom";
+  t.domContinuation = true;
+  t.awaitContinue = 0;
+  t.continueGraceUntil = 0;
+  startDomObserver(t, { continuationBaseline: true });
+}
+
+/**
  * Provider stopped mid-answer with a Continue button on screen: click it and
  * keep the SAME turn going (same reqId, append-only deltas). The continuation
  * is a fresh completion POST, so the hook is re-armed to catch it. Bounded:
@@ -1826,6 +1848,21 @@ function maybeContinue(t, why) {
           JSON.stringify({ clicked, keyboardActivated })
       );
     }
+    if (r.ok) {
+      // v1.2.46 DOM continuation. The trusted click landed but the log
+      // shows `streamAfterClick:false` even when `stillThere:false`: the
+      // continuation travels over a transport the SSE hook does not see.
+      // Give the stream 1.5s to show up; if it does not, switch the turn
+      // to DOM reading so the continued text is appended to the partial
+      // we already emitted, inside the same turn.
+      setTimeout(() => {
+        if (!t || t.finished) return;
+        if (t.mode === "dom") return;
+        if (t.awaitContinue && t.lastSseAt > t.awaitContinue) return;
+        if (findContinueButton()) return;
+        startDomContinuation(t);
+      }, 1500);
+    }
     // Post-dispatch verification: did the button disappear?
     setTimeout(() => {
       if (!t || t.finished) return;
@@ -1847,7 +1884,7 @@ function maybeContinue(t, why) {
 
 /** Legacy DOM capture (v1.1 logic): observer + stability tick. Used only
  * when the SSE hook is absent or produced nothing. */
-function startDomObserver(t) {
+function startDomObserver(t, opts) {
   if (t.domObserver) return;
   let lastLen = -1;
   let sawGrowth = false;
@@ -1856,6 +1893,7 @@ function startDomObserver(t) {
   let tickLen = -1;
   let tickStableSince = 0;
 
+  const continuationMode = !!(opts && opts.continuationBaseline === true);
   const emitText = (text) => {
     // DOM scraping sees RENDERED markdown: the thinking block leaks as plain
     // text (tags are elements, not text) and code fences lose their backticks.
@@ -1863,6 +1901,27 @@ function startDomObserver(t) {
     // fidelity is unrecoverable from DOM — tool turns must ride SSE (the
     // 1.2.6 boot-race fix); this is only a prose safety net.
     text = stripThinkBlocks(text);
+    if (continuationMode) {
+      // v1.2.46 DOM continuation. The SSE path already streamed the partial
+      // answer, DeepSeek halted, and its Continue click went over a transport
+      // the hook does not intercept. Read the growth of the assistant bubble
+      // as continued text; append it to what we already emitted so the caller
+      // receives partial+continued as one continuous stream in one turn.
+      if (text.startsWith(t.emitted)) {
+        const delta = text.slice(t.emitted.length);
+        if (delta) emitDelta(t, delta);
+      } else if (t.emitted.startsWith(text)) {
+        // The rendered bubble has not caught up with the partial we already
+        // sent. Wait for growth; do not double-emit.
+        return;
+      } else if (text.length > 0) {
+        // DeepSeek painted the continuation in a NEW bubble, so the prefix
+        // check fails. Emit that content additively — the caller still gets
+        // the full answer.
+        emitDelta(t, text);
+      }
+      return;
+    }
     if (text.startsWith(lastSent)) {
       const delta = text.slice(lastSent.length);
       if (delta) {
@@ -1964,6 +2023,20 @@ function startDomObserver(t) {
       clearInterval(tick);
       return;
     }
+    // v1.2.46 — multi-halt support while in DOM continuation mode. If
+    // DeepSeek halts AGAIN after a previous resume, the Continue button
+    // reappears. Click it once more via the trusted debugger path (bounded
+    // by MAX_CONTINUES), with a 5s cooldown so we do not spam.
+    if (continuationMode && (t.continues | 0) < MAX_CONTINUES) {
+      const contBtn = findContinueButton();
+      if (
+        contBtn &&
+        (!t.domContinuationClickAt || Date.now() - t.domContinuationClickAt > 5000)
+      ) {
+        t.domContinuationClickAt = Date.now();
+        maybeContinue(t, "dom-continuation-halt");
+      }
+    }
     const text = replyText();
     if (text === null) {
       // Provider outage check FIRST. DeepSeek renders
@@ -2014,6 +2087,23 @@ function startDomObserver(t) {
       return;
     }
     nullSince = 0;
+    // v1.2.46 continuation bailout: if the Continue button persists past
+    // MAX_CONTINUES trusted-click retries, finish with what we captured
+    // rather than hanging until the turn deadline.
+    if (
+      continuationMode &&
+      (t.continues | 0) >= MAX_CONTINUES &&
+      tickStableSince &&
+      Date.now() - tickStableSince > 5000 &&
+      text.length > 0
+    ) {
+      dbg(
+        "DOM continuation exhausted; finishing with captured text",
+        `(${t.emitted.length} chars, ${t.continues | 0} click(s))`
+      );
+      finishTurn(true);
+      return;
+    }
     if (text.length !== tickLen) {
       tickLen = text.length;
       tickStableSince = Date.now();
@@ -2233,18 +2323,13 @@ function startWatchdog(t) {
       });
       t.awaitContinue = 0;
       const retried = (t.continues | 0) < MAX_CONTINUES && maybeContinue(t, "continue-no-stream");
-      if (retried) return;
-      if (!t.continueGraceUntil) {
-        t.continueGraceUntil = now + 30000;
-        dbg("Continue retries exhausted; holding turn open 30s", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
-        return;
-      }
-      if (now < t.continueGraceUntil) return;
-      if (t.emitted.length > 0) {
-        dbg("Continue grace expired with no stream — ending turn with captured text", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
-        finishTurn(true);
-      } else {
-        fallbackToDom(t, "continuation produced no stream and no captured text");
+      if (!retried) {
+        if (t.emitted.length > 0) {
+          dbg("Continue produced no stream within 10s — ending turn with the captured text", `(${t.emitted.length} chars, ${t.continues | 0} click(s))`);
+          finishTurn(true);
+        } else {
+          fallbackToDom(t, "continuation produced no stream and no captured text");
+        }
       }
     }
   }, 2000);
@@ -2374,6 +2459,8 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
+    domContinuation: false, // v1.2.46: DOM-continuation mode active for this turn
+    domContinuationClickAt: 0, // v1.2.46: last DOM-continuation Continue click (cooldown)
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
