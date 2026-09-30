@@ -47,6 +47,11 @@ export type WorkerObservation =
   | { t: "RESET_OK"; reqId: string }
   | { t: "RESET_TIMEOUT"; reqId: string }
   | { t: "PONG"; seq: number; tabs?: Array<{ tabId: number; state: string; health: string }> }
+  // v1.2.65: the worker also emits PING (application-level keepalive), which
+  // the bridge answers with PONG. The frame is bidirectional in practice, so
+  // the observation union must accept it or the pool's onMessage cannot
+  // discriminate the branch without a type assertion.
+  | { t: "PING"; seq: number }
   | { t: "RELEASED"; sessionId: string };
 
 export function parseWorkerMessage(raw: string): WorkerObservation | null {

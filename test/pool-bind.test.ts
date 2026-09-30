@@ -61,3 +61,25 @@ test("bind fails fast on rate-limited-cooldown", async () => {
   await assert.rejects(() => pool.bind("s-cool", 5000), /bind-failed: rate-limited-cooldown/);
   pool.detach("test-done");
 });
+
+// v1.2.65 — the pool MUST answer the worker's application-level PING with a
+// PONG. The reply is the only inbound WebSocket traffic the worker sees when
+// idle; without it Chrome kills the MV3 service worker at 30 s and the bridge
+// retries RESET_RESEED into a flap cascade.
+test("pool answers worker PING with PONG", async () => {
+  const pool = new WorkerPool({ autoCreateTabs: true, managedOnly: true, warmTabs: 0 });
+  const sent: Record<string, unknown>[] = [];
+  const conn = stubConn((m) => sent.push(m));
+  pool.attach(conn as never);
+
+  // Wait for the HELLO_OK handshake flush to settle before injecting our PING,
+  // so we don't conflate the handshake ack with the PONG assertion.
+  await new Promise((r) => setTimeout(r, 10));
+  conn.emit("message", JSON.stringify({ t: "PING", seq: 42 }));
+
+  const pong = sent.find((m) => m.t === "PONG");
+  assert.ok(pong, "pool must reply PONG to a worker PING");
+  assert.equal((pong as { seq: number }).seq, 42, "PONG must echo the PING seq");
+
+  pool.detach("test-done");
+});

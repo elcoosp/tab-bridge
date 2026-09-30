@@ -23,14 +23,19 @@ const RECONNECT_MAX_MS = 30000;
  * later drops because Chrome reclaimed the SW lives for seconds-to-minutes. */
 const STABLE_CONNECTION_MS = 5000;
 /**
- * Chrome MV3 suspends an extension service worker after 30s of no extension
- * activity. Sending a WebSocket frame counts as activity — but only if the
- * frames are exchanged MORE FREQUENTLY than every 30s. 25s was inside the
- * margin of error on a busy machine; 15s is comfortably below it. The ping
- * also drives the bridge's liveness check (PONG responses), so it earns its
- * keep twice.
+ * Chrome MV3 suspends an extension service worker after 30 s of no activity.
+ * The activity that counts is: extension-API calls, port messages, and
+ * INBOUND WebSocket messages. OUTBOUND WS frames do NOT reset the timer on
+ * their own — the bridge must answer our PING with a PONG for the frame
+ * to do us any good (see WorkerPool.onMessage).
+ *
+ * The bridge now answers every PING with a PONG, so a 10 s interval gives
+ * three inbound frames inside the 30 s window even with one lost delivery.
+ * Reduced from 15 s (v1.2.64) after the previous version saw the SW still
+ * killed at ~28.5 s — right at the threshold — while the bridge silently
+ * dropped our PINGs.
  */
-const PING_INTERVAL_MS = 15000;
+const PING_INTERVAL_MS = 10000;
 /**
  * v1.2.61: was 45_000. Chrome MV3 reclaims an idle service worker well
  * before 45s of no extension-API activity; the RESET wait (which uses no

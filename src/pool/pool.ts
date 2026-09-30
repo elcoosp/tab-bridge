@@ -410,6 +410,23 @@ export class WorkerPool extends EventEmitter {
       const p = o as { t: "PONG"; tabs?: Array<{ tabId: number; state: string; health: string }> };
       for (const t of p.tabs ?? []) this.healthByTab.set(t.tabId, t.health as HealthState);
     }
+    if (o.t === "PING") {
+      // v1.2.65 — reply to the worker's application-level PING. The reply is
+      // an INBOUND text frame on the worker side, which is what resets the
+      // Chrome MV3 30-second service-worker idle timer (outbound frames do
+      // not; only events / extension-API calls / inbound messages do). The
+      // worker's WS control-frame ping (sent by startHeartbeat) is handled by
+      // Chrome internally and never surfaces as a "message" event, so it
+      // cannot serve this purpose. Without this reply, the worker went idle
+      // ~30 s into any quiet stretch, was killed mid-turn, and the bridge
+      // retried RESET_RESEED into a flap cascade.
+      const p = o as { t: "PING"; seq: number };
+      try {
+        this.send({ t: "PONG", seq: p.seq });
+      } catch {
+        /* send failure surfaces via the socket close path */
+      }
+    }
     this.emit("raw", raw);
   }
 
