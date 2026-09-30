@@ -98,3 +98,19 @@ test("turn-state carries the retry bookkeeping fields", () => {
   assert.match(SRC, /rateLimitRecoveryActive: false,/, "turn state must init the debounce flag");
   assert.match(SRC, /promptText: typeof msg\.text === "string" \? msg\.text : ""/, "turn state must capture the prompt text");
 });
+
+test("regression: rate-limit recovery bumps the SSE idle clock", () => {
+  // v1.2.66 — a recovery attempt is activity, not idle. Without this bump,
+  // the watchdog's 120s SSE-idle timeout fires mid-recovery (DeepSeek's
+  // empty 200 responses leave lastSseAt stale) and the harness gets
+  // "timeout" instead of the eventual "rate_limited". See the 2026-09-30
+  // log: retries #1..#6 spanned 126s of backoff while lastSseAt was still
+  // the original submit timestamp, so the watchdog killed the turn at 67s
+  // into the recovery window.
+  const fn = extractFunction("attemptRateLimitRecovery");
+  assert.match(
+    fn,
+    /t\.lastSseAt = now;/,
+    "attemptRateLimitRecovery must bump t.lastSseAt so the SSE idle watchdog does not fire mid-recovery"
+  );
+});

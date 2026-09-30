@@ -92,12 +92,12 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.65: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.66: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
  * 20-minute cooldown. Per-step cap 30s. */
-/** v1.2.65: rate-limit recovery. DeepSeek's "Messages too frequent" is
+/** v1.2.66: rate-limit recovery. DeepSeek's "Messages too frequent" is
  * often transient — a burst hits the account window for seconds, then
  * clears. Retry with exponential backoff (2s, 4s, 8s, …) inside a
  * 5-minute wall-clock window; only a persistent limit crosses that window
@@ -1429,7 +1429,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "concurrency_blocked",
         detail: `${ready.detail || "provider notice: another message is generating"} (mode=${mode})`,
-        // v1.2.65: submit rejected before any generation started — no user
+        // v1.2.66: submit rejected before any generation started — no user
         // bubble was rendered. MUST be explicit so the engine does NOT mark
         // the row failed (which sets pendingReset and poisons the session
         // into an infinite RESET_RESEED loop, one that on this DeepSeek
@@ -1442,7 +1442,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "rate_limited",
         detail: `${ready.detail || "provider notice: messages too frequent"} (mode=${mode})`,
-        // v1.2.65: submit-time rate limit — nothing submitted, no bubble.
+        // v1.2.66: submit-time rate limit — nothing submitted, no bubble.
         // Explicit false keeps the engine from calling markFailed and
         // setting pendingReset (the poisoned-session loop).
         userBubbleRendered: conversationNodes().length > preCount,
@@ -1558,7 +1558,7 @@ function emitDelta(t, text) {
   report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
 }
 /**
- * v1.2.65 — rate-limit recovery with a 5-minute exponential-backoff window.
+ * v1.2.66 — rate-limit recovery with a 5-minute exponential-backoff window.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1584,6 +1584,14 @@ function attemptRateLimitRecovery(t, why, detail) {
   if (t.rateLimitRecoveryActive) return true; // a retry is already in flight
 
   const now = Date.now();
+  // v1.2.66 — rate-limit recovery IS activity. Every retry attempt, every
+  // empty-stream response, every click on the on-screen retry affordance is
+  // evidence the injector is actively working on this turn, not idle. Bump
+  // the SSE idle clock so the watchdog's 120s SSE-idle timeout does not fire
+  // mid-recovery and turn a genuine rate_limited into a misclassified timeout.
+  // The 5-minute RATE_LIMIT_RETRY_WINDOW_MS below is the real upper bound;
+  // the idle check must not race it.
+  t.lastSseAt = now;
   if (!t.rateLimitFirstAt) t.rateLimitFirstAt = now;
   const elapsed = now - t.rateLimitFirstAt;
   if (elapsed >= RATE_LIMIT_RETRY_WINDOW_MS) {
@@ -1879,7 +1887,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.65 — ensure the button is on-screen before we compute the click
+  // v1.2.66 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -2051,7 +2059,7 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
-      // v1.2.65: capture the provider-reported token delta for this turn.
+      // v1.2.66: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
       // emit a real total_tokens instead of the chars/4 estimate.
@@ -2083,7 +2091,7 @@ window.addEventListener("message", (ev) => {
         finishTurn(false, "concurrency_blocked", d.hintError.content || "provider: another message is being generated");
         break;
       }
-      // v1.2.65: Continue/retry is the strongest "halted, more available"
+      // v1.2.66: Continue/retry is the strongest "halted, more available"
       // signal — check it BEFORE the empty-text failure path. A generation
       // that streamed only a THINK fragment leaves t.emitted.length === 0
       // when the stream closes; the old order fail-fast'd to dom-error
@@ -2346,10 +2354,10 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    rateLimitRetries: 0, // v1.2.65: rate-limit recovery attempts this turn
-    rateLimitFirstAt: 0, // v1.2.65: wall-clock start of the recovery window
-    rateLimitRecoveryActive: false, // v1.2.65: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.65: for re-submit
+    rateLimitRetries: 0, // v1.2.66: rate-limit recovery attempts this turn
+    rateLimitFirstAt: 0, // v1.2.66: wall-clock start of the recovery window
+    rateLimitRecoveryActive: false, // v1.2.66: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.66: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
