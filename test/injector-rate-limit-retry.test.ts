@@ -29,7 +29,7 @@ function extractFunction(name: string): string {
   throw new Error(`closing brace for ${name}() not found`);
 }
 
-test("rate-limit constants: 4-minute window + exponential backoff", () => {
+test("rate-limit constants: 90s window + exponential backoff", () => {
   // v1.2.67 — window and cap reduced from 5 min to 4 min so recovery
   // concludes before accumulated per-attempt timeouts at the harness layer
   // (each attempt's own 120s SSE-idle watchdog vs the recovery window's
@@ -37,8 +37,8 @@ test("rate-limit constants: 4-minute window + exponential backoff", () => {
   // pre-empted by a mid-recovery 120s timeout.
   assert.match(
     SRC,
-    /const RATE_LIMIT_RETRY_WINDOW_MS = 4 \* 60_000;/,
-    "must declare a 4-minute wall-clock window"
+    /const RATE_LIMIT_RETRY_WINDOW_MS = 90_000;/,
+    "must declare a 90s wall-clock window"
   );
   assert.match(
     SRC,
@@ -47,8 +47,8 @@ test("rate-limit constants: 4-minute window + exponential backoff", () => {
   );
   assert.match(
     SRC,
-    /const RATE_LIMIT_BACKOFF_MAX_MS = 4 \* 60_000;/,
-    "must cap per-step backoff at the 4-minute window"
+    /const RATE_LIMIT_BACKOFF_MAX_MS = 32_000;/,
+    "must cap per-step backoff at 32s"
   );
 });
 
@@ -142,8 +142,22 @@ test("regression: rate-limit-retry bypasses the MAX_CONTINUES ceiling", () => {
 });
 
 test("regression: rate-limit window and backoff cap are both 4 minutes", () => {
-  assert.match(SRC, /const RATE_LIMIT_RETRY_WINDOW_MS = 4 \* 60_000;/,
+  assert.match(SRC, /const RATE_LIMIT_RETRY_WINDOW_MS = 90_000;/,
     "recovery window must be 4 min so it concludes before the harness's 120s-per-attempt timeout accumulates");
-  assert.match(SRC, /const RATE_LIMIT_BACKOFF_MAX_MS = 4 \* 60_000;/,
+  assert.match(SRC, /const RATE_LIMIT_BACKOFF_MAX_MS = 32_000;/,
     "per-step backoff cap must also be 4 min");
+});
+
+
+test("regression: attemptRateLimitRecovery schedules a proactive give-up timer", () => {
+  // Without this, the last retry fires at the same instant as the turn
+  // deadline, and the deadline always wins → harness sees timeout, not
+  // rate_limited. The timer guarantees the rate_limited declaration.
+  const fn = extractFunction("attemptRateLimitRecovery");
+  assert.match(fn, /t\.rateLimitGiveUpTimer = setTimeout\(/,
+    "must schedule a give-up timer on first entry");
+  assert.match(fn, /finishTurn\(\s*false,\s*"rate_limited"/,
+    "the give-up timer must finish the turn with rate_limited");
+  assert.match(fn, /}, RATE_LIMIT_RETRY_WINDOW_MS\);/,
+    "the give-up timer must fire at window expiry");
 });
