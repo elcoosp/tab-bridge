@@ -29,11 +29,16 @@ function extractFunction(name: string): string {
   throw new Error(`closing brace for ${name}() not found`);
 }
 
-test("rate-limit constants: 5-minute window + exponential backoff", () => {
+test("rate-limit constants: 4-minute window + exponential backoff", () => {
+  // v1.2.67 — window and cap reduced from 5 min to 4 min so recovery
+  // concludes before accumulated per-attempt timeouts at the harness layer
+  // (each attempt's own 120s SSE-idle watchdog vs the recovery window's
+  // total budget) can misfire. See 2026-09-30 log where a 5-min window was
+  // pre-empted by a mid-recovery 120s timeout.
   assert.match(
     SRC,
-    /const RATE_LIMIT_RETRY_WINDOW_MS = 5 \* 60_000;/,
-    "must declare a 5-minute wall-clock window"
+    /const RATE_LIMIT_RETRY_WINDOW_MS = 4 \* 60_000;/,
+    "must declare a 4-minute wall-clock window"
   );
   assert.match(
     SRC,
@@ -42,8 +47,8 @@ test("rate-limit constants: 5-minute window + exponential backoff", () => {
   );
   assert.match(
     SRC,
-    /const RATE_LIMIT_BACKOFF_MAX_MS = 5 \* 60_000;/,
-    "must cap per-step backoff at the window size"
+    /const RATE_LIMIT_BACKOFF_MAX_MS = 4 \* 60_000;/,
+    "must cap per-step backoff at the 4-minute window"
   );
 });
 
@@ -113,4 +118,32 @@ test("regression: rate-limit recovery bumps the SSE idle clock", () => {
     /t\.lastSseAt = now;/,
     "attemptRateLimitRecovery must bump t.lastSseAt so the SSE idle watchdog does not fire mid-recovery"
   );
+});
+
+test("regression: rate-limit-retry bypasses the MAX_CONTINUES ceiling", () => {
+  // v1.2.67 — the SSE-halt path is bounded by MAX_CONTINUES; the rate-limit
+  // recovery path is bounded by RATE_LIMIT_RETRY_WINDOW_MS. Sharing the
+  // Continue counter capped recovery at 5 clicks and let the 120s SSE-idle
+  // watchdog misfire mid-recovery (2026-09-30 log: retry #6 was rejected by
+  // the ceiling, no POST fired, harness got "timeout" instead of
+  // "rate_limited").
+  const fn = extractFunction("maybeContinue");
+  assert.match(fn, /isRateLimitRetry/, "maybeContinue must distinguish the rate-limit-retry path");
+  assert.match(
+    fn,
+    /why === "rate-limit-retry"/,
+    'the bypass must key off the exact reason string "rate-limit-retry"'
+  );
+  assert.match(
+    fn,
+    /!isRateLimitRetry && \(t\.continues \| 0\) >= MAX_CONTINUES/,
+    "the MAX_CONTINUES ceiling must not apply to rate-limit-retry"
+  );
+});
+
+test("regression: rate-limit window and backoff cap are both 4 minutes", () => {
+  assert.match(SRC, /const RATE_LIMIT_RETRY_WINDOW_MS = 4 \* 60_000;/,
+    "recovery window must be 4 min so it concludes before the harness's 120s-per-attempt timeout accumulates");
+  assert.match(SRC, /const RATE_LIMIT_BACKOFF_MAX_MS = 4 \* 60_000;/,
+    "per-step backoff cap must also be 4 min");
 });
