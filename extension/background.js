@@ -377,11 +377,31 @@ function stopPingLoop() {
 // ---------------------------------------------------------------------------
 
 function tabsSnapshot() {
-  return [...tabState.entries()].map(([tabId, st]) => ({
-    tabId,
-    state: st.state,
-    health: st.health || "ok",
-  }));
+  // v1.2.69 — lazily expire rate-limit cooldowns while building the snapshot.
+  //
+  // The 2026-10-01 log showed the harness could not recover from a rate
+  // limit even after the 20-minute cooldown had passed: the stateful session
+  // still had row.tabId set, so `ensureTabAndReady` skipped the BIND and went
+  // straight to adapter.ensureReady → pool.ping → this function. The tab's
+  // st.health was still "rate_limited" from 20 minutes earlier because
+  // `tabInCooldown` (the only code that clears it on expiry) is called from
+  // `allocateTab`, and allocateTab only runs on BIND. No BIND → no expiry →
+  // ensureReady reported the stale health → harness got "provider-rate-limited"
+  // in 5 ms, three retries in a row.
+  //
+  // Calling tabInCooldown here means any tabsSnapshot (and therefore any
+  // PONG snapshot the bridge polls) reflects the current cooldown status,
+  // not the last-observed one. tabInCooldown also emits the correct HEALTH
+  // observation when it clears the state, so the bridge's healthByTab is
+  // updated in the same tick.
+  return [...tabState.entries()].map(([tabId, st]) => {
+    tabInCooldown(tabId, st);
+    return {
+      tabId,
+      state: st.state,
+      health: st.health || "ok",
+    };
+  });
 }
 
 function markHealth(tabId, health, detail) {

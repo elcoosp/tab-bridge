@@ -92,19 +92,19 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.68: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.69: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
  * 20-minute cooldown. Per-step cap 30s. */
-/** v1.2.68: rate-limit recovery. DeepSeek's "Messages too frequent" is
+/** v1.2.69: rate-limit recovery. DeepSeek's "Messages too frequent" is
  * often transient — a burst hits the account window for seconds, then
  * clears. Retry with exponential backoff (2s, 4s, 8s, …) inside a
  * 5-minute wall-clock window; only a persistent limit crosses that window
  * and falls through to the worker's 20-minute cooldown. Per-step backoff
  * is capped at the window itself so the last retry always lands inside. */
 /**
- * v1.2.68 — recovery window 90 s (was 240 s). Two hard bounds force this:
+ * v1.2.69 — recovery window 90 s (was 240 s). Two hard bounds force this:
  *   1. The harness HTTP client gives up at ~120 s (kod "Provider timeout
  *      after 120000ms"). Anything past that and rate_limited never reaches
  *      the caller even though the bridge eventually declares it.
@@ -116,7 +116,7 @@ const MAX_CONTINUES = 5;
  */
 const RATE_LIMIT_RETRY_WINDOW_MS = 90_000;
 const RATE_LIMIT_BACKOFF_INITIAL_MS = 2_000;
-/** v1.2.68 — per-step backoff capped at 32 s so a single backoff cannot
+/** v1.2.69 — per-step backoff capped at 32 s so a single backoff cannot
  * consume more than roughly a third of the 90 s window. The previous 240 s
  * cap let backoff #7 alone eat 108 s (2026-10-01 log), landing an attempt
  * exactly on the turn deadline. */
@@ -1444,7 +1444,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "concurrency_blocked",
         detail: `${ready.detail || "provider notice: another message is generating"} (mode=${mode})`,
-        // v1.2.68: submit rejected before any generation started — no user
+        // v1.2.69: submit rejected before any generation started — no user
         // bubble was rendered. MUST be explicit so the engine does NOT mark
         // the row failed (which sets pendingReset and poisons the session
         // into an infinite RESET_RESEED loop, one that on this DeepSeek
@@ -1457,7 +1457,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "rate_limited",
         detail: `${ready.detail || "provider notice: messages too frequent"} (mode=${mode})`,
-        // v1.2.68: submit-time rate limit — nothing submitted, no bubble.
+        // v1.2.69: submit-time rate limit — nothing submitted, no bubble.
         // Explicit false keeps the engine from calling markFailed and
         // setting pendingReset (the poisoned-session loop).
         userBubbleRendered: conversationNodes().length > preCount,
@@ -1573,7 +1573,7 @@ function emitDelta(t, text) {
   report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
 }
 /**
- * v1.2.68 — rate-limit recovery with a 5-minute exponential-backoff window.
+ * v1.2.69 — rate-limit recovery with a 5-minute exponential-backoff window.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1599,7 +1599,7 @@ function attemptRateLimitRecovery(t, why, detail) {
   if (t.rateLimitRecoveryActive) return true; // a retry is already in flight
 
   const now = Date.now();
-  // v1.2.68 — rate-limit recovery IS activity. Every retry attempt, every
+  // v1.2.69 — rate-limit recovery IS activity. Every retry attempt, every
   // empty-stream response, every click on the on-screen retry affordance is
   // evidence the injector is actively working on this turn, not idle. Bump
   // the SSE idle clock so the watchdog's 120s SSE-idle timeout does not fire
@@ -1609,7 +1609,7 @@ function attemptRateLimitRecovery(t, why, detail) {
   t.lastSseAt = now;
   if (!t.rateLimitFirstAt) {
     t.rateLimitFirstAt = now;
-    // v1.2.68 — proactive give-up. The old design only noticed the window
+    // v1.2.69 — proactive give-up. The old design only noticed the window
     // had expired when a *new* attempt tried to schedule; the last attempt
     // fired right on the turn deadline and the deadline always won. This
     // timer fires finishTurn(rate_limited) at window expiry, so the caller
@@ -1895,7 +1895,7 @@ function debuggerClickViaSW(x, y, timeoutMs) {
 }
 
 function maybeContinue(t, why) {
-  // v1.2.68 — the MAX_CONTINUES ceiling bounds the SSE-halt path (deepseek
+  // v1.2.69 — the MAX_CONTINUES ceiling bounds the SSE-halt path (deepseek
   // halt mid-answer with a Continue button). It must NOT bound the rate-limit
   // recovery path: that mechanism has its own explicit budget
   // (RATE_LIMIT_RETRY_WINDOW_MS, 4 min) and its own give-up semantics. The
@@ -1929,7 +1929,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.68 — ensure the button is on-screen before we compute the click
+  // v1.2.69 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -2101,7 +2101,7 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
-      // v1.2.68: capture the provider-reported token delta for this turn.
+      // v1.2.69: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
       // emit a real total_tokens instead of the chars/4 estimate.
@@ -2133,7 +2133,7 @@ window.addEventListener("message", (ev) => {
         finishTurn(false, "concurrency_blocked", d.hintError.content || "provider: another message is being generated");
         break;
       }
-      // v1.2.68: Continue/retry is the strongest "halted, more available"
+      // v1.2.69: Continue/retry is the strongest "halted, more available"
       // signal — check it BEFORE the empty-text failure path. A generation
       // that streamed only a THINK fragment leaves t.emitted.length === 0
       // when the stream closes; the old order fail-fast'd to dom-error
@@ -2396,11 +2396,11 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    rateLimitRetries: 0, // v1.2.68: rate-limit recovery attempts this turn
-    rateLimitGiveUpTimer: null, // v1.2.68: fires finishTurn(rate_limited) at window expiry
-    rateLimitFirstAt: 0, // v1.2.68: wall-clock start of the recovery window
-    rateLimitRecoveryActive: false, // v1.2.68: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.68: for re-submit
+    rateLimitRetries: 0, // v1.2.69: rate-limit recovery attempts this turn
+    rateLimitGiveUpTimer: null, // v1.2.69: fires finishTurn(rate_limited) at window expiry
+    rateLimitFirstAt: 0, // v1.2.69: wall-clock start of the recovery window
+    rateLimitRecoveryActive: false, // v1.2.69: debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.69: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
