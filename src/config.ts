@@ -38,6 +38,13 @@ export interface Config {
   maxTabs?: number;
   /** E3: worker closes ready+unbound tabs idle beyond this (ms). 0 = never. */
   tabIdleCloseMs?: number;
+  /**
+   * H4: allowed Origin values for the worker WebSocket upgrade. When unset,
+   * the server accepts chrome-extension:// origins and any client that omits
+   * Origin (non-browser); web-page origins are always rejected. Set an
+   * explicit list to pin extension ids (missing Origin is then rejected).
+   */
+  workerOrigins?: string[];
 }
 
 export const DEFAULTS: Config = {
@@ -159,6 +166,16 @@ export function parseServeArgs(argv: string[]): Config {
       case "--db":
         cfg.dbPath = val();
         break;
+      case "--worker-origin": {
+        // H4: comma-separated allow-list. Replaces the default
+        // chrome-extension:// gate.
+        const raw = val();
+        cfg.workerOrigins = raw.split(",").map((s) => s.trim()).filter(Boolean);
+        if (cfg.workerOrigins.length === 0) {
+          throw new Error("--worker-origin needs at least one origin");
+        }
+        break;
+      }
       case "--turn-timeout-ms":
         cfg.turnTimeoutMs = Number(val());
         if (!Number.isInteger(cfg.turnTimeoutMs) || cfg.turnTimeoutMs <= 0) {
@@ -247,5 +264,6 @@ export function usage(): string {
     "  --reset-on-seed=<mode>      SEED-into-dirty-tab policy auto|always|never (default auto)",
     "  --max-tabs=<n>              cap on worker-managed tabs, 0 = unbounded (default 4)",
     "  --tab-idle-close=<dur>      close ready+unbound tabs idle beyond dur, 0 = never (default 15m)",
+    "  --worker-origin=<origin>    comma-separated allowed Origin values (default: chrome-extension://*)",
   ].join("\n");
 }

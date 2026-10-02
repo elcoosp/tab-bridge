@@ -4,7 +4,7 @@
  * fragmentation is reassembled before "message" is emitted.
  */
 import { EventEmitter } from "node:events";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
@@ -237,6 +237,23 @@ export interface WsServerOptions {
   path?: string;
   /** Reject upgrade when set and the query param `token` does not match. */
   token?: string | null;
+  /**
+   * H4: browser-origin gate.
+   *
+   * A web page can open a cross-origin WebSocket to 127.0.0.1 and, when no
+   * API key is configured, seize the single worker slot with a valid HELLO
+   * — corrupting in-flight turns or blocking the real extension.
+   *
+   * Policy:
+   *   - No Origin header → ACCEPT. Non-browser clients (Node scripts, tests,
+   *     CLI tooling) do not send Origin and are not a CSWSH vector.
+   *   - Origin matches `chrome-extension://...` → ACCEPT (default policy).
+   *   - Origin `http(s)://...`, `file://`, or anything else → REJECT.
+   *   - When `allowedOrigins` is set, accept only listed values; a missing
+   *     Origin is REJECTED under an explicit allow-list (the operator
+   *     opted into strict behavior).
+   */
+  allowedOrigins?: string[];
   onConnection(conn: WsConnection): void;
 }
 
@@ -261,9 +278,32 @@ export class WsServer {
       socket.destroy();
       return;
     }
+    // H4: Origin gate. Non-browser clients (no Origin) are accepted; browser
+    // pages are rejected unless their Origin is chrome-extension:// (default)
+    // or is present in an explicit allow-list.
+    const origin = req.headers.origin;
+    const allowed = this.opts.allowedOrigins;
+    let originOk: boolean;
+    if (allowed) {
+      originOk = typeof origin === "string" && allowed.includes(origin);
+    } else if (typeof origin !== "string") {
+      // No Origin header — non-browser client. Not a CSWSH vector.
+      originOk = true;
+    } else {
+      originOk = /^chrome-extension:\/\//i.test(origin);
+    }
+    if (!originOk) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     if (this.opts.token) {
       const q = new URLSearchParams(url.split("?")[1] ?? "");
-      if (q.get("token") !== this.opts.token) {
+      const got = Buffer.from(q.get("token") ?? "", "utf8");
+      const want = Buffer.from(this.opts.token, "utf8");
+      // H4: constant-time compare; guard length mismatch before
+      // timingSafeEqual (which throws on different lengths).
+      if (got.length !== want.length || !timingSafeEqual(got, want)) {
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;

@@ -113,6 +113,10 @@ export class TabBridge {
     this.wsServer = new WsServer({
       path: "/worker",
       token: config.apiKey,
+      // H4: pass through the allow-list when configured; the default policy
+      // (accept chrome-extension:// and Origin-less clients, reject web-page
+      // origins) applies otherwise.
+      ...(config.workerOrigins !== undefined ? { allowedOrigins: config.workerOrigins } : {}),
       onConnection: (conn) => this.pool.attach(conn),
     });
   }
