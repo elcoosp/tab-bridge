@@ -29,6 +29,9 @@ export interface ScriptedReply {
   failWith?: "submit-failed" | "timeout" | "dom-error" | "port-lost";
   /** Raw error string thrown verbatim (e.g. "turn-error:rate_limited:..."). */
   failText?: string;
+  /** usageMeta bag surfaced on TurnResult (e.g. `{ chat_url }` for the
+   * session↔chat-URL mapping path). */
+  usageMeta?: Record<string, unknown>;
 }
 
 export class ScriptedAdapter implements ChatProviderAdapter {
@@ -113,6 +116,7 @@ export class ScriptedAdapter implements ChatProviderAdapter {
     return {
       text,
       stopReason: reply.stopReason ?? "stop",
+      ...(reply.usageMeta !== undefined ? { usageMeta: reply.usageMeta } : {}),
     };
   }
 
