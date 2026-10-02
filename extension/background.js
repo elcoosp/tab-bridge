@@ -52,6 +52,12 @@ const START_URL = "https://chat.deepseek.com/";
  * cools down it is not allocated to any session.
  */
 const RATE_LIMIT_COOLDOWN_MS = 20 * 60 * 1000;
+/**
+ * Provider overload ("Server busy, please try again later.") cooldown.
+ * Distinct from the 20-minute send-frequency window: overload clears
+ * faster, so cooling tabs are held 10 minutes.
+ */
+const SERVER_BUSY_COOLDOWN_MS = 10 * 60 * 1000;
 
 let ws = null;
 let wsUrl = DEFAULT_WS_URL;
@@ -503,9 +509,15 @@ async function allocateTab(sessionId, opts = {}) {
       return tabId;
   }
   // 2) every free tab is cooling down -> tell the bridge it is a rate-limit,
-  //    not a generic capacity miss (maps to 429 + Retry-After ~20 min)
+  //    not a generic capacity miss (maps to 429 + Retry-After ~20 min).
+  //    server_busy cooldowns count here too (bridge maps them to 503).
   const freeTabs = [...tabState.values()].filter((st) => st.state === "ready" && !st.sessionId);
-  if (freeTabs.length > 0 && freeTabs.every((st) => st.health === "rate_limited")) {
+  if (
+    freeTabs.length > 0 &&
+    freeTabs.every((st) => st.health === "rate_limited" || st.health === "server_busy")
+  ) {
+    const busyOnly = freeTabs.every((st) => st.health === "server_busy");
+    if (busyOnly) return "server-busy-cooldown";
     return "rate-limited-cooldown";
   }
   // 3) create one if allowed
@@ -599,7 +611,7 @@ function tabInCooldown(tabId, st) {
     // cooldown expired: restore the tab to the allocatable pool
     delete st.rateLimitedUntil;
     st.health = "ok";
-    send({ t: "HEALTH", tabId, state: "ok", detail: "rate-limit cooldown expired" });
+    send({ t: "HEALTH", tabId, state: "ok", detail: "cooldown expired" });
     return false;
   }
   return true;
@@ -663,6 +675,16 @@ async function handleBind(m) {
       t: "BIND_FAILED",
       sessionId: m.sessionId,
       code: "rate-limited-cooldown",
+      retryAfterSec: Math.max(30, maxCooldownRemainingSecs()),
+    });
+    return;
+  }
+  if (tabId === "server-busy-cooldown") {
+    blog("BIND", m.sessionId, "-> server-busy-cooldown");
+    send({
+      t: "BIND_FAILED",
+      sessionId: m.sessionId,
+      code: "server-busy-cooldown",
       retryAfterSec: Math.max(30, maxCooldownRemainingSecs()),
     });
     return;
@@ -1166,6 +1188,9 @@ function handleInjectorMessage(tabId, port, msg) {
         if (msg.code === "rate_limited") {
           applyRateLimitCooldown(tabId);
         }
+        if (msg.code === "server_busy") {
+          applyServerBusyCooldown(tabId);
+        }
         // Even a failed turn may have placed content; mark dirty unless the
         // injector confirms no user bubble rendered (tab untouched).
         const turnSt = tabState.get(tabId);
@@ -1182,6 +1207,7 @@ function handleInjectorMessage(tabId, port, msg) {
           code: msg.code || "dom-error",
           ...(msg.detail ? { detail: msg.detail } : {}),
           ...(msg.code === "rate_limited" ? { retryAfterSec: 1200 } : {}),
+          ...(msg.code === "server_busy" ? { retryAfterSec: 600 } : {}),
           // Report whether a user bubble actually rendered. A submit that
           // never placed one leaves the tab state untouched and must NOT
           // poison the session with a pendingReset + null tabHash (RCA
@@ -1230,6 +1256,18 @@ function applyRateLimitCooldown(tabId) {
   st.rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
   st.health = "rate_limited";
   send({ t: "HEALTH", tabId, state: "rate_limited", detail: "messages-too-frequent cooldown ~20min" });
+}
+
+/** Put a tab into the provider overload cooldown pool (~10 min).
+ * Distinct health from rate_limited so the bridge maps it to 503
+ * server_busy instead of 429. Reuses rateLimitedUntil so allocation
+ * blocking (tabInCooldown) applies unchanged. */
+function applyServerBusyCooldown(tabId) {
+  const st = tabState.get(tabId);
+  if (!st) return;
+  st.rateLimitedUntil = Date.now() + SERVER_BUSY_COOLDOWN_MS;
+  st.health = "server_busy";
+  send({ t: "HEALTH", tabId, state: "server_busy", detail: "server-busy cooldown ~10min" });
 }
 
 /**
