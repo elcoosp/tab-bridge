@@ -1889,6 +1889,23 @@ function attemptServerBusyRecovery(t, why, detail) {
   return true;
 }
 
+/**
+ * Provider-assigned chat URL for this tab. DeepSeek navigates `/` to
+ * `/a/chat/s/<uuid>` after the first message is accepted; capturing it lets
+ * the bridge re-navigate an evicted session's new tab straight back to the
+ * provider-side conversation instead of a full RESET_RESEED. Returns null
+ * on the home page or any unexpected shape.
+ */
+function currentChatUrl() {
+  try {
+    const href = location.href;
+    if (/^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[0-9a-f-]{8,}/i.test(href)) return href;
+  } catch {
+    /* location unreadable — no URL */
+  }
+  return null;
+}
+
 function finishTurn(ok, code, detail, aborted, extra) {
   const t = turn;
   if (!t || t.finished) return;
@@ -1923,9 +1940,11 @@ function finishTurn(ok, code, detail, aborted, extra) {
   }
   if (ok) {
     dbg("turn done:", t.reqId, `chars=${t.emitted.length}`, `mode=${t.mode}`);
+    const chatUrl = currentChatUrl();
     report("TURN_DONE", {
       reqId: t.reqId,
       ...(typeof t.usageTokens === "number" ? { usageTokens: t.usageTokens } : {}),
+      ...(chatUrl ? { chatUrl } : {}),
     });
   } else if (aborted) {
     dbg("turn aborted:", t.reqId);
@@ -1937,6 +1956,7 @@ function finishTurn(ok, code, detail, aborted, extra) {
       code: code || "dom-error",
       ...(detail ? { detail } : {}),
       ...(extra || {}),
+      ...(currentChatUrl() ? { chatUrl: currentChatUrl() } : {}),
     });
   }
 }
