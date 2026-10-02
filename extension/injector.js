@@ -92,19 +92,19 @@ const CONCURRENCY_RE =
 const CONTINUE_RE = /^\s*(continue|continue\s+generating|resume|继续|继续生成|继续回答|继续输出)\s*$/i;
 /** Provider-side halt: clicking Continue resumes the same answer. */
 const MAX_CONTINUES = 5;
-/** v1.2.69: rate-limit recovery. The provider's "Messages too frequent"
+/** v1.2.70: rate-limit recovery. The provider's "Messages too frequent"
  * flag is often transient — a burst hits the account window for seconds,
  * then clears. Three retries with exponential backoff absorb a transient
  * burst in-place; only a persistent limit falls through to the worker's
  * 20-minute cooldown. Per-step cap 30s. */
-/** v1.2.69: rate-limit recovery. DeepSeek's "Messages too frequent" is
+/** v1.2.70: rate-limit recovery. DeepSeek's "Messages too frequent" is
  * often transient — a burst hits the account window for seconds, then
  * clears. Retry with exponential backoff (2s, 4s, 8s, …) inside a
  * 5-minute wall-clock window; only a persistent limit crosses that window
  * and falls through to the worker's 20-minute cooldown. Per-step backoff
  * is capped at the window itself so the last retry always lands inside. */
 /**
- * v1.2.69 — recovery window 90 s (was 240 s). Two hard bounds force this:
+ * v1.2.70 — recovery window 90 s (was 240 s). Two hard bounds force this:
  *   1. The harness HTTP client gives up at ~120 s (kod "Provider timeout
  *      after 120000ms"). Anything past that and rate_limited never reaches
  *      the caller even though the bridge eventually declares it.
@@ -116,11 +116,26 @@ const MAX_CONTINUES = 5;
  */
 const RATE_LIMIT_RETRY_WINDOW_MS = 90_000;
 const RATE_LIMIT_BACKOFF_INITIAL_MS = 2_000;
-/** v1.2.69 — per-step backoff capped at 32 s so a single backoff cannot
+/** v1.2.70 — per-step backoff capped at 32 s so a single backoff cannot
  * consume more than roughly a third of the 90 s window. The previous 240 s
  * cap let backoff #7 alone eat 108 s (2026-10-01 log), landing an attempt
  * exactly on the turn deadline. */
 const RATE_LIMIT_BACKOFF_MAX_MS = 32_000;
+
+/**
+ * Provider overload: "Server busy, please try again later." (and neighbours).
+ * Disjoint from RATE_LIMIT_RE (send-frequency) and CONCURRENCY_RE (parallel
+ * generation cap) by construction — "busy" never appears in either. Own
+ * error code `server_busy` (never `rate_limited`), own exp-backoff recovery
+ * window below, and a 10-minute worker cooldown on give-up (vs 20 min for
+ * rate limits).
+ */
+const SERVER_BUSY_RE =
+  /(server\s*busy|please\s*try\s*again\s*later|server\s*(is\s*)?(busy|overloaded|overload|temporarily\s*unavailable)|service\s*(busy|unavailable|overloaded)|capacity\s*exceeded|overloaded\s*try\s*again)/i;
+/** In-tab retry window: same 90 s harness-timeout rationale as rate limits. */
+const SERVER_BUSY_RETRY_WINDOW_MS = 90_000;
+const SERVER_BUSY_BACKOFF_INITIAL_MS = 2_000;
+const SERVER_BUSY_BACKOFF_MAX_MS = 32_000;
 
 // ---------------------------------------------------------------------------
 // Debug instrumentation.
@@ -694,11 +709,39 @@ function serverDownVisible() {
       // Some builds append a short suffix; keep the prefix match tight
       // (must be within 4 chars of the bare sentence).
       if (t.startsWith(needle) && t.length <= needle.length + 4) return true;
+      // Overload banner ("Server busy, please try again later."): same
+      // leaf-only scan, regex-gated so locale/build variants match.
+      if (t.length < 120 && SERVER_BUSY_RE.test(t)) return true;
     } catch {
       continue;
     }
   }
   return false;
+}
+
+/** Leaf-only overload-banner scan returning the matched text (or null).
+ * serverDownVisible() answers boolean for the outage banner; this covers
+ * the distinct "Server busy" family so callers can route it to the
+ * server_busy recovery path instead of a generic dom-error. */
+function serverBusyVisible() {
+  if (findContinueButton()) return null;
+  let els;
+  try {
+    els = document.querySelectorAll("span, div, p");
+  } catch {
+    return null;
+  }
+  for (const el of els) {
+    try {
+      if (el.children.length > 2) continue;
+      const t = (el.textContent || "").trim();
+      if (!t || t.length > 200) continue;
+      if (SERVER_BUSY_RE.test(t)) return t.slice(0, 200);
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 function sleep(ms) {
@@ -862,6 +905,28 @@ function submitConcurrencyHit(preCount) {
   for (let i = Math.max(0, preCount); i < nodes.length; i++) {
     const t = (nodes[i].textContent || "").trim();
     if (t && t.length < 400 && CONCURRENCY_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/** Provider-overload text in transient notice surfaces (mirrors
+ * noticeRateLimitHit, disjoint pattern: SERVER_BUSY_RE). */
+function noticeServerBusyHit() {
+  for (const el of findAll(SELECTORS.noticeRegions)) {
+    const t = (el.textContent || "").trim();
+    if (t && t.length < 300 && SERVER_BUSY_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/** Broad submit-block scan for the overload notice — notice surfaces AND
+ * chat nodes that appeared after `preCount`. */
+function submitServerBusyHit(preCount) {
+  if (noticeServerBusyHit()) return true;
+  const nodes = conversationNodes();
+  for (let i = Math.max(0, preCount); i < nodes.length; i++) {
+    const t = (nodes[i].textContent || "").trim();
+    if (t && t.length < 400 && SERVER_BUSY_RE.test(t)) return true;
   }
   return false;
 }
@@ -1321,6 +1386,7 @@ async function verifySubmitted(composer, baseCount, baseDsCount, stopBefore, had
   for (; ;) {
     await sleep(250);
     if (submitRateLimitHit(baseCount)) return "rate-limited";
+    if (submitServerBusyHit(baseCount)) return "server-busy";
     if (dsMessageCount() > baseDsCount) return true;
     if (!stopBefore && findFirst(SELECTORS.stopButton)) return true;
     if (hadText && readComposer(composer).length === 0) return true;
@@ -1414,6 +1480,14 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   }
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
+    if (submitServerBusyHit(preCount)) {
+      return {
+        ok: false,
+        code: "server_busy",
+        detail: "provider notice: server busy, please try again later (submit rejected)",
+        userBubbleRendered: conversationNodes().length > preCount,
+      };
+    }
     if (submitRateLimitHit(preCount)) {
       return {
         ok: false,
@@ -1444,7 +1518,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "concurrency_blocked",
         detail: `${ready.detail || "provider notice: another message is generating"} (mode=${mode})`,
-        // v1.2.69: submit rejected before any generation started — no user
+        // v1.2.70: submit rejected before any generation started — no user
         // bubble was rendered. MUST be explicit so the engine does NOT mark
         // the row failed (which sets pendingReset and poisons the session
         // into an infinite RESET_RESEED loop, one that on this DeepSeek
@@ -1457,9 +1531,17 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         ok: false,
         code: "rate_limited",
         detail: `${ready.detail || "provider notice: messages too frequent"} (mode=${mode})`,
-        // v1.2.69: submit-time rate limit — nothing submitted, no bubble.
+        // v1.2.70: submit-time rate limit — nothing submitted, no bubble.
         // Explicit false keeps the engine from calling markFailed and
         // setting pendingReset (the poisoned-session loop).
+        userBubbleRendered: conversationNodes().length > preCount,
+      };
+    }
+    if (submitServerBusyHit(preCount)) {
+      return {
+        ok: false,
+        code: "server_busy",
+        detail: "provider notice: server busy, please try again later (submit rejected)",
         userBubbleRendered: conversationNodes().length > preCount,
       };
     }
@@ -1483,6 +1565,12 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     code: "rate_limited",
     detail: "provider notice: messages too frequent (submit rejected)",
   });
+  const serverBusyResult = () => ({
+    ok: false,
+    code: "server_busy",
+    detail: "provider notice: server busy, please try again later (submit rejected)",
+    userBubbleRendered: conversationNodes().length > preCount,
+  });
   const concurrencyBlockedResult = () => ({
     ok: false,
     code: "concurrency_blocked",
@@ -1493,12 +1581,14 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   // LIVE class list (BEM "--disabled" included).
   const btnA = findSendButton(composer);
   const a = clickSend(btnA) ? await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs) : false;
+  if (a === "server-busy" || (a !== true && submitServerBusyHit(preCount))) return serverBusyResult();
   if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (a !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (a === true) return { ok: true, mode };
   // Method B: Enter on the composer.
   pressEnter(composer);
   const b = await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs);
+  if (b === "server-busy" || (b !== true && submitServerBusyHit(preCount))) return serverBusyResult();
   if (b === "rate-limited" || (b !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (b !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (b === true) return { ok: true, mode };
@@ -1506,6 +1596,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   // attachment finished processing) and click it if it is now enabled.
   const btn2 = findSendButton(composer);
   const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs) : false;
+  if (c === "server-busy" || (c !== true && submitServerBusyHit(preCount))) return serverBusyResult();
   if (c === "rate-limited" || (c !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (c !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
   if (c === true) return { ok: true, mode };
@@ -1573,7 +1664,7 @@ function emitDelta(t, text) {
   report("FRAGMENT", { reqId: t.reqId, seq: ++seq, text });
 }
 /**
- * v1.2.69 — rate-limit recovery with a 5-minute exponential-backoff window.
+ * v1.2.70 — rate-limit recovery with a 5-minute exponential-backoff window.
  *
  * The provider's "Messages too frequent" flag is often transient; the
  * worker's 20-minute cooldown is correct for a persistent limit but a
@@ -1599,7 +1690,7 @@ function attemptRateLimitRecovery(t, why, detail) {
   if (t.rateLimitRecoveryActive) return true; // a retry is already in flight
 
   const now = Date.now();
-  // v1.2.69 — rate-limit recovery IS activity. Every retry attempt, every
+  // v1.2.70 — rate-limit recovery IS activity. Every retry attempt, every
   // empty-stream response, every click on the on-screen retry affordance is
   // evidence the injector is actively working on this turn, not idle. Bump
   // the SSE idle clock so the watchdog's 120s SSE-idle timeout does not fire
@@ -1609,7 +1700,7 @@ function attemptRateLimitRecovery(t, why, detail) {
   t.lastSseAt = now;
   if (!t.rateLimitFirstAt) {
     t.rateLimitFirstAt = now;
-    // v1.2.69 — proactive give-up. The old design only noticed the window
+    // v1.2.70 — proactive give-up. The old design only noticed the window
     // had expired when a *new* attempt tried to schedule; the last attempt
     // fired right on the turn deadline and the deadline always won. This
     // timer fires finishTurn(rate_limited) at window expiry, so the caller
@@ -1680,6 +1771,9 @@ function attemptRateLimitRecovery(t, why, detail) {
       if (!t || t.finished) return;
       if (!r.ok) {
         dbg("rate-limit recovery: re-submit failed", r.code || "?", r.detail || "");
+        if (r.code === "server_busy" || submitServerBusyHit(t.submitCount)) {
+          if (attemptServerBusyRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
         if (r.code === "rate_limited" || submitRateLimitHit(t.submitCount)) {
           if (attemptRateLimitRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
         }
@@ -1687,6 +1781,107 @@ function attemptRateLimitRecovery(t, why, detail) {
         return;
       }
       dbg("rate-limit recovery: re-submitted, awaiting stream");
+      t.unverified = r.unverified === true;
+      scheduleNoStreamFallback(t, composer, text, true);
+    });
+  }, backoff);
+  return true;
+}
+
+/**
+ * Server-busy recovery: same exponential-backoff shape as rate limits
+ * (2s, 4s, 8s, … capped at 32s inside a 90s wall-clock window) but a
+ * distinct `server_busy` terminal code — never `rate_limited` — so the
+ * worker applies the 10-minute overload cooldown instead of the 20-minute
+ * send-frequency cooldown. Own timers/state so the two windows never
+ * interfere when both signals appear in one turn.
+ *
+ * Returns true when a retry is scheduled (caller must NOT finishTurn),
+ * false when the window elapsed (caller must finishTurn "server_busy").
+ */
+function attemptServerBusyRecovery(t, why, detail) {
+  if (!t || t.finished) return false;
+  if (t.serverBusyRecoveryActive) return true; // retry already in flight
+  // A rate-limit recovery in flight owns the turn; don't double-schedule.
+  if (t.rateLimitRecoveryActive) return true;
+
+  const now = Date.now();
+  t.lastSseAt = now;
+  if (!t.serverBusyFirstAt) {
+    t.serverBusyFirstAt = now;
+    t.serverBusyGiveUpTimer = setTimeout(() => {
+      if (!t || t.finished) return;
+      dbg("server-busy recovery window elapsed — declaring server_busy");
+      finishTurn(
+        false,
+        "server_busy",
+        `provider overload persisted past ${Math.round(SERVER_BUSY_RETRY_WINDOW_MS / 1000)}s`,
+      );
+    }, SERVER_BUSY_RETRY_WINDOW_MS);
+  }
+  const elapsed = now - t.serverBusyFirstAt;
+  if (elapsed >= SERVER_BUSY_RETRY_WINDOW_MS) {
+    dbg("server-busy recovery window elapsed",
+        `${Math.round(elapsed / 1000)}s / ${Math.round(SERVER_BUSY_RETRY_WINDOW_MS / 1000)}s`,
+        `(${why})`);
+    return false;
+  }
+
+  t.serverBusyRetries = (t.serverBusyRetries | 0) + 1;
+  const exp = SERVER_BUSY_BACKOFF_INITIAL_MS * Math.pow(2, t.serverBusyRetries - 1);
+  const remaining = SERVER_BUSY_RETRY_WINDOW_MS - elapsed;
+  const backoff = Math.max(0, Math.min(exp, SERVER_BUSY_BACKOFF_MAX_MS, remaining));
+  if (backoff <= 0) {
+    dbg("server-busy recovery window exhausted", `(${why})`);
+    return false;
+  }
+
+  dbg("server-busy recovery scheduled",
+      `#${t.serverBusyRetries}`,
+      `in ${backoff}ms`,
+      `(elapsed ${Math.round(elapsed / 1000)}s / ${Math.round(SERVER_BUSY_RETRY_WINDOW_MS / 1000)}s)`,
+      `(${why})`);
+
+  t.serverBusyRecoveryActive = true;
+  const reqId = t.reqId;
+  const timeoutMs = t.opts.timeoutMs || 240000;
+  setTimeout(() => {
+    if (!t || t.finished) return;
+    t.serverBusyRecoveryActive = false;
+    if (findContinueButton()) {
+      dbg("server-busy recovery: clicking on-screen retry affordance");
+      maybeContinue(t, "server-busy-retry");
+      return;
+    }
+    const composer = findFirst(SELECTORS.composer);
+    const text = typeof t.promptText === "string" ? t.promptText : "";
+    if (!composer || !text) {
+      dbg("server-busy recovery: composer or prompt missing, giving up");
+      finishTurn(false, "server_busy", detail || why);
+      return;
+    }
+    dbg("server-busy recovery: re-submitting prompt");
+    try { setComposerValue(composer, ""); } catch { /* best effort */ }
+    t.submitCount = conversationNodes().length;
+    t.dsMessageBase = dsMessageCount();
+    t.awaitContinue = 0;
+    t.mode = "sse-await";
+    hookArmSync(reqId, timeoutMs);
+    hookPost({ type: "arm", turnId: reqId, timeoutMs });
+    void submitPrompt(composer, text, t.opts.submitWaitMs || SUBMIT_READY_TIMEOUT_MS, true).then((r) => {
+      if (!t || t.finished) return;
+      if (!r.ok) {
+        dbg("server-busy recovery: re-submit failed", r.code || "?", r.detail || "");
+        if (r.code === "server_busy" || submitServerBusyHit(t.submitCount)) {
+          if (attemptServerBusyRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
+        if (r.code === "rate_limited" || submitRateLimitHit(t.submitCount)) {
+          if (attemptRateLimitRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
+        finishTurn(false, r.code || "server_busy", r.detail || "overloaded re-submit failed");
+        return;
+      }
+      dbg("server-busy recovery: re-submitted, awaiting stream");
       t.unverified = r.unverified === true;
       scheduleNoStreamFallback(t, composer, text, true);
     });
@@ -1709,6 +1904,7 @@ function finishTurn(ok, code, detail, aborted, extra) {
   t.finished = true;
   if (t.fallbackTimer) clearTimeout(t.fallbackTimer);
   if (t.rateLimitGiveUpTimer) clearTimeout(t.rateLimitGiveUpTimer);
+  if (t.serverBusyGiveUpTimer) clearTimeout(t.serverBusyGiveUpTimer);
   if (t.watchdog) clearInterval(t.watchdog);
   hookPost({ type: "disarm" });
   turn = null;
@@ -1895,7 +2091,7 @@ function debuggerClickViaSW(x, y, timeoutMs) {
 }
 
 function maybeContinue(t, why) {
-  // v1.2.69 — the MAX_CONTINUES ceiling bounds the SSE-halt path (deepseek
+  // v1.2.70 — the MAX_CONTINUES ceiling bounds the SSE-halt path (deepseek
   // halt mid-answer with a Continue button). It must NOT bound the rate-limit
   // recovery path: that mechanism has its own explicit budget
   // (RATE_LIMIT_RETRY_WINDOW_MS, 4 min) and its own give-up semantics. The
@@ -1929,7 +2125,7 @@ function maybeContinue(t, why) {
   let hitStr = "(unknown)";
   let cx = 0;
   let cy = 0;
-  // v1.2.69 — ensure the button is on-screen before we compute the click
+  // v1.2.70 — ensure the button is on-screen before we compute the click
   // target. When the SSE stream completes and DeepSeek paints the Continue
   // button, the conversation may still be auto-scrolling; the button can
   // sit BELOW the viewport. The debugger click dispatches viewport-space
@@ -2093,6 +2289,10 @@ window.addEventListener("message", (ev) => {
         if (!attemptRateLimitRecovery(t, "sse-hint", d.content || "provider rate limit (stream hint)")) {
           finishTurn(false, "rate_limited", d.content || "provider rate limit (stream hint)");
         }
+      } else if (SERVER_BUSY_RE.test(d.content || "") || SERVER_BUSY_RE.test(d.finishReason || "")) {
+        if (!attemptServerBusyRecovery(t, "sse-hint", d.content || "provider: server busy (stream hint)")) {
+          finishTurn(false, "server_busy", d.content || "provider: server busy (stream hint)");
+        }
       } else if (CONCURRENCY_RE.test(d.finishReason || "") || CONCURRENCY_RE.test(d.content || "")) {
         finishTurn(false, "concurrency_blocked", d.content || "provider: another message is being generated");
       }
@@ -2101,7 +2301,7 @@ window.addEventListener("message", (ev) => {
     case "complete": {
       t.lastSseAt = Date.now();
       if (t.mode === "dom") break;
-      // v1.2.69: capture the provider-reported token delta for this turn.
+      // v1.2.70: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
       // emit a real total_tokens instead of the chars/4 estimate.
@@ -2127,13 +2327,23 @@ window.addEventListener("message", (ev) => {
       }
       if (
         d.hintError &&
+        (SERVER_BUSY_RE.test(d.hintError.finishReason || "") ||
+          SERVER_BUSY_RE.test(d.hintError.content || ""))
+      ) {
+        if (!attemptServerBusyRecovery(t, "sse-complete-hint", d.hintError.content || "provider: server busy")) {
+          finishTurn(false, "server_busy", d.hintError.content || "provider: server busy");
+        }
+        break;
+      }
+      if (
+        d.hintError &&
         (CONCURRENCY_RE.test(d.hintError.finishReason || "") ||
           CONCURRENCY_RE.test(d.hintError.content || ""))
       ) {
         finishTurn(false, "concurrency_blocked", d.hintError.content || "provider: another message is being generated");
         break;
       }
-      // v1.2.69: Continue/retry is the strongest "halted, more available"
+      // v1.2.70: Continue/retry is the strongest "halted, more available"
       // signal — check it BEFORE the empty-text failure path. A generation
       // that streamed only a THINK fragment leaves t.emitted.length === 0
       // when the stream closes; the old order fail-fast'd to dom-error
@@ -2142,6 +2352,13 @@ window.addEventListener("message", (ev) => {
       if (maybeContinue(t, "sse-complete")) break;
       // Provider halted mid-answer with more available: resume in this turn.
       if (!finalText && t.emitted.length === 0) {
+        const busyText = serverBusyVisible();
+        if (busyText) {
+          if (!attemptServerBusyRecovery(t, "banner", `provider notice: ${busyText}`)) {
+            finishTurn(false, "server_busy", `provider notice: ${busyText}`);
+          }
+          break;
+        }
         if (serverDownVisible()) {
           finishTurn(false, "dom-error", "provider: server temporarily unavailable");
           break;
@@ -2170,6 +2387,10 @@ window.addEventListener("message", (ev) => {
       if (s === 429) {
         if (!attemptRateLimitRecovery(t, "http-429", detail)) {
           finishTurn(false, "rate_limited", detail);
+        }
+      } else if (s === 503 || SERVER_BUSY_RE.test(d.snippet || "")) {
+        if (!attemptServerBusyRecovery(t, `http-${s}`, detail)) {
+          finishTurn(false, "server_busy", detail);
         }
       } else finishTurn(false, "dom-error", detail);
       break;
@@ -2214,6 +2435,13 @@ function startWatchdog(t) {
     if (hit) {
       if (!attemptRateLimitRecovery(t, "toast", "provider notice: messages too frequent")) {
         finishTurn(false, "rate_limited", "provider notice: messages too frequent");
+      }
+      return;
+    }
+    const busyHit = submitServerBusyHit(t.submitCount);
+    if (busyHit) {
+      if (!attemptServerBusyRecovery(t, "toast", "provider notice: server busy, please try again later")) {
+        finishTurn(false, "server_busy", "provider notice: server busy, please try again later");
       }
       return;
     }
@@ -2308,6 +2536,13 @@ async function onNoStream(t, composer, originalText, isRetry) {
   // re-submit cannot help until the provider recovers. Report the specific
   // error so the bridge maps it to a retryable 502 rather than treating the
   // tool-results attachment as a successful submit.
+  const busyText = serverBusyVisible();
+  if (busyText) {
+    if (!attemptServerBusyRecovery(t, "no-stream", `provider notice: ${busyText}`)) {
+      finishTurn(false, "server_busy", `provider notice: ${busyText}`);
+    }
+    return;
+  }
   if (serverDownVisible()) {
     finishTurn(false, "dom-error", "provider: server temporarily unavailable");
     return;
@@ -2396,11 +2631,15 @@ async function handleTurn(msg) {
     continues: 0, // provider Continue clicks this turn (bounded)
     awaitContinue: 0, // timestamp of the last Continue click awaiting stream
     continueGraceUntil: 0, // set once Continue retries are exhausted; holds the turn open
-    rateLimitRetries: 0, // v1.2.69: rate-limit recovery attempts this turn
-    rateLimitGiveUpTimer: null, // v1.2.69: fires finishTurn(rate_limited) at window expiry
-    rateLimitFirstAt: 0, // v1.2.69: wall-clock start of the recovery window
-    rateLimitRecoveryActive: false, // v1.2.69: debounce while a retry is scheduled
-    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.69: for re-submit
+    rateLimitRetries: 0, // v1.2.70: rate-limit recovery attempts this turn
+    rateLimitGiveUpTimer: null, // v1.2.70: fires finishTurn(rate_limited) at window expiry
+    rateLimitFirstAt: 0, // v1.2.70: wall-clock start of the recovery window
+    rateLimitRecoveryActive: false, // v1.2.70: debounce while a retry is scheduled
+    serverBusyRetries: 0, // server-busy recovery attempts this turn
+    serverBusyGiveUpTimer: null, // fires finishTurn(server_busy) at window expiry
+    serverBusyFirstAt: 0, // wall-clock start of the server-busy window
+    serverBusyRecoveryActive: false, // debounce while a retry is scheduled
+    promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.70: for re-submit
   };
   turn = t;
   dbg("TURN", msg.reqId, `chars=${(msg.text || "").length}`);
