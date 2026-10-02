@@ -667,6 +667,49 @@ function waitForReady(tabId, timeoutMs) {
 // intent handlers
 // ---------------------------------------------------------------------------
 
+/** Provider-assigned chat URL guard (mirrors the injector's currentChatUrl).
+ * Only these URLs are ever navigated to on relaunch — never arbitrary input. */
+function isChatUrl(u) {
+  return typeof u === "string" && /^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[0-9a-f-]{8,}/i.test(u);
+}
+
+/**
+ * Navigate a bound tab to a previously captured session chat URL so an
+ * evicted session resumes its provider-side conversation instead of a full
+ * reseed. Navigation kills the injector port; waits for document load +
+ * injector reconnect (same pattern as tab creation in allocateTab).
+ * Returns true when the tab is on (or reached) the URL, false otherwise —
+ * the caller then falls back to the legacy dirty-tab + reseed path.
+ */
+async function navigateTabToChatUrl(tabId, chatUrl) {
+  let cur = null;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    cur = tab && typeof tab.url === "string" ? tab.url : null;
+  } catch {
+    return false;
+  }
+  if (cur === chatUrl) return true;
+  blog("BIND", "navigating tab", tabId, "to session chat URL");
+  try {
+    await chrome.tabs.update(tabId, { url: chatUrl });
+  } catch (e) {
+    blog("BIND", "navigate to chat URL failed for tab", tabId, String((e && e.message) || e));
+    return false;
+  }
+  const loaded = await waitForLoaded(tabId, 30000);
+  if (!loaded) {
+    blog("BIND", "tab", tabId, "document never finished loading chat URL within 30s");
+    return false;
+  }
+  const ok = await waitForReady(tabId, 20000);
+  if (!ok) {
+    blog("BIND", "tab", tabId, "injector never reconnected on chat URL within 20s");
+    return false;
+  }
+  return true;
+}
+
 async function handleBind(m) {
   const tabId = await allocateTab(m.sessionId, { noCreate: m.noCreate === true });
   if (tabId === "rate-limited-cooldown") {
@@ -699,6 +742,15 @@ async function handleBind(m) {
   // Unknown dirtiness (re-registered tab with no record) is treated as dirty
   // by the bridge; default true when the flag was never set.
   if (st.dirty === undefined) st.dirty = true;
+  // Session relaunch: when the bridge remembers this session's provider chat
+  // URL (captured from the injector after a previous turn), navigate the
+  // freshly bound tab straight there. A tab showing the session's own
+  // conversation is clean — no reset needed before continuing.
+  if (typeof m.chatUrl === "string" && isChatUrl(m.chatUrl)) {
+    const reached = await navigateTabToChatUrl(tabId, m.chatUrl);
+    if (reached) st.dirty = false;
+    else blog("BIND", m.sessionId, "chat-URL relaunch failed — keeping dirty-tab path");
+  }
   st.sessionId = m.sessionId;
   st.releasedAt = undefined;
   tabState.set(tabId, st);
@@ -1171,8 +1223,21 @@ function handleInjectorMessage(tabId, port, msg) {
         // v1.2.56: emit USAGE before STATUS done when the injector forwarded
         // the provider-reported token delta. The deepseek adapter reads
         // ev.t === "USAGE" and stashes meta onto TurnResult.usageMeta.
-        if (typeof msg.usageTokens === "number" && msg.usageTokens > 0) {
-          send({ t: "USAGE", reqId: msg.reqId, meta: { total_tokens: msg.usageTokens } });
+        // chatUrl rides the same USAGE meta (no protocol bump): the engine
+        // persists it as the session's relaunch URL for post-eviction BINDs.
+        const chatUrl = typeof msg.chatUrl === "string" && isChatUrl(msg.chatUrl) ? msg.chatUrl : null;
+        if (chatUrl) blog("chat URL", msg.reqId, chatUrl);
+        if ((typeof msg.usageTokens === "number" && msg.usageTokens > 0) || chatUrl) {
+          send({
+            t: "USAGE",
+            reqId: msg.reqId,
+            meta: {
+              ...(typeof msg.usageTokens === "number" && msg.usageTokens > 0
+                ? { total_tokens: msg.usageTokens }
+                : {}),
+              ...(chatUrl ? { chat_url: chatUrl } : {}),
+            },
+          });
         }
         send({ t: "STATUS", reqId: msg.reqId, code: msg.t === "TURN_DONE" ? "done" : "aborted" });
         break;
@@ -1201,6 +1266,11 @@ function handleInjectorMessage(tabId, port, msg) {
         const s = fragStats.get(msg.reqId);
         blog("TURN_ERROR", msg.reqId, msg.code, msg.detail || "", s ? `(${s.n} frags, ${s.chars} chars)` : "(no fragments)");
         fragStats.delete(msg.reqId);
+        // Even a failed turn may have created the chat (first message accepted,
+        // reply errored): forward its URL so the session still learns it.
+        if (typeof msg.chatUrl === "string" && isChatUrl(msg.chatUrl)) {
+          send({ t: "USAGE", reqId: msg.reqId, meta: { chat_url: msg.chatUrl } });
+        }
         send({
           t: "ERROR",
           reqId: msg.reqId,
