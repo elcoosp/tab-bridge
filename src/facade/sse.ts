@@ -112,7 +112,16 @@ export class SseStream {
     if (this.headersSent) this.res.end();
   }
 
+  /** P6: true once the client socket is gone; the facade should stop
+   * producing fragments (they would be stringified + written into a void). */
+  get clientGone(): boolean {
+    return this.res.destroyed || this.res.writableEnded;
+  }
+
   private write(obj: unknown): void {
+    // P6: dropping writes to a dead socket avoids per-frame JSON.stringify
+    // work for a result that will never be read.
+    if (this.clientGone) return;
     this.frameCount += 1;
     this.res.write(`data: ${JSON.stringify(obj)}\n\n`);
   }

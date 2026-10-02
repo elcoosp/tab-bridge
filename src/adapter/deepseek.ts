@@ -52,11 +52,11 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
     this.caps = { ...DEFAULT_CAPS, ...caps };
     // Permanent dispatch: observations land in per-reqId buffers whether or
     // not a consumer has attached yet.
-    this.pool.on("raw", (raw: string) => this.dispatch(raw));
+    this.pool.on("raw", (o: WorkerObservation) => this.dispatch(o));
   }
 
-  private dispatch(raw: string): void {
-    const o = parseWorkerMessage(raw);
+  private dispatch(o: WorkerObservation): void {
+    // P1: the pool already parsed the observation; do not re-parse.
     if (!o || !("reqId" in o)) return;
     const reqId = (o as unknown as { reqId: string }).reqId;
     const buf = this.buffers.get(reqId);

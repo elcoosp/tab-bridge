@@ -339,6 +339,9 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
     let toolIndex = 0;
     const events = {
       onContent: (text: string) => {
+        // P6: a client that has gone away cannot read the stream — stop
+        // stringifying and writing for a turn whose output goes nowhere.
+        if (sse.clientGone) return;
         if (!roleSent) {
           sse.sendChoice({ delta: { role: "assistant", content: "" }, finish_reason: null }, model, id, created);
           roleSent = true;
@@ -348,6 +351,7 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
         }
       },
       onCall: (call: { id: string; name: string; arguments: string }) => {
+        if (sse.clientGone) return;
         if (!roleSent) {
           sse.sendChoice({ delta: { role: "assistant", content: "" }, finish_reason: null }, model, id, created);
           roleSent = true;

@@ -358,8 +358,8 @@ export class WorkerPool extends EventEmitter {
       },
       reject: (e: Error) => d.reject(e),
     };
-    const route = (raw: string) => {
-      const o = parseWorkerMessage(raw);
+    const route = (o: WorkerObservation) => {
+      // P1: the pool emits the parsed observation now; do not re-parse.
       if (!o) return;
       if (failMatch) {
         const fail = failMatch(o);
@@ -442,7 +442,11 @@ export class WorkerPool extends EventEmitter {
         /* send failure surfaces via the socket close path */
       }
     }
-    this.emit("raw", raw);
+    // P1: emit the already-parsed observation. Every "raw" listener would
+    // otherwise call parseWorkerMessage() again on the same string — with K
+    // in-flight requests plus the adapter listener that is K+1 duplicate
+    // JSON.parse calls per message (thousands per second under load).
+    this.emit("raw", o);
   }
 
   /**
