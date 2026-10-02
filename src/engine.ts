@@ -466,7 +466,14 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
           }
         : {}),
     };
-    const outputHash = text || calls.length > 0 ? messageHash(emitted) : null;
+    // C11: always hash the emitted assistant message, even when text is
+    // empty and no tool calls were made. Committing tabHash=null on an
+    // empty-but-successful turn makes the NEXT tool round fail the
+    // "assistant echo matches tabHash" check → fabricated-assistant-echo →
+    // forced full RESEED for what was merely an empty turn. The chain
+    // already folds the empty assistant message (`A|`), so this aligns
+    // tabHash with the chain's own view of the tab's output.
+    const outputHash = messageHash(emitted);
     registry.commit(row, chain, outputHash);
 
     log.audit("turn.commit", {

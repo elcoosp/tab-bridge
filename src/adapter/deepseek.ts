@@ -104,7 +104,11 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return { ok: false, detail: "tab-not-known-to-worker" };
+      // C13: this is a readiness timeout, not "tab unknown". Returning
+      // tab-not-known-to-worker made the engine issue a rebind on the
+      // next turn for a tab that was merely slow to report healthy —
+      // extra BIND round-trip, possibly a different tab, dirty-flag churn.
+      if (remaining <= 0) return { ok: false, detail: "ensureReady-timeout" };
       try {
         const tabs = await this.pool.ping(Math.min(5_000, Math.max(500, remaining)));
         const me = tabs.find((t) => t.tabId === tab.tabId);
@@ -119,7 +123,7 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
         await new Promise((r) => setTimeout(r, 250));
       } catch (e) {
         if (e instanceof TimeoutError) return { ok: false, detail: "ensureReady-timeout" };
-        if (Date.now() >= deadline) return { ok: false, detail: "tab-not-known-to-worker" };
+        if (Date.now() >= deadline) return { ok: false, detail: "ensureReady-timeout" };
         await new Promise((r) => setTimeout(r, 500));
       }
     }

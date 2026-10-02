@@ -159,7 +159,27 @@ function parseMessages(raw: unknown): ChatMessage[] {
       throw badRequest(`unsupported message role: ${role}`);
     }
     const msg: ChatMessage = { role, content: null };
-    if (rec.content !== undefined) msg.content = rec.content as ChatMessage["content"];
+    if (rec.content !== undefined) {
+      // C2: reject non-string/array content as 400 not 500. textOf() calls
+      // .filter on the content in canonicalization, so a number or object
+      // would TypeError deep inside the turn, mapping to a 500 for what is
+      // really a client bug.
+      const c = rec.content;
+      const ok =
+        c === null ||
+        typeof c === "string" ||
+        (Array.isArray(c) &&
+          c.every(
+            (p) =>
+              p !== null &&
+              typeof p === "object" &&
+              (p as Record<string, unknown>).type === "text"
+          ));
+      if (!ok) {
+        throw badRequest("message.content must be a string, null, or an array of {type:'text'} parts");
+      }
+      msg.content = c as ChatMessage["content"];
+    }
     if (role === "tool") {
       if (rec.tool_call_id !== undefined && typeof rec.tool_call_id !== "string") {
         throw badRequest("tool_call_id must be a string");
@@ -432,8 +452,14 @@ async function handleSessions(
   if (url === "/v1/sessions") {
     if (method === "POST") {
       const force = query.get("force") === "true";
-      if (force && bridge.registry.size > 64) {
-        bridge.registry.evictOldestIdle();
+      if (force) {
+        // C8: evict in a loop until under the threshold (previous code
+        // evicted at most one session per call, so a POST could still be
+        // over the threshold with a long backlog of stale rows).
+        let guard = 128;
+        while (bridge.registry.size > 64 && guard-- > 0) {
+          if (!bridge.registry.evictOldestIdle()) break;
+        }
       }
       const sessionId = `sess-${randomId(8)}`;
       bridge.createSession(sessionId);

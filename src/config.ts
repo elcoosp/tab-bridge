@@ -161,9 +161,15 @@ export function parseServeArgs(argv: string[]): Config {
         break;
       case "--turn-timeout-ms":
         cfg.turnTimeoutMs = Number(val());
+        if (!Number.isInteger(cfg.turnTimeoutMs) || cfg.turnTimeoutMs <= 0) {
+          throw new Error("--turn-timeout-ms must be a positive integer");
+        }
         break;
       case "--bind-timeout-ms":
         cfg.bindTimeoutMs = Number(val());
+        if (!Number.isInteger(cfg.bindTimeoutMs) || cfg.bindTimeoutMs <= 0) {
+          throw new Error("--bind-timeout-ms must be a positive integer");
+        }
         break;
       case "--max-prompt-chars":
         cfg.maxPromptChars = Number(val());
