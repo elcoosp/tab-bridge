@@ -34,10 +34,12 @@ export type WorkerObservation =
         | "timeout"
         | "dom-error"
         | "rate_limited"
+        | "server_busy"
         | "send-button-disabled"
         | "concurrency_blocked";
       detail?: string;
-      /** Suggested cooldown seconds (rate_limited carries ~1200s / 20 min). */
+      /** Suggested cooldown seconds (rate_limited carries ~1200s / 20 min,
+       * server_busy carries ~600s / 10 min). */
       retryAfterSec?: number;
       /** For submit-phase failures: whether a user bubble actually rendered.
        * false means the tab state is untouched — the bridge must not
