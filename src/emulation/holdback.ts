@@ -25,6 +25,9 @@ export class HoldbackBuffer {
   private openLen = OPENER.length;
   /** True when the hold began at a naked (backtick-less) marker. */
   private nakedOpen = false;
+  /** P2: index into `pending` up to which we have already proven there is no
+   * closing fence. Reset to 0 whenever `pending` is emptied or rewritten. */
+  private scannedUpTo = 0;
   private readonly ceiling: number;
 
   constructor(ceiling = HOLDBACK_CEILING) {
@@ -45,6 +48,7 @@ export class HoldbackBuffer {
       this.pending = "";
     }
     this.holding = false;
+    this.scannedUpTo = 0;
     return events;
   }
 
@@ -83,10 +87,14 @@ export class HoldbackBuffer {
         this.holding = true;
         this.openLen = openLen;
         this.nakedOpen = nakedOpen;
+        this.scannedUpTo = this.openLen;
       }
 
       // Holding: look for the closing fence.
-      const closeIdx = this.pending.indexOf("```", this.openLen);
+      // P2: only scan from scannedUpTo — the region before it was already
+      // proven fence-free on a previous push.
+      const searchFrom = Math.max(this.openLen, this.scannedUpTo);
+      const closeIdx = this.pending.indexOf("```", searchFrom);
       if (closeIdx !== -1) {
         const inner = this.pending.slice(this.openLen, closeIdx).trim();
         const after = this.pending.slice(closeIdx + 3);
@@ -95,6 +103,7 @@ export class HoldbackBuffer {
         const verbatim = this.pending.slice(0, closeIdx + 3);
         this.pending = "";
         this.holding = false;
+        this.scannedUpTo = 0;
         try {
           const obj = JSON.parse(inner || "{}") as Record<string, unknown>;
           if (obj && typeof obj === "object" && !Array.isArray(obj) && typeof obj.name === "string") {
@@ -128,11 +137,13 @@ export class HoldbackBuffer {
         return events;
       }
 
-      // No close yet: ceiling check.
+      // No close yet: advance the scanned marker, then run the ceiling check.
+      this.scannedUpTo = Math.max(this.scannedUpTo, this.pending.length - 2);
       if (this.pending.length > this.ceiling) {
         this.holding = false;
         const flushed = this.pending;
         this.pending = "";
+        this.scannedUpTo = 0;
         events.push({
           type: "invalid",
           text: flushed,
