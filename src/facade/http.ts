@@ -48,17 +48,36 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let settled = false;
+    const done = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
     req.on("data", (c: Buffer) => {
       size += c.length;
       if (size > BODY_LIMIT) {
-        reject(badRequest("request body too large"));
+        done(() => reject(badRequest("request body too large")));
         req.destroy();
         return;
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", (e) => reject(e));
+    req.on("end", () => done(() => resolve(Buffer.concat(chunks))));
+    req.on("error", (e) => done(() => reject(e)));
+    // L4: a client that aborts mid-upload never emits "end" or (on some Node
+    // versions) "error" — the promise stayed pending forever, retaining the
+    // request/response/handler chain until the 300s server timeout. Settle
+    // explicitly on early close. The thrown error carries code "client_gone"
+    // so handleChat's existing guard treats it as a silent drop.
+    req.on("close", () => {
+      if (!req.readableEnded) {
+        done(() => {
+          const err = Object.assign(new Error("request aborted"), { code: "client_gone" as const });
+          reject(err);
+        });
+      }
+    });
   });
 }
 

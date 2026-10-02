@@ -98,7 +98,7 @@ Two provider behaviors are explicitly modeled by the injector and the bridge:
    the composer, DeepSeek converts it into a `Pasted Content_<timestamp>.txt`
    attachment, empties the composer, and keeps the **send button disabled**
    until the attachment finishes processing. The injector therefore
-   (a) routes prompts ≥ 8 000 chars through a synthetic paste event so the
+   (a) routes prompts ≥ 4 000 chars through a synthetic paste event so the
    site's own pipeline runs, (b) waits for the send control to become enabled
    (`aria-disabled`/`disabled`/`pointer-events` checked, up to 90 s), and
    (c) verifies the submit actually started (stop button / new bubble /

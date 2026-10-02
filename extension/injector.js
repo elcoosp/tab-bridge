@@ -9,8 +9,9 @@
  *    works regardless of tab focus/visibility (MutationObserver + timers are
  *    throttled in background tabs and were the v1.1 root cause of "message
  *    sent but response never returns")
- *  - DOM observation kept as a FALLBACK when the hook is absent or the
- *    completion stream is not seen within 15 s of a verified submit
+ *  - NO DOM-capture fallback (removed in v1.2.57): the SSE hook is the sole
+ *    source of reply text. DOM is still inspected for controls (Continue,
+ *    retry affordance, server-down banner, composer).
  *  - verifiable "New chat" reset (confirms the conversation actually changed)
  *  - provider rate-limit detection (HTTP 429 / `event: hint` rate_limit_reached
  *    on the SSE stream, plus the classic toast scan as a secondary net)
@@ -2320,7 +2321,6 @@ window.addEventListener("message", (ev) => {
       break;
     case "complete": {
       t.lastSseAt = Date.now();
-      if (t.mode === "dom") break;
       // v1.2.70: capture the provider-reported token delta for this turn.
       // The wire carries a cumulative counter (thinking + response); the
       // per-turn total is final − baseline. Propagated up so the engine can
@@ -2418,7 +2418,6 @@ window.addEventListener("message", (ev) => {
     case "stream-error":
     case "hook-error":
     case "fetch-rejected":
-      if (t.mode === "dom") break;
       if (t.emitted.length > 0) {
         finishTurn(false, "dom-error", "capture failed after partial stream: " + (d.error || d.type));
       } else {
@@ -2451,7 +2450,15 @@ function startWatchdog(t) {
       deadlineInMs: t.deadline - now,
       unverified: !!t.unverified,
     });
-    const hit = submitRateLimitHit(t.submitCount);
+    // C5: the watchdog scan covers conversation nodes rendered AFTER the
+    // submit baseline — including the assistant's own streaming reply. A
+    // short answer that merely MENTIONS "too many requests" would false-fire
+    // recovery mid-stream and re-submit a duplicate prompt. Only trust the
+    // transcript scan before any fragment has flowed; after that, the SSE
+    // hint path is the sole rate-limit signal.
+    const hit =
+      noticeRateLimitHit() ||
+      (t.emitted.length === 0 && submitRateLimitHit(t.submitCount));
     if (hit) {
       if (!attemptRateLimitRecovery(t, "toast", "provider notice: messages too frequent")) {
         finishTurn(false, "rate_limited", "provider notice: messages too frequent");

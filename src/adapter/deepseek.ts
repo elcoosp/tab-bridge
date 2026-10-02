@@ -143,10 +143,23 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
       for (;;) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new Error("timeout waiting for ACCEPTED");
-        const ev = await Promise.race([
-          this.nextEvent(reqId),
-          new Promise<null>((r) => setTimeout(() => r(null), remaining).unref?.()),
-        ]);
+        // L3: race the event against a per-iteration timeout, clear it in a
+        // finally so a fast event does not leave a live timer pinned to the
+        // deadline (previous code allocated one never-cleared timer per
+        // iteration — thousands of them on a long turn).
+        let iterTimer: NodeJS.Timeout | null = null;
+        let ev: Awaited<ReturnType<typeof this.nextEvent>>;
+        try {
+          ev = await Promise.race([
+            this.nextEvent(reqId),
+            new Promise<null>((r) => {
+              iterTimer = setTimeout(() => r(null), remaining);
+              iterTimer.unref?.();
+            }),
+          ]);
+        } finally {
+          if (iterTimer) clearTimeout(iterTimer);
+        }
         if (ev === null) throw new Error("timeout waiting for ACCEPTED");
         if (ev.t === "ACCEPTED") return;
         if (ev.t === "ERROR") throw errorFromObservation(ev);
@@ -182,10 +195,20 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
       for (;;) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new Error("timeout: no stream completion");
-        const ev = await Promise.race([
-          this.nextEvent(reqId),
-          new Promise<null>((r) => setTimeout(() => r(null), remaining).unref?.()),
-        ]);
+        // L3: same per-iteration timer + finally clear as the ACCEPTED loop.
+        let iterTimer: NodeJS.Timeout | null = null;
+        let ev: Awaited<ReturnType<typeof this.nextEvent>>;
+        try {
+          ev = await Promise.race([
+            this.nextEvent(reqId),
+            new Promise<null>((r) => {
+              iterTimer = setTimeout(() => r(null), remaining);
+              iterTimer.unref?.();
+            }),
+          ]);
+        } finally {
+          if (iterTimer) clearTimeout(iterTimer);
+        }
         if (ev === null) throw new Error("timeout: no stream completion");
         switch (ev.t) {
           case "FRAGMENT":
