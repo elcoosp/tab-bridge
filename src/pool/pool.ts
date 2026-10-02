@@ -407,14 +407,19 @@ export class WorkerPool extends EventEmitter {
       this.emit("event", { type: "worker-up", info: this.info } satisfies PoolEvent);
     }
     if (o.t === "HEALTH") {
-      const h = o as { t: "HEALTH"; tabId: number; state: string; detail?: string };
-      this.healthByTab.set(h.tabId, h.state as HealthState);
-      this.emit("event", {
-        type: "health",
-        tabId: h.tabId,
-        state: h.state as HealthState,
-        ...(h.detail !== undefined ? { detail: h.detail } : {}),
-      } satisfies PoolEvent);
+      const h = o as { t: "HEALTH"; tabId?: number; state: string; detail?: string };
+      // L2: worker-level HEALTH (SW boot notification) carries no tabId. It
+      // must not install an undefined key in healthByTab — that created a
+      // phantom tab visible in /healthz forever.
+      if (typeof h.tabId === "number") {
+        this.healthByTab.set(h.tabId, h.state as HealthState);
+        this.emit("event", {
+          type: "health",
+          tabId: h.tabId,
+          state: h.state as HealthState,
+          ...(h.detail !== undefined ? { detail: h.detail } : {}),
+        } satisfies PoolEvent);
+      }
     }
     if (o.t === "PONG") {
       const p = o as { t: "PONG"; tabs?: Array<{ tabId: number; state: string; health: string }> };
@@ -447,6 +452,7 @@ export class WorkerPool extends EventEmitter {
    *   TAB_BRIDGE_DEBUG=1 node dist/src/index.js serve ...
    */
   private fragSeen = new Set<string>();
+  private static readonly FRAG_SEEN_MAX = 2048;
   private traceObservation(o: WorkerObservation): void {
     const debug = process.env.TAB_BRIDGE_DEBUG === "1" || process.env.TAB_BRIDGE_DEBUG === "true";
     const rec = o as unknown as Record<string, unknown>;
@@ -479,6 +485,12 @@ export class WorkerPool extends EventEmitter {
         break;
       case "FRAGMENT":
         if (reqId && !this.fragSeen.has(reqId)) {
+          // L1: cap the set; drop the oldest entry when full so an abandoned
+          // turn whose link died before STATUS/ERROR cannot leak forever.
+          if (this.fragSeen.size >= WorkerPool.FRAG_SEEN_MAX) {
+            const oldest = this.fragSeen.values().next().value;
+            if (oldest !== undefined) this.fragSeen.delete(oldest);
+          }
           this.fragSeen.add(reqId);
           if (debug) {
             const text = typeof rec.text === "string" ? rec.text : "";
@@ -503,6 +515,9 @@ export class WorkerPool extends EventEmitter {
     this.conn = null;
     this.info = null;
     this.healthByTab.clear();
+    // L1: reqIds on the dead link are unreachable — clear the set so a turn
+    // that lost its link mid-stream cannot leak entries for process lifetime.
+    this.fragSeen.clear();
     log.warn("worker.down", {
       reason: "socket closed",
       serial,

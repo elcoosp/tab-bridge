@@ -62,6 +62,11 @@ const SERVER_BUSY_COOLDOWN_MS = 10 * 60 * 1000;
 let ws = null;
 let wsUrl = DEFAULT_WS_URL;
 let backoff = RECONNECT_MIN_MS;
+/** H5: single-flight WS state machine. Prevents two timers (reconnect
+ * backoff + keepalive alarm) from opening duplicate worker sockets and
+ * orphaning the first — the flap-cascade root cause. */
+let wsState = "closed"; // "closed" | "connecting" | "open"
+let reconnectTimer = null;
 /** Timestamp of the last successful WS open; used to distinguish a flap
  * (short-lived connection → grow backoff) from a stable close (reset). */
 let connectedAt = 0;
@@ -167,30 +172,6 @@ chrome.storage.local.get({ managedTabs: [], workerInstance: null }, (res) => {
 // websocket link
 // ---------------------------------------------------------------------------
 
-try {
-  self.addEventListener("unhandledrejection", (ev) => {
-    try {
-      const r = ev && ev.reason;
-      console.error("[tab-bridge-worker] unhandled rejection:", String((r && (r.stack || r.message)) || r));
-    } catch {
-      /* noop */
-    }
-  });
-} catch {
-  /* noop */
-}
-try {
-  self.addEventListener("error", (ev) => {
-    try {
-      console.error("[tab-bridge-worker] uncaught error:", String((ev && (ev.message || ev.error)) || ev));
-    } catch {
-      /* noop */
-    }
-  });
-} catch {
-  /* noop */
-}
-
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try {
@@ -208,13 +189,20 @@ function send(obj) {
 }
 
 function connect() {
+  // H5: single-flight guard. Called from scheduleReconnect and from the
+  // keepalive alarm; without this both can fire while a socket is already
+  // CONNECTING/OPEN, orphaning the first and creating the flap cascade.
+  if (wsState !== "closed") return;
+  wsState = "connecting";
   try {
     ws = new WebSocket(wsUrl);
   } catch {
+    wsState = "closed";
     scheduleReconnect();
     return;
   }
   ws.addEventListener("open", () => {
+    wsState = "open";
     // NOTE: backoff does NOT reset here. It resets only when a connection
     // closes after a stable uptime — see the close handler below.
     connectedAt = Date.now();
@@ -282,8 +270,20 @@ function connect() {
     // default-deny pool config.
     try {
       if (!helloOk && m && ["BIND", "SEND", "RESET", "ABORT", "RELEASE", "PING"].includes(m.t)) {
-        if (helloQueue.length < 20) helloQueue.push(m);
-        else blog("dropping pre-handshake intent (queue full):", m.t);
+        if (helloQueue.length < 20) {
+          helloQueue.push(m);
+        } else {
+          blog("dropping pre-handshake intent (queue full):", m.t);
+          // C12: answer the dropped intent so the bridge does not wait out
+          // its full bind/send timeout for a request we threw away.
+          if (m.t === "BIND") {
+            send({ t: "BIND_FAILED", sessionId: m.sessionId, code: "worker-booting" });
+          } else if (m.t === "SEND") {
+            send({ t: "ERROR", reqId: m.reqId, code: "submit-failed", detail: "worker booting" });
+          } else if (m.t === "RESET") {
+            send({ t: "RESET_TIMEOUT", reqId: m.reqId });
+          }
+        }
         return;
       }
       if (m) routeIntent(m);
@@ -292,6 +292,7 @@ function connect() {
     }
   });
   ws.addEventListener("close", (ev) => {
+    wsState = "closed";
     const uptime = connectedAt > 0 ? Date.now() - connectedAt : 0;
     connectedAt = 0;
     const code = ev && typeof ev.code === "number" ? ev.code : null;
@@ -339,7 +340,13 @@ function routeIntent(m) {
 }
 
 function scheduleReconnect() {
-  setTimeout(connect, backoff);
+  // H5: one pending timer only. A stale timer from a previous cycle would
+  // otherwise fire alongside the new one and open a duplicate socket.
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, backoff);
   backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
 }
 
@@ -764,16 +771,10 @@ function handleSend(m) {
   // the single-bound-tab scan for minimal workers.
   let useTab = typeof m.tabId === "number" ? m.tabId : undefined;
   if (useTab === undefined) {
-    for (const tid of sessionTab.values()) {
-      const st = tabState.get(tid);
-      if (st && st.state !== "dead") {
-        useTab = tid;
-        break;
-      }
-    }
-  }
-  if (useTab === undefined) {
-    send({ t: "ERROR", reqId: m.reqId, code: "submit-failed", detail: "no bound tab" });
+    // C14: the bridge always sends tabId today. The legacy fallback that
+    // scanned sessionTab.values() could pick another session's tab when
+    // multiple sessions were bound — never do that.
+    send({ t: "ERROR", reqId: m.reqId, code: "submit-failed", detail: "no tabId and no single bound tab" });
     return;
   }
   const port = portByTab.get(useTab);
@@ -1303,6 +1304,8 @@ function handleInjectorMessage(tabId, port, msg) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabState.delete(tabId);
   portByTab.delete(tabId);
+  // L5: prune the debugger-attach memo so it does not pin ids forever.
+  debuggerAttached.delete(tabId);
   if (managedTabs.delete(tabId)) saveManaged();
   for (const [sid, tid] of sessionTab) {
     if (tid === tabId) sessionTab.delete(sid);
@@ -1492,13 +1495,18 @@ chrome.alarms.create("pool-sweep", { periodInMinutes: 1 });
 // coarsely, so just the boot counter is enough).
 const swBootAt = Date.now();
 function reportSwBoot() {
-  // Deferred until the WS is up.
+  // C10: bounded retries (20 attempts = 10s). Once the link is up the
+  // normal HELLO path already informs the bridge; this is redundancy, not
+  // a critical notification, and an unbounded 500ms retry loop kept the SW
+  // awake forever when the bridge was simply not running.
+  let attempts = 0;
   const send2 = () => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       send({ t: "HEALTH", state: "ok", detail: `sw-boot-ms=${swBootAt}` });
-    } else {
-      setTimeout(send2, 500);
+      return;
     }
+    if (++attempts >= 20) return;
+    setTimeout(send2, 500);
   };
   send2();
 }
@@ -1523,9 +1531,9 @@ try {
 
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "keepalive") {
-    // Reconnect if the WS is down. Keepalive during a healthy connection is
-    // handled by startPingLoop (WS frame + chrome.runtime.getPlatformInfo).
-    if (!ws || ws.readyState !== WebSocket.OPEN) connect();
+    // Reconnect if the WS is down. H5: also check the state machine so this
+    // does not fire while a reconnect is already pending.
+    if (wsState === "closed" && !reconnectTimer) connect();
   }
   if (a.name === "pool-sweep") void sweepIdleTabs().catch((e) => blog("pool sweep failed:", String((e && e.message) || e)));
 });

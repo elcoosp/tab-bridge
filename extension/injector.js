@@ -2605,6 +2605,12 @@ async function onNoStream(t, composer, originalText, isRetry) {
     }
   }
   diagnoseSubmit(composer, originalText);
+  // H6: a verified submit DOES place a user bubble even when no completion
+  // stream attached. Claiming "no bubble" makes the bridge keep tabHash and
+  // INJECT after an orphan user message the transcript chain never saw — the
+  // exact poisoned-tab failure mode the rest of the file guards against.
+  // Report the truth: only claim `false` when the DOM proves nothing rendered.
+  const bubbleRendered = conversationNodes().length > (t.submitCount ?? 0);
   finishTurn(
     false,
     "submit-failed",
@@ -2612,7 +2618,7 @@ async function onNoStream(t, composer, originalText, isRetry) {
       ? "re-submit failed: no completion stream and no ds-message growth"
       : "submit not confirmed: no completion stream within 15s and no ds-message growth",
     false,
-    { userBubbleRendered: false }
+    bubbleRendered ? { userBubbleRendered: true } : { userBubbleRendered: false }
   );
 }
 
@@ -2628,6 +2634,10 @@ async function handleTurn(msg) {
       reqId: msg.reqId,
       code: "submit-failed",
       detail: "another turn is still active in this tab",
+      // C6: nothing was submitted for this rejected reqId — claiming
+      // "may have rendered" makes the engine markFailed → pendingReset →
+      // the NEXT turn is a full RESET_RESEED for no reason.
+      userBubbleRendered: false,
     });
     return;
   }
