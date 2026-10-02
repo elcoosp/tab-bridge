@@ -8,6 +8,7 @@ import { normalizeMessages, canonical, stripSystemPrefix } from "./core/canonica
 import { foldAll, hashCanonical } from "./core/hashchain.js";
 import { messageHash, classify, type PlanName } from "./core/classifier.js";
 import type { SessionRegistry, SessionRow } from "./core/registry.js";
+import { isChatUrl } from "./core/registry.js";
 import { validateArgs } from "./emulation/parser.js";
 import {
   compileSeed,
@@ -38,8 +39,14 @@ export interface TurnRequest {
   /** Holdback ceiling override (0/unset = library default). */
   holdbackCeiling?: number;
   /** Binds a session to a managed tab (pool-backed deployments). May return
-   * the tab id or the full bind observation (carries worker dirty flag). */
-  bindTab: (sessionId: string, timeoutMs: number) => Promise<number | { tabId: number; dirty?: boolean }>;
+   * the tab id or the full bind observation (carries worker dirty flag).
+   * The optional hint carries the session's remembered provider chat URL so
+   * an evicted session can relaunch straight into its own conversation. */
+  bindTab: (
+    sessionId: string,
+    timeoutMs: number,
+    opts?: { chatUrl?: string | null }
+  ) => Promise<number | { tabId: number; dirty?: boolean }>;
   /** WS-D: SEED-into-dirty-tab policy. auto = reset when the worker reports
    * the tab dirty (default); always = reset on every SEED; never = legacy. */
   resetOnSeed?: "auto" | "always" | "never";
@@ -133,13 +140,18 @@ export function summarizeMessages(messages: readonly ChatMessage[]): string {
 
 async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<ManagedTab> {
   let dirty = false;
+  // Relaunch hint: sessions that survived eviction/TTL in the journal carry
+  // their provider chat URL. The worker navigates the fresh tab straight
+  // there, so the turn below can continue instead of a full reseed.
+  const bindOpts =
+    typeof row.chatUrl === "string" && row.chatUrl.length > 0 ? { chatUrl: row.chatUrl } : undefined;
   const takeBind = (bound: number | { tabId: number; dirty?: boolean }): number => {
     if (typeof bound === "number") return bound;
     if (bound.dirty === true) dirty = true;
     return bound.tabId;
   };
   if (row.tabId === null) {
-    row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs));
+    row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs, bindOpts));
   }
   const ready = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
   if (!ready.ok) {
@@ -149,7 +161,9 @@ async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<Man
     if (detail === "tab-not-known-to-worker") {
       // Tab died while we held the row: re-bind once, then re-check.
       // A re-bind lands on some (possibly dirty) tab — track it as above.
-      row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs));
+      // The chat-URL hint travels here too: a recycled tab relaunches into
+      // the session's own conversation when the provider still has it.
+      row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs, bindOpts));
       const again = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
       if (!again.ok) throw new Error(`not-ready:${again.detail ?? "unknown"}`);
     } else {
@@ -184,6 +198,13 @@ function readTotalTokens(meta: Record<string, unknown> | undefined): number | un
   const v = meta.total_tokens;
   if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return undefined;
   return Math.floor(v);
+}
+
+/** Extract a validated provider chat URL from an adapter usageMeta bag. */
+function readChatUrl(meta: Record<string, unknown> | undefined): string | undefined {
+  if (!meta) return undefined;
+  const v = meta.chat_url;
+  return isChatUrl(v) ? v : undefined;
 }
 
 async function observePass(
@@ -371,6 +392,10 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     let stopReason = first.stopReason;
     // v1.2.56: provider-reported total_tokens, summed across repair rounds.
     let usageTotalTokens: number | undefined = readTotalTokens(first.usageMeta);
+    // Session↔chat-URL mapping: remember the provider conversation URL the
+    // moment the worker reports it, so post-eviction BINDs can relaunch it.
+    const firstChatUrl = readChatUrl(first.usageMeta);
+    if (firstChatUrl) registry.noteChatUrl(row, firstChatUrl);
 
     // ---- repair round (ADR-5, spec 6.4) --------------------------------------
     if (calls.length === 0 && tools.length > 0 && warnings.length > 0 && req.repairRounds > 0) {
@@ -480,7 +505,10 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     // untouched. Marking the row failed here would set pendingReset and
     // null tabHash, forcing a full RESET_RESEED on the very next turn
     // (RCA stage 2 — the poisoned-session loop).
-    const err = e as Error & { userBubbleRendered?: boolean; postSubmit?: boolean };
+    const err = e as Error & { userBubbleRendered?: boolean; postSubmit?: boolean; chatUrl?: unknown };
+    // The chat URL may have been created before the failure (first message
+    // accepted, reply errored): still learn it for the next relaunch.
+    if (isChatUrl(err.chatUrl)) registry.noteChatUrl(row, err.chatUrl);
     const submitNoBubble = err.userBubbleRendered === false;
     if (!submitNoBubble) {
       req.registry.markFailed(row);
