@@ -20,26 +20,65 @@ interface RawBlock {
   id?: string;
 }
 
+const FENCE_OPENER = "```tool_call";
+
+/**
+ * P3: absolute-offset fence extraction. Finds the next valid opener at or
+ * after `from` and returns its ABSOLUTE position in `text`, or -1 when none.
+ *
+ * A valid opener position is:
+ *   - `from` itself (back-to-back after a previously-consumed close fence),
+ *   - the start of the string, or
+ *   - immediately after a newline with only spaces/tabs between (the `^[ \t]*`
+ *     anchor the original regex enforced, now checked explicitly).
+ *
+ * The previous implementation sliced `rest` per block, which is O(n · blocks)
+ * on replies containing many fences. This keeps the same semantics in O(n).
+ */
+function findFenceOpener(text: string, from: number): number {
+  let searchFrom = from;
+  for (;;) {
+    const hit = text.indexOf(FENCE_OPENER, searchFrom);
+    if (hit === -1) return -1;
+    // Back-to-back: the opener begins exactly where the previous close ended.
+    if (hit === from) return hit;
+    // Walk back through [ \t]* to a line start (\n) or the string start.
+    let i = hit;
+    while (i > 0 && (text[i - 1] === " " || text[i - 1] === "\t")) i--;
+    if (i === 0) return 0;
+    if (text[i - 1] === "\n") return i;
+    // Mid-line occurrence of "```tool_call" — not a valid opener, keep looking.
+    searchFrom = hit + 1;
+  }
+}
+
 function extractFences(text: string): RawBlock[] {
   const blocks: RawBlock[] = [];
-  let rest = text;
-  let offset = 0;
-  for (;;) {
-    FENCE_OPEN.lastIndex = 0;
-    const open = FENCE_OPEN.exec(rest);
-    if (!open || open.index === undefined) break;
-    const innerStart = offset + open.index + open[0].length;
-    const closeIdx = rest.indexOf("```", open.index + open[0].length);
+  // Fast path: no opener literal at all — nothing to scan.
+  if (!text.includes(FENCE_OPENER)) return blocks;
+  let from = 0;
+  while (from < text.length) {
+    const openIdx = findFenceOpener(text, from);
+    if (openIdx === -1) break;
+    // Consume the opener + optional [ \t]* + optional \r?\n.
+    let innerStart = openIdx + FENCE_OPENER.length;
+    while (innerStart < text.length && (text[innerStart] === " " || text[innerStart] === "\t")) {
+      innerStart++;
+    }
+    if (text[innerStart] === "\r") innerStart++;
+    if (text[innerStart] === "\n") innerStart++;
+    const closeIdx = text.indexOf("```", innerStart);
     if (closeIdx === -1) {
       // Unterminated fence: treat the tail as content (holdback ceiling guards
       // runaway buffers upstream; a completed turn must still parse).
       break;
     }
-    const inner = rest.slice(open.index + open[0].length, closeIdx);
-    blocks.push({ inner: inner.trim(), start: offset + open.index, end: offset + closeIdx + 3 });
-    const consumed = closeIdx + 3;
-    offset += consumed;
-    rest = rest.slice(consumed);
+    blocks.push({
+      inner: text.slice(innerStart, closeIdx).trim(),
+      start: openIdx,
+      end: closeIdx + 3,
+    });
+    from = closeIdx + 3;
   }
   return blocks;
 }
