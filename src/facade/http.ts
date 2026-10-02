@@ -448,6 +448,7 @@ async function handleSessions(
           created: r.createdAt,
           last_used: r.lastUsed,
           mode: r.mode,
+          ...(typeof r.chatUrl === "string" ? { chat_url: r.chatUrl } : {}),
         })),
       });
       return;
@@ -484,6 +485,7 @@ async function handleSessions(
       created: row.createdAt,
       last_used: row.lastUsed,
       mode: row.mode,
+      ...(typeof row.chatUrl === "string" ? { chat_url: row.chatUrl } : {}),
     });
     return;
   }
