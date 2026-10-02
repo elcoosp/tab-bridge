@@ -7,7 +7,7 @@ export const WORKER_PROTOCOL = 1;
 
 export type WorkerIntent =
   | { t: "HELLO"; v: number; ext: string; caps?: Record<string, unknown>; extVersion?: string; instance?: string }
-  | { t: "BIND"; sessionId: string; noCreate?: boolean }
+  | { t: "BIND"; sessionId: string; noCreate?: boolean; chatUrl?: string }
   | { t: "SEND"; reqId: string; text: string; opts: { timeoutMs: number; think: boolean }; tabId?: number }
   | { t: "RESET"; reqId: string; tabId?: number }
   | { t: "ABORT"; reqId: string }
