@@ -61,7 +61,11 @@ export class TabBridge {
    * excess turns queue FIFO. See src/core/turngate.ts. */
   readonly turnGate: TurnGate;
   private readonly wsServer: WsServer;
-  private readonly bindTabImpl: (sessionId: string, timeoutMs: number, opts?: { noCreate?: boolean }) => Promise<number | { tabId: number; dirty?: boolean }>;
+  private readonly bindTabImpl: (
+    sessionId: string,
+    timeoutMs: number,
+    opts?: { noCreate?: boolean; chatUrl?: string | null }
+  ) => Promise<number | { tabId: number; dirty?: boolean }>;
 
   constructor(config: Config, adapter?: ChatProviderAdapter) {
     this.config = config;
@@ -156,7 +160,11 @@ export class TabBridge {
       // never force a new tab; it waits only for a free one (fail-fast 429).
       const noCreate = ephemeral && params.background === true;
       const bindTab = noCreate
-        ? ((sid: string, ms: number) => this.bindTabImpl(sid, ms, { noCreate: true }))
+        ? (
+            sid: string,
+            ms: number,
+            extra?: { chatUrl?: string | null }
+          ) => this.bindTabImpl(sid, ms, { noCreate: true, ...(extra ?? {}) })
         : this.bindTabImpl;
       const out = await runTurn(
         {
