@@ -8,6 +8,18 @@ import { CHAIN_SCHEME } from "./hashchain.js";
 export type SessionState = "active" | "resetting" | "draining";
 export type StateMode = "stateful" | "always-reset";
 
+/**
+ * Provider-assigned chat URL shape (`/a/chat/s/<uuid>`). Shared by the
+ * registry (persisted relaunch mapping) and the engine (bind hint). Only
+ * URLs matching this pattern are ever stored or navigated to — the worker
+ * enforces the same guard before navigating.
+ */
+export const CHAT_URL_RE = /^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[0-9a-f-]{8,}/i;
+
+export function isChatUrl(u: unknown): u is string {
+  return typeof u === "string" && CHAT_URL_RE.test(u);
+}
+
 export interface SessionRow {
   sessionId: string;
   tabId: number | null;
@@ -28,6 +40,14 @@ export interface SessionRow {
    * instead of injecting into a conversation the bridge cannot vouch for.
    */
   pendingReset?: boolean;
+  /**
+   * Provider-assigned chat URL captured from the tab after a turn
+   * (`https://chat.deepseek.com/a/chat/s/<uuid>`). Lets a session whose tab
+   * was released (TTL sweep / pool eviction) relaunch straight into its own
+   * provider-side conversation instead of a full RESET_RESEED. Persisted in
+   * the JSONL journal like the rest of the row; validated on restore.
+   */
+  chatUrl?: string | null;
 }
 
 export interface PersistStore {
@@ -95,6 +115,9 @@ export class SessionRegistry {
   restore(row: SessionRow): void {
     if (!this.rows.has(row.sessionId)) {
       row.mode = this.opts.mode;
+      // The journal predates chatUrl or may hold a stale shape: only keep
+      // well-formed provider chat URLs.
+      if (!isChatUrl(row.chatUrl)) row.chatUrl = null;
       this.rows.set(row.sessionId, row);
     }
   }
@@ -124,6 +147,16 @@ export class SessionRegistry {
 
   touch(row: SessionRow): void {
     row.lastUsed = Date.now();
+  }
+
+  /** Record the provider chat URL for a session (validated, persisted). */
+  noteChatUrl(row: SessionRow, url: unknown): boolean {
+    if (!isChatUrl(url)) return false;
+    if (row.chatUrl === url) return false;
+    row.chatUrl = url;
+    this.touch(row);
+    if (!row.ephemeral) this.opts.persist?.append(row);
+    return true;
   }
 
   /** Commit a completed turn: update chain bookkeeping and persist. */
