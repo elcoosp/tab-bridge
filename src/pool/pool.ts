@@ -185,11 +185,16 @@ export class WorkerPool extends EventEmitter {
   async bind(
     sessionId: string,
     timeoutMs: number,
-    opts: { noCreate?: boolean } = {}
+    opts: { noCreate?: boolean; chatUrl?: string | null } = {}
   ): Promise<{ tabId: number; state: string; dirty: boolean }> {
     try {
       const obs = await this.request<{ t: "BOUND"; sessionId: string; tabId: number; state: string; dirty?: boolean }>(
-        { t: "BIND", sessionId, ...(opts.noCreate ? { noCreate: true } : {}) },
+        {
+          t: "BIND",
+          sessionId,
+          ...(opts.noCreate ? { noCreate: true } : {}),
+          ...(opts.chatUrl ? { chatUrl: opts.chatUrl } : {}),
+        },
         "BIND",
         timeoutMs,
         (o) => o?.t === "BOUND" && (o as { sessionId: string }).sessionId === sessionId,
