@@ -59,6 +59,17 @@ export function rateLimited(retryAfter: number, message: string): BridgeError {
   });
 }
 
+/** Provider overload ("Server busy, please try again later."). Distinct
+ * from rate_limited: 503 (not 429) with a 10-minute Retry-After. */
+export function serverBusy(retryAfter: number, message: string): BridgeError {
+  return new BridgeError({
+    status: 503,
+    code: "server_busy",
+    message,
+    retryAfter,
+  });
+}
+
 export function poolExhausted(retryAfter: number, message: string): BridgeError {
   return new BridgeError({ status: 503, code: "pool_exhausted", message, retryAfter });
 }
@@ -100,6 +111,10 @@ export const RATE_LIMIT_COOLDOWN_SEC = 1200;
  * Retry-After for the defensive 429 is short. */
 export const CONCURRENCY_RETRY_AFTER_SEC = 15;
 
+/** Provider overload cooldown (10 minutes). The injector retries in-tab
+ * with exponential backoff first; only a persistent overload surfaces here. */
+export const SERVER_BUSY_COOLDOWN_SEC = 600;
+
 /** Map adapter/worker failures onto the taxonomy. */
 export function mapTurnError(err: unknown): BridgeError {
   const msg = err instanceof Error ? err.message : String(err);
@@ -116,6 +131,14 @@ export function mapTurnError(err: unknown): BridgeError {
     return rateLimited(
       retryAfterSec,
       `provider reports rate limiting (Messages too frequent); wait ~${Math.ceil(retryAfterSec / 60)} minutes before retrying`
+    );
+  }
+  if (msg.startsWith("turn-error:server_busy")) {
+    const busyHint = /retry-after=(\d+)/.exec(msg);
+    const busyAfter = busyHint ? Number(busyHint[1]) : SERVER_BUSY_COOLDOWN_SEC;
+    return serverBusy(
+      busyAfter,
+      `provider reports overload (Server busy, please try again later); wait ~${Math.ceil(busyAfter / 60)} minutes before retrying`
     );
   }
   // DeepSeek refuses a send while the account already has the maximum number
@@ -140,6 +163,12 @@ export function mapTurnError(err: unknown): BridgeError {
       `provider rejected the send: another message is still generating (${msg})`
     );
   }
+  if (msg.startsWith("not-ready:server_busy") || msg.startsWith("not-ready:server-busy")) {
+    return serverBusy(
+      SERVER_BUSY_COOLDOWN_SEC,
+      `managed tab is cooling down from provider overload; wait ~${Math.ceil(SERVER_BUSY_COOLDOWN_SEC / 60)} minutes`
+    );
+  }
   if (msg.startsWith("not-ready:") || msg.startsWith("reset failed")) {
     return badGateway(`tab not usable: ${msg}`);
   }
@@ -154,6 +183,12 @@ export function mapTurnError(err: unknown): BridgeError {
 
   if (msg.startsWith("bind-failed")) {
     const detail = msg.slice("bind-failed:".length).trim();
+    if (detail.includes("server-busy")) {
+      return serverBusy(
+        retryHint ? Number(retryHint[1]) : SERVER_BUSY_COOLDOWN_SEC,
+        `every managed tab is cooling down from provider overload; wait ~${Math.ceil((retryHint ? Number(retryHint[1]) : SERVER_BUSY_COOLDOWN_SEC) / 60)} minutes`
+      );
+    }
     if (detail.includes("rate-limited")) {
       return rateLimited(
         retryAfterSec,
