@@ -18,6 +18,7 @@ export type HealthState =
   | "cf_challenge"
   | "auth_invalid"
   | "rate_limited"
+  | "server_busy"
   | "degraded";
 
 export interface Health {
