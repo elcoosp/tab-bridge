@@ -196,7 +196,12 @@ export class WorkerPool extends EventEmitter {
         (o) => {
           if (o?.t !== "BIND_FAILED" || (o as { sessionId: string }).sessionId !== sessionId) return null;
           const code = (o as { code?: string }).code ?? "unknown";
-          if (code.includes("rate-limited")) return new Error(`bind-failed: ${code}`);
+          if (code.includes("rate-limited") || code.includes("server-busy")) {
+            const retry = (o as { retryAfterSec?: number }).retryAfterSec;
+            return new Error(
+              `bind-failed: ${code}${typeof retry === "number" && retry > 0 ? `;retry-after=${retry}` : ""}`
+            );
+          }
           // E5: ephemeral background traffic must never grow the pool — a
           // noCreate BIND fails fast instead of waiting out the deadline.
           if (opts.noCreate) return new Error(`bind-failed: no-tab-available (no-create)`);
