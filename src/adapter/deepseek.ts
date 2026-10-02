@@ -206,8 +206,18 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
             usageMeta = ev.meta;
             sink.onUsage?.(ev.meta);
             break;
-          case "ERROR":
-            throw errorFromObservation(ev);
+          case "ERROR": {
+            // A turn can fail after the provider chat URL was already
+            // reported via USAGE (first message accepted, reply errored).
+            // Carry it on the thrown error so the engine can still learn
+            // the session's relaunch URL in its catch block.
+            const err = errorFromObservation(ev);
+            const chatUrl = (usageMeta as Record<string, unknown> | undefined)?.["chat_url"];
+            if (typeof chatUrl === "string" && chatUrl.length > 0) {
+              (err as Error & { chatUrl?: string }).chatUrl = chatUrl;
+            }
+            throw err;
+          }
           default:
             break;
         }
