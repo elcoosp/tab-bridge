@@ -461,16 +461,42 @@ async function handleSessions(
   if (!sessionId) throw badRequest("missing session id");
 
   if (method === "DELETE") {
-    const row = bridge.registry.delete(sessionId);
-    if (!row) throw notFound(`no such session: ${sessionId}`);
-    try {
-      await bridge.pool.release(sessionId, 5_000);
-    } catch {
-      /* worker may be gone; the row is cleared regardless */
+    // H1: honour the per-session turn mutex. Deleting mid-turn otherwise
+    // (a) returns 204 while the turn keeps running, (b) releases the physical
+    // tab back to the allocatable pool while a turn is still using it —
+    // two sessions can end up driving one tab — and (c) lets the in-flight
+    // commit() re-persist the deleted row as a zombie on next boot.
+    const existing = bridge.registry.get(sessionId);
+    if (!existing) throw notFound(`no such session: ${sessionId}`);
+    const mutex = bridge.registry.lockFor(sessionId);
+    if (!mutex.tryAcquire()) {
+      throw new BridgeError({
+        status: 409,
+        code: "session_busy",
+        message: `session ${sessionId} has a turn in flight; retry the delete`,
+      });
     }
-    res.writeHead(204);
-    res.end();
-    return;
+    try {
+      const row = bridge.registry.delete(sessionId);
+      if (!row) throw notFound(`no such session: ${sessionId}`);
+      try {
+        await bridge.pool.release(sessionId, 5_000);
+      } catch {
+        /* worker may be gone; the row is cleared regardless */
+      }
+      // Compact the journal without this row. A late commit() from the
+      // in-flight turn would otherwise append the removed row back; the
+      // compact makes the on-disk state match the in-memory state.
+      bridge.registry.persistCompact();
+      res.writeHead(204);
+      res.end();
+      return;
+    } finally {
+      // delete() already removed the lock entry from the registry map, but
+      // we still hold a reference to the mutex object; releasing it keeps
+      // the object consistent if a future request somehow reuses the id.
+      mutex.release();
+    }
   }
 
   if (method === "GET") {

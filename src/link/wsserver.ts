@@ -33,6 +33,12 @@ export class WsConnection extends EventEmitter {
   readonly remoteAddress: string;
   readonly url: string;
 
+  /** H2: DoS guards. A remote peer must not be able to grow bridge memory
+   * without bound: three caps close the socket when exceeded. */
+  private static readonly MAX_BUFFER_BYTES = 1 << 20;   // 1 MiB raw backlog
+  private static readonly MAX_MESSAGE_BYTES = 8 << 20;  // 8 MiB reassembled
+  private static readonly MAX_FRAGMENTS = 1024;         // per message
+
   constructor(socket: Duplex, req: IncomingMessage) {
     super();
     this.socket = socket;
@@ -105,6 +111,10 @@ export class WsConnection extends EventEmitter {
 
   private onData(chunk: Buffer): void {
     this.buffer = Buffer.concat([this.buffer, chunk]);
+    if (this.buffer.length > WsConnection.MAX_BUFFER_BYTES) {
+      this.close(1009, "frame backlog exceeded");
+      return;
+    }
     for (;;) {
       const frame = this.tryParseFrame();
       if (!frame) break;
@@ -123,6 +133,11 @@ export class WsConnection extends EventEmitter {
     const fin = (b0 & 0x80) !== 0;
     const opcode = b0 & 0x0f;
     const masked = (b1 & 0x80) !== 0;
+    if (!masked) {
+      // H3 — RFC 6455 §5.1: client-to-server frames MUST be masked.
+      this.close(1002, "unmasked client frame");
+      return null;
+    }
     let len = b1 & 0x7f;
     let offset = 2;
     if (len === 126) {
@@ -139,26 +154,35 @@ export class WsConnection extends EventEmitter {
       len = Number(big);
       offset += 8;
     }
-    let maskKey: Buffer | null = null;
-    if (masked) {
-      if (buf.length < offset + 4) return null;
-      maskKey = buf.subarray(offset, offset + 4);
-      offset += 4;
-    }
+    if (buf.length < offset + 4) return null;
+    const maskKey = buf.subarray(offset, offset + 4);
+    offset += 4;
     if (buf.length < offset + len) return null;
-    let payload = Buffer.from(buf.subarray(offset, offset + len));
-    if (maskKey) {
-      for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
-    }
-    this.buffer = buf.subarray(offset + len);
+    const payload = Buffer.from(buf.subarray(offset, offset + len));
+    for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+    // L5: copy the remainder — a subarray view would pin the parent buffer.
+    this.buffer = Buffer.from(buf.subarray(offset + len));
     return { opcode, payload, final: fin };
   }
 
   private handleFrame(f: { opcode: number; payload: Buffer; final: boolean }): void {
     switch (f.opcode) {
       case 0x0: {
-        // continuation
+        // continuation — H2: reject without a started message, cap size/count.
+        if (this.fragOpcode === -1) {
+          this.close(1002, "unexpected continuation");
+          break;
+        }
         this.fragParts.push(f.payload);
+        let total = 0;
+        for (const p of this.fragParts) total += p.length;
+        if (
+          total > WsConnection.MAX_MESSAGE_BYTES ||
+          this.fragParts.length > WsConnection.MAX_FRAGMENTS
+        ) {
+          this.close(1009, "reassembled message too large");
+          break;
+        }
         if (f.final) {
           const whole = Buffer.concat(this.fragParts);
           const op = this.fragOpcode;
@@ -170,7 +194,16 @@ export class WsConnection extends EventEmitter {
       }
       case 0x1:
       case 0x2: {
+        if (f.payload.length > WsConnection.MAX_MESSAGE_BYTES) {
+          this.close(1009, "message too large");
+          break;
+        }
         if (!f.final) {
+          // H2: a new fragmented message while one is in flight is a protocol error.
+          if (this.fragOpcode !== -1) {
+            this.close(1002, "interleaved fragmentation");
+            break;
+          }
           this.fragOpcode = f.opcode;
           this.fragParts = [f.payload];
           break;

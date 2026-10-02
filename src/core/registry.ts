@@ -199,6 +199,19 @@ export class SessionRegistry {
     return row;
   }
 
+  /**
+   * H1 support: rewrite the journal to the current in-memory rows. Called
+   * after a delete so a late commit() from an in-flight turn cannot
+   * resurrect the removed row on next boot.
+   */
+  persistCompact(): void {
+    try {
+      this.opts.persist?.compact?.(this.list());
+    } catch {
+      /* best effort */
+    }
+  }
+
   /** Evict the oldest idle non-ephemeral session (?force=true on create). */
   evictOldestIdle(): SessionRow | undefined {
     let oldest: SessionRow | undefined;
