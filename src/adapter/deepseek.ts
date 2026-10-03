@@ -22,6 +22,7 @@ import type { WorkerPool } from "../pool/pool.js";
 import { newReqId } from "../pool/pool.js";
 import { randomId, TimeoutError } from "../util/async.js";
 import { parseWorkerMessage, type WorkerObservation } from "../link/protocol.js";
+import { TurnError, kindForErrorCode } from "../facade/errors.js";
 
 const DEFAULT_CAPS: AdapterCapabilities = {
   streaming: true,
@@ -321,10 +322,19 @@ function errText(ev: Extract<WorkerObservation, { t: "ERROR" }>): string {
 /** Build the Error thrown for an ERROR observation, carrying the
  * userBubbleRendered flag (a submit that never placed a user bubble leaves
  * the tab state untouched and must not poison the session — RCA stage 2). */
-function errorFromObservation(ev: Extract<WorkerObservation, { t: "ERROR" }>): Error {
-  const err = new Error(errText(ev));
+function errorFromObservation(ev: Extract<WorkerObservation, { t: "ERROR" }>): TurnError {
+  // C7: return a typed TurnError so mapTurnError does not have to string-match
+  // `turn-error:<code>:...`. The legacy message string is preserved verbatim
+  // (via `errText(ev)`) so existing callers and tests that match on the
+  // prefix keep working unchanged.
+  const legacyMessage = errText(ev);
+  const err = new TurnError(kindForErrorCode(ev.code), {
+    message: legacyMessage,
+    ...(typeof ev.detail === "string" ? { detail: ev.detail } : {}),
+    ...(typeof ev.retryAfterSec === "number" ? { retryAfterSec: ev.retryAfterSec } : {}),
+  });
   if (typeof ev.userBubbleRendered === "boolean") {
-    (err as Error & { userBubbleRendered?: boolean }).userBubbleRendered =
+    (err as TurnError & { userBubbleRendered?: boolean }).userBubbleRendered =
       ev.userBubbleRendered;
   }
   return err;

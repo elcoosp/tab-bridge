@@ -24,6 +24,7 @@ import { synthCallId } from "./emulation/ids.js";
 import { canonJson } from "./util/json.js";
 import type { ChatProviderAdapter, ManagedTab, TurnOptions } from "./adapter/types.js";
 import { log } from "./log.js";
+import { TurnError } from "./facade/errors.js";
 
 export interface TurnRequest {
   messages: ChatMessage[];
@@ -156,8 +157,8 @@ async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<Man
   const ready = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
   if (!ready.ok) {
     const detail = ready.detail ?? "not-ready";
-    if (detail === "cf_challenge") throw new Error("cf-challenge");
-    if (detail === "rate_limited") throw new Error("provider-rate-limited");
+    if (detail === "cf_challenge") throw new TurnError("cf_challenge", { detail: "cf-challenge" });
+    if (detail === "rate_limited") throw new TurnError("provider_rate_limited", { detail: "provider-rate-limited" });
     if (detail === "tab-not-known-to-worker") {
       // Tab died while we held the row: re-bind once, then re-check.
       // A re-bind lands on some (possibly dirty) tab — track it as above.
@@ -165,9 +166,9 @@ async function ensureTabAndReady(req: TurnRequest, row: SessionRow): Promise<Man
       // the session's own conversation when the provider still has it.
       row.tabId = takeBind(await req.bindTab(row.sessionId, req.bindTimeoutMs, bindOpts));
       const again = await req.adapter.ensureReady(tabOf(row.tabId), req.bindTimeoutMs);
-      if (!again.ok) throw new Error(`not-ready:${again.detail ?? "unknown"}`);
+      if (!again.ok) throw new TurnError("not_ready", { detail: again.detail ?? "unknown" });
     } else {
-      throw new Error(`not-ready:${detail}`);
+      throw new TurnError("not_ready", { detail });
     }
   }
   return tabOf(row.tabId as number, dirty);
@@ -369,13 +370,13 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
     // Composer limit is part of the adapter contract (spec 7.1): refuse early.
     const maxChars = req.adapter.capabilities().maxPromptChars;
     if (promptText.length > maxChars) {
-      throw new Error(`prompt-too-large:${promptText.length}>${maxChars}`);
+      throw new TurnError("prompt_too_large", { detail: `${promptText.length}>${maxChars}` });
     }
 
     // A fully empty compiled prompt would submit nothing (or an empty
     // bubble) into the tab. Fail with a typed, caller-actionable error.
     if (promptText.trim().length === 0) {
-      throw new Error("empty-prompt");
+      throw new TurnError("empty_prompt");
     }
 
     await req.adapter.sendTurn(tab, promptText, optionsFor(req));

@@ -34,6 +34,81 @@ export class BridgeError extends Error {
   }
 }
 
+/**
+ * C7: typed error carrying the taxonomy code. Engines, adapters, and pools
+ * throw TurnError with a stable `kind` instead of relying on caller-side
+ * string matching of `Error.message`. mapTurnError() prefers TurnError;
+ * legacy string-based matching is kept as a fallback so existing call sites
+ * keep working during migration and until every thrower is converted.
+ *
+ * The `kind` values mirror the HTTP taxonomy in this file: `cf_challenge`,
+ * `provider_rate_limited`, `server_busy`, `concurrency_blocked`, `not_ready`,
+ * `submit_failed`, `timeout`, `dom_error`, `port_lost`, `prompt_too_large`,
+ * `empty_prompt`, `bind_failed`.
+ */
+export type TurnErrorKind =
+  | "cf_challenge"
+  | "provider_rate_limited"
+  | "server_busy"
+  | "concurrency_blocked"
+  | "not_ready"
+  | "submit_failed"
+  | "timeout"
+  | "dom_error"
+  | "port_lost"
+  | "prompt_too_large"
+  | "empty_prompt"
+  | "bind_failed";
+
+export class TurnError extends Error {
+  readonly kind: TurnErrorKind;
+  readonly retryAfterSec?: number;
+  readonly detail?: string;
+  readonly submitNoBubble?: boolean;
+  constructor(
+    kind: TurnErrorKind,
+    opts: { message?: string; retryAfterSec?: number; detail?: string; submitNoBubble?: boolean } = {}
+  ) {
+    // Keep the legacy string shape in `message` so any code still doing
+    // prefix matching continues to work: "turn-error:<kind>[:<detail>]".
+    const detail = opts.detail !== undefined ? `:${opts.detail}` : "";
+    super(opts.message ?? `turn-error:${kind}${detail}`);
+    this.name = "TurnError";
+    this.kind = kind;
+    if (opts.retryAfterSec !== undefined) this.retryAfterSec = opts.retryAfterSec;
+    if (opts.detail !== undefined) this.detail = opts.detail;
+    if (opts.submitNoBubble !== undefined) this.submitNoBubble = opts.submitNoBubble;
+  }
+}
+
+/**
+ * C7: map a worker ERROR observation's `code` to a TurnErrorKind. The worker
+ * observation union and the taxonomy are aligned by intent, but named
+ * differently (e.g. `rate_limited` on the wire ↔ `provider_rate_limited` in
+ * the taxonomy, to disambiguate from the facade's own rate-limit responses).
+ */
+export function kindForErrorCode(code: string | undefined): TurnErrorKind {
+  switch (code) {
+    case "rate_limited":
+      return "provider_rate_limited";
+    case "server_busy":
+      return "server_busy";
+    case "concurrency_blocked":
+      return "concurrency_blocked";
+    case "timeout":
+      return "timeout";
+    case "submit-failed":
+      return "submit_failed";
+    case "send-button-disabled":
+      return "submit_failed";
+    case "port-lost":
+      return "port_lost";
+    case "dom-error":
+    default:
+      return "dom_error";
+  }
+}
+
 export function badRequest(message: string, headers?: Record<string, string>): BridgeError {
   return new BridgeError({ status: 400, code: "bad_request", message, headers });
 }
@@ -117,6 +192,79 @@ export const SERVER_BUSY_COOLDOWN_SEC = 600;
 
 /** Map adapter/worker failures onto the taxonomy. */
 export function mapTurnError(err: unknown): BridgeError {
+  // C7: a typed TurnError carries the taxonomy code directly; no string
+  // matching needed. Fall through to the legacy prefix scanner below when
+  // the error is not a TurnError (older throw sites, third-party errors).
+  if (err instanceof TurnError) {
+    switch (err.kind) {
+      case "cf_challenge":
+        return badGateway(`cloudflare challenge: ${err.detail ?? "cf-challenge"}`);
+      case "provider_rate_limited":
+        return rateLimited(
+          err.retryAfterSec ?? RATE_LIMIT_COOLDOWN_SEC,
+          `provider reports rate limiting (Messages too frequent); wait ~${Math.ceil(
+            (err.retryAfterSec ?? RATE_LIMIT_COOLDOWN_SEC) / 60
+          )} minutes before retrying`
+        );
+      case "server_busy":
+        return serverBusy(
+          err.retryAfterSec ?? SERVER_BUSY_COOLDOWN_SEC,
+          `provider reports overload (Server busy, please try again later); wait ~${Math.ceil(
+            (err.retryAfterSec ?? SERVER_BUSY_COOLDOWN_SEC) / 60
+          )} minutes before retrying`
+        );
+      case "concurrency_blocked":
+        return badGateway(
+          `provider rejected the send: another message is still generating${err.detail ? ` (${err.detail})` : ""}`
+        );
+      case "not_ready":
+        return badGateway(`tab not usable: ${err.detail ?? "not ready"}`);
+      case "submit_failed":
+        return new BridgeError({
+          status: 400,
+          code: "submit_failed",
+          message: `submit failed: ${err.detail ?? "unknown"}`,
+        });
+      case "timeout":
+        return badGateway(`provider timed out: ${err.detail ?? "turn exceeded deadline"}`);
+      case "dom_error":
+        return badGateway(`provider error: ${err.detail ?? "DOM error"}`);
+      case "port_lost":
+        return badGateway(`worker link lost: ${err.detail ?? "port-lost"}`);
+      case "prompt_too_large":
+        return badRequest(`prompt too large: ${err.detail ?? ""}`);
+      case "empty_prompt":
+        return badRequest("empty prompt");
+      case "bind_failed": {
+        const detail = err.detail ?? "";
+        if (detail.includes("server-busy")) {
+          return serverBusy(
+            err.retryAfterSec ?? SERVER_BUSY_COOLDOWN_SEC,
+            `every managed tab is cooling down from provider overload; wait ~${Math.ceil(
+              (err.retryAfterSec ?? SERVER_BUSY_COOLDOWN_SEC) / 60
+            )} minutes`
+          );
+        }
+        if (detail.includes("rate-limited")) {
+          return rateLimited(
+            err.retryAfterSec ?? RATE_LIMIT_COOLDOWN_SEC,
+            `every managed tab is cooling down from a provider rate limit; wait ~${Math.ceil(
+              (err.retryAfterSec ?? RATE_LIMIT_COOLDOWN_SEC) / 60
+            )} minutes`
+          );
+        }
+        return poolExhausted(
+          err.retryAfterSec ?? 20,
+          `no worker tab available: ${detail || "pool exhausted"}`
+        );
+      }
+      default: {
+        const _exhaustive: never = err.kind;
+        void _exhaustive;
+        return badGateway(`turn error: ${(err as Error).message}`);
+      }
+    }
+  }
   const msg = err instanceof Error ? err.message : String(err);
   const retryHint = /retry-after=(\d+)/.exec(msg);
   const retryAfterSec = retryHint ? Number(retryHint[1]) : RATE_LIMIT_COOLDOWN_SEC;
