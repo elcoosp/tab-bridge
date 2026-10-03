@@ -153,6 +153,8 @@ export class TabBridge {
       throw err;
     }
     let gateHeld = false;
+    // P9: declared here so the finally block can drop the listener.
+    let onClientAbortRef: (() => void) | null = null;
     try {
       // Blocks (FIFO) until one of maxConcurrentTurns generation slots frees
       // up. Throws GateRejectionError on queue_full / queue_timeout /
@@ -160,6 +162,26 @@ export class TabBridge {
       // longer time-to-first-byte ("thinking"); nothing else changes.
       const gateWaitMs = await this.turnGate.acquire(row.sessionId, params.signal);
       gateHeld = true;
+      // P9: after admission, a client that gives up would otherwise leave
+      // the bridge streaming DeepSeek's full reply into a dead socket for
+      // up to the turn timeout, holding a generation slot and consuming the
+      // account's send-frequency budget. Translate an abort into a worker
+      // ABORT intent for the exact reqId this adapter has pending for the
+      // tab. The injector handles ABORT (finishTurn aborted → TURN_ABORTED),
+      // and streamResponse maps STATUS aborted → stopReason "aborted".
+      const adapterWithReqId = this.adapter as ChatProviderAdapter & {
+        reqIdForTab?: (tabId: number) => string | undefined;
+      };
+      const onClientAbort = (): void => {
+        if (row.tabId === null) return;
+        const reqId = adapterWithReqId.reqIdForTab?.(row.tabId);
+        if (reqId) this.pool.abortIntent(reqId);
+      };
+      onClientAbortRef = onClientAbort;
+      if (params.signal) {
+        if (params.signal.aborted) onClientAbort();
+        else params.signal.addEventListener("abort", onClientAbort, { once: true });
+      }
       // E5: background-class ephemeral traffic binds with noCreate so it can
       // never force a new tab; it waits only for a free one (fail-fast 429).
       const noCreate = ephemeral && params.background === true;
@@ -206,6 +228,10 @@ export class TabBridge {
       }
       throw e;
     } finally {
+      // P9: drop the abort listener now that the turn has resolved.
+      if (params.signal && onClientAbortRef !== null) {
+        params.signal.removeEventListener("abort", onClientAbortRef);
+      }
       // Release the gate slot first so the next queued turn starts before
       // the session bookkeeping unwinds (both are synchronous).
       if (gateHeld) this.turnGate.release();

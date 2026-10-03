@@ -75,4 +75,12 @@ export interface ChatProviderAdapter {
   resetConversation(tab: ManagedTab): Promise<ResetOutcome>;
   health(tab: ManagedTab): Promise<Health>;
   dispose(tab: ManagedTab): Promise<void>;
+  /**
+   * P9: reqId of the currently-pending SEND for this tab, or undefined when
+   * the tab has no in-flight turn. Used by the bridge to translate a client
+   * abort into a worker ABORT intent for the correct turn. Optional: an
+   * adapter that does not track a per-tab pending reqId can omit it, in which
+   * case aborts are best-effort.
+   */
+  reqIdForTab?(tabId: number): string | undefined;
 }

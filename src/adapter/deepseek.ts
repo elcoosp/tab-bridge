@@ -102,6 +102,14 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
 
   async ensureReady(tab: ManagedTab, timeoutMs: number): Promise<Ready> {
     const deadline = Date.now() + timeoutMs;
+    // P8: exponential backoff between pings. The previous 250 ms fixed
+    // interval hammered the worker for the full deadline (up to 20 s of
+    // PINGs) whenever a tab was slow or absent, and every ping held the
+    // generation slot that a queued turn could otherwise use. Backoff
+    // doubles from 250 ms to 2 s, so a genuinely stuck tab is polled ~10
+    // times instead of ~80.
+    let backoffMs = 250;
+    let consecutiveAbsent = 0;
     for (;;) {
       const remaining = deadline - Date.now();
       // C13: this is a readiness timeout, not "tab unknown". Returning
@@ -113,18 +121,27 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
         const tabs = await this.pool.ping(Math.min(5_000, Math.max(500, remaining)));
         const me = tabs.find((t) => t.tabId === tab.tabId);
         if (me) {
+          consecutiveAbsent = 0;
           if (me.health === "ok") return { ok: true };
           // Terminal for this window: map to 429/5xx immediately.
           if (me.health !== "degraded") return { ok: false, detail: me.health };
           // Transient (port reconnect / SW restart): keep polling.
+        } else {
+          consecutiveAbsent += 1;
+          // P8: after two consecutive pings that do not list the tab at
+          // all, treat it as genuinely unknown and exit early — do not
+          // burn the full 20 s slot on a tab the worker has forgotten.
+          if (consecutiveAbsent >= 2) {
+            return { ok: false, detail: "tab-not-known-to-worker" };
+          }
         }
-        // Back off before the next ping — a hot loop here hammers the
-        // worker for the entire deadline when the tab is simply absent.
-        await new Promise((r) => setTimeout(r, 250));
+        await new Promise((r) => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, 2_000);
       } catch (e) {
         if (e instanceof TimeoutError) return { ok: false, detail: "ensureReady-timeout" };
         if (Date.now() >= deadline) return { ok: false, detail: "ensureReady-timeout" };
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, 2_000);
       }
     }
   }
@@ -252,6 +269,11 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
     } finally {
       this.closeBuffer(reqId);
     }
+  }
+
+  /** P9: expose the pending reqId for a tab so the bridge can abort it. */
+  reqIdForTab(tabId: number): string | undefined {
+    return this.pendingByTab.get(tabId);
   }
 
   async resetConversation(tab: ManagedTab): Promise<ResetOutcome> {
