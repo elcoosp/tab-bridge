@@ -78,8 +78,15 @@ function main(argv: string[]): void {
     );
   });
 
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     log.info("bridge.shutdown", { signal });
+    // P5: await pending journal writes before dispose so a SIGTERM does not
+    // drop the last turn's commit. Bounded by the watchdog below.
+    try {
+      await bridge.store.flush();
+    } catch {
+      /* best effort */
+    }
     bridge.dispose();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1_500).unref();

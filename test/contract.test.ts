@@ -539,6 +539,9 @@ test("bridge restart replays chains from the journal without storing text (ADR-3
       messages: [{ role: "user", content: "persist me" }],
     }),
   });
+  // P5: wait for the async journal writes to hit disk before the second
+  // bridge reads them at boot.
+  await b1.store.flush();
   b1.dispose();
   s1.close();
 
