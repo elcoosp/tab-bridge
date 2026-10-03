@@ -121,10 +121,6 @@ export function notFound(message = "not found"): BridgeError {
   return new BridgeError({ status: 404, code: "not_found", message });
 }
 
-export function conflict(message: string): BridgeError {
-  return new BridgeError({ status: 409, code: "session_busy", message });
-}
-
 export function rateLimited(retryAfter: number, message: string): BridgeError {
   return new BridgeError({
     status: 429,

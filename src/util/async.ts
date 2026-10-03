@@ -11,11 +11,6 @@ export class Mutex {
     return true;
   }
 
-  acquire(): Promise<void> {
-    if (this.tryAcquire()) return Promise.resolve();
-    return new Promise((resolve) => this.queue.push(resolve));
-  }
-
   release(): void {
     const next = this.queue.shift();
     if (next) next();
@@ -65,17 +60,6 @@ export class TimeoutError extends Error {
   constructor(message = "operation timed out") {
     super(message);
     this.name = "TimeoutError";
-  }
-}
-
-/** Run `p` with a hard deadline. Rejects with TimeoutError; does not cancel `p`. */
-export async function withTimeout<T>(p: Promise<T>, ms: number, what = "operation"): Promise<T> {
-  const d = new Deferred<never>();
-  const t = setTimeout(() => d.reject(new TimeoutError(`${what} timed out after ${ms}ms`)), ms);
-  try {
-    return await Promise.race([p, d.promise]);
-  } finally {
-    clearTimeout(t);
   }
 }
 

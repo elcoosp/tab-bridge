@@ -77,11 +77,6 @@ export class SseStream {
     });
   }
 
-  sendRaw(obj: unknown): void {
-    this.start("unknown");
-    this.write(obj);
-  }
-
   done(): void {
     if (this.doneSent || this.ended) return;
     this.doneSent = true;

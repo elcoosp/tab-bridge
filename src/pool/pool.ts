@@ -280,40 +280,6 @@ export class WorkerPool extends EventEmitter {
     }
   }
 
-  /** Subscribe to FRAGMENT/STATUS/USAGE/ERROR for one reqId. */
-  subscribe(
-    reqId: string,
-    handlers: {
-      onFragment: (text: string, full: boolean) => void;
-      onStatus: (code: "submitting" | "streaming" | "done" | "aborted") => void;
-      onUsage?: (meta: Record<string, unknown>) => void;
-      onError: (code: string, detail?: string) => void;
-    }
-  ): () => void {
-    const listener = (raw: string) => {
-      const o = parseWorkerMessage(raw);
-      if (!o || !("reqId" in o) || (o as unknown as { reqId: string }).reqId !== reqId) return;
-      switch (o.t) {
-        case "FRAGMENT":
-          handlers.onFragment(o.text, Boolean(o.full));
-          break;
-        case "STATUS":
-          handlers.onStatus(o.code);
-          break;
-        case "USAGE":
-          handlers.onUsage?.(o.meta);
-          break;
-        case "ERROR":
-          handlers.onError(o.code, o.detail);
-          break;
-        default:
-          break;
-      }
-    };
-    this.on("raw", listener);
-    return () => this.off("raw", listener);
-  }
-
   async ping(timeoutMs = 5000): Promise<Array<{ tabId: number; state: string; health: string }>> {
     const seq = ++this.seq;
     const o = await this.request<{ t: "PONG"; tabs?: Array<{ tabId: number; state: string; health: string }> }>(
