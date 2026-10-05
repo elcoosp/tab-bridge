@@ -78,3 +78,19 @@ fleet-drain *ARGS:
 # CLI directly to delete files).
 fleet-remove id:
     node dist/src/index.js fleet remove {{id}}
+
+# Real-browser fleet E2E: launches two real Chromium profiles and verifies
+# the fleet's plumbing (process launch, WS routing, per-account pools,
+# checkup, targeted removal, SIGTERM cleanup). Skips cleanly when no
+# Chromium-family browser is installed. Does NOT cover the DeepSeek DOM
+# layer, which is captcha-gated (see docs/RUNBOOK.md).
+e2e-fleet:
+    node scripts/e2e-fleet.mjs
+
+# Real-browser fleet E2E: launches two real Chromium profiles and verifies
+# the fleet's plumbing (process launch, WS routing, per-account pools,
+# checkup, targeted removal, SIGTERM cleanup). Skips cleanly when no
+# Chromium-family browser is installed. Does NOT cover the DeepSeek DOM
+# layer, which is captcha-gated (see docs/RUNBOOK.md).
+e2e-fleet:
+    node scripts/e2e-fleet.mjs
