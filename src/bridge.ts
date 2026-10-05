@@ -105,6 +105,11 @@ export class TabBridge {
   /** Per-account DeepSeekAdapter instances, created lazily the first time a
    * turn is routed to an account. The default `this.adapter` is used for the
    * legacy (fleet-disabled) path so existing deployments are untouched. */
+  /** Bug-hunt G7: timestamps for the /healthz surface. bridge_started_at
+   * is captured once at construction; last_probe_started_at updates each
+   * time a fingerprint checkup is dispatched. */
+  private readonly startedAt = Date.now();
+  private lastProbeStartedAt: number | null = null;
   private readonly adaptersByAccount = new Map<string, ChatProviderAdapter>();
   /** Bug-hunt C1: at most one in-flight checkup per account. Opening two
    * probe tabs concurrently used to orphan the second promise (its token
@@ -863,7 +868,8 @@ export class TabBridge {
 
   /** §7.3: run a fresh fingerprint checkup — open the probe page in a new
    * tab of the account's profile, wait up to timeoutMs for the result. */
-  async fleetCheckup(id: string, timeoutMs = 30_000): Promise<CheckupEntry> {
+  async fleetCheckup(id: string, timeoutMs?: number): Promise<CheckupEntry> {
+    const effectiveTimeout = timeoutMs ?? this.config.fleetCheckupTimeoutMs ?? 60_000;
     if (!this.fleet) {
       throw new BridgeError({
         status: 503,
@@ -908,17 +914,19 @@ export class TabBridge {
         cleanup();
         reject(
           new Error(
-            `fingerprint probe for "${id}" did not return within ${timeoutMs}ms ` +
+            `fingerprint probe for "${id}" did not return within ${effectiveTimeout}ms ` +
               `(check that the profile is logged in and the tab can reach ${host}:${this.config.port})`
           )
         );
-      }, timeoutMs);
+      }, effectiveTimeout);
       timer.unref?.();
       const wrappedSettle = (r: CheckupEntry): void => { cleanup(); settle(r); };
       const wrappedReject = (e: Error): void => { cleanup(); reject(e); };
       this.probeWaiters.set(token, { accountId: id, settle: wrappedSettle, reject: wrappedReject, timer });
     });
     this.checkupInFlight.set(id, token);
+    // Bug-hunt G7: record the probe's start time so /healthz can show it.
+    this.lastProbeStartedAt = Date.now();
     // Bug-hunt fix: pass the account's surface timezone so the probe measures
     // the SAME TZ the account's real Chrome presents.
     const tz = acct.surface?.timezone;
@@ -1175,6 +1183,16 @@ export class TabBridge {
             const full = rows.filter((r) => r.state === "ready" && r.activeSessions >= maxSessions).length;
             if (full > 0 && full === ready) alerts.push("all_ready_accounts_at_session_cap");
           }
+          // Bug-hunt G5: --fleet-proxy-required promised an identity per
+          // account, but one or more accounts are missing theirs. This
+          // will fail their next launch; surface it at health-check time
+          // rather than waiting for a bind_failed.
+          if (
+            this.config.fleetProxyRequired === true &&
+            rows.some((r) => this.fleet!.registry.byId(r.id)?.proxy === undefined)
+          ) {
+            alerts.push("proxy_required_but_missing");
+          }
           return {
             enabled: true,
             accounts: rows.length,
@@ -1185,6 +1203,7 @@ export class TabBridge {
             sessions: rows.reduce((s, r) => s + r.activeSessions, 0),
             queueDepth: this.fleet!.gate.totalWaiting(),
             isolationFindings: findings.length,
+            lastProbeStartedAt: this.lastProbeStartedAt,
             alerts,
           };
         })()
@@ -1208,6 +1227,10 @@ export class TabBridge {
         : { connected: false },
       tabs: this.pool.tabHealth(),
       fleet: fleetBlock,
+      // Bug-hunt G7: ops-facing basics a dashboard/alerting rule needs.
+      bridge_started_at: this.startedAt,
+      uptime_ms: Date.now() - this.startedAt,
+      rss_bytes: process.memoryUsage?.().rss,
     };
   }
 

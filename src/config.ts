@@ -69,6 +69,10 @@ export interface Config {
   fleetProxyRequired?: boolean;
   /** ADR-19 (v4): boot phase window for launchAll (0 = off). */
   fleetLaunchStaggerMs?: number;
+  /** Bug-hunt G19: default timeout for a fingerprint checkup. Cold-booting
+   * Chrome for a fresh profile can exceed the previous 30s hard-coded
+   * default, so this is now a flag. */
+  fleetCheckupTimeoutMs?: number;
 }
 
 export const DEFAULTS: Config = {
@@ -99,6 +103,7 @@ export const DEFAULTS: Config = {
   maxSessionsPerAccount: 8,
   fleetProxyRequired: false,
   fleetLaunchStaggerMs: 45_000,
+  fleetCheckupTimeoutMs: 60_000,
 };
 
 export function parseDuration(s: string): number {
@@ -313,6 +318,14 @@ export function parseServeArgs(argv: string[]): Config {
       case "--fleet-launch-stagger":
         cfg.fleetLaunchStaggerMs = parseDuration(val());
         break;
+      case "--fleet-checkup-timeout": {
+        const ms = parseDuration(val());
+        if (ms < 1_000 || ms > 10 * 60_000) {
+          throw new Error("--fleet-checkup-timeout must be between 1s and 10m");
+        }
+        cfg.fleetCheckupTimeoutMs = ms;
+        break;
+      }
       default:
         throw new Error(`unknown flag: ${flag}`);
     }
@@ -367,5 +380,6 @@ export function usage(): string {
     "  --max-sessions-per-account=<n> cap of sessions bound per account (default 8)",
     "  --fleet-proxy-required      refuse to launch accounts with no network identity (ADR-17)",
     "  --fleet-launch-stagger=<dur> boot phase window for launchAll (default 45s; 0=off)",
+    "  --fleet-checkup-timeout=<dur> fingerprint probe deadline (default 60s)",
   ].join("\n");
 }

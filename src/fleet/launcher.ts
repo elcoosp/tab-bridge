@@ -256,6 +256,11 @@ export class FleetLauncher {
    * own. We do NOT track this child in `this.children` — the launcher's
    * `isLaunched()` semantics must reflect the long-lived session process,
    * not this one-shot tab opener. */
+  /** Bug-hunt G21: probe tabs live in their own map so killAll reaches
+   * them (they are not the account's session child, so they do not go into
+   * `children`), and so the launcher can report/close them on shutdown. */
+  private probeChildren = new Map<string, ChildProcess>();
+
   spawnProbeTab(profileDir: string, url: string, tz?: string): void {
     let browser: string;
     try {
@@ -279,10 +284,20 @@ export class FleetLauncher {
     const spawnFn = this.opts.spawnFn ?? ((cmd, a, o) => spawn(cmd, a, { stdio: "ignore", env: o.env }));
     try {
       const child = spawnFn(browser, args, { env });
-      child.on("error", (e) => log.error("fleet.probe-spawn-failed", { error: String(e) }));
-      // Do not register in this.children: the child may exit immediately
-      // (URL forwarded to an already-running Chrome) and would otherwise
-      // leave a stale map entry.
+      // Bug-hunt G21: keep a per-profile handle so a shutdown can SIGTERM a
+      // stuck probe. The child usually exits immediately (URL forwarded to
+      // an already-running Chrome); we drop it from the map on exit so the
+      // map does not leak.
+      const handle = child;
+      const key = profileDir;
+      this.probeChildren.set(key, handle);
+      handle.on("error", (e) => {
+        log.error("fleet.probe-spawn-failed", { error: String(e) });
+        this.probeChildren.delete(key);
+      });
+      handle.on("exit", () => {
+        if (this.probeChildren.get(key) === handle) this.probeChildren.delete(key);
+      });
     } catch (e) {
       log.error("fleet.probe-spawn-failed", { error: String(e) });
     }
@@ -313,5 +328,17 @@ export class FleetLauncher {
       }
       log.audit("fleet.kill", { accountId: id, reason });
     }
+    // Bug-hunt G21: also SIGTERM any in-flight probe tabs so a shutdown
+    // does not leave a Chrome renderer process behind. The probe tab has
+    // already served its purpose by then.
+    for (const [key, child] of this.probeChildren) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      log.audit("fleet.kill-probe", { profileDir: key, reason });
+    }
+    this.probeChildren.clear();
   }
 }

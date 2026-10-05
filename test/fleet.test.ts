@@ -1115,3 +1115,96 @@ test("group 36: fleetStatus — turnSlots null when gate disabled, sessionsInUse
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// group 37: --fleet-checkup-timeout parses and is bounded (G19)
+// ---------------------------------------------------------------------------
+test("group 37: parseServeArgs — --fleet-checkup-timeout bounds", async () => {
+  const cfgPath = new URL("../src/config.js", import.meta.url).href;
+  const m = (await import(cfgPath)) as {
+    parseServeArgs: (args: string[]) => { fleetCheckupTimeoutMs?: number };
+  };
+  assert.equal(m.parseServeArgs(["--fleet-checkup-timeout=90s"]).fleetCheckupTimeoutMs, 90_000);
+  assert.equal(m.parseServeArgs(["--fleet-checkup-timeout=1m"]).fleetCheckupTimeoutMs, 60_000);
+  assert.throws(
+    () => m.parseServeArgs(["--fleet-checkup-timeout=500ms"]),
+    /--fleet-checkup-timeout must be between/
+  );
+  assert.throws(
+    () => m.parseServeArgs(["--fleet-checkup-timeout=20m"]),
+    /--fleet-checkup-timeout must be between/
+  );
+  // Default when unspecified.
+  assert.equal(m.parseServeArgs([]).fleetCheckupTimeoutMs, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// group 38: /healthz alerts include proxy_required_but_missing (G5)
+// ---------------------------------------------------------------------------
+test("group 38: /healthz — proxy_required_but_missing fires when an account lacks a proxy", async () => {
+  const { TabBridge } = await import("../src/bridge.js");
+  const { DEFAULTS } = await import("../src/config.js");
+  const dir = tmpDir();
+  try {
+    const fleetFile = join(dir, "fleet.json");
+    // Two accounts: one with proxy, one without.
+    writeFileSync(
+      fleetFile,
+      JSON.stringify({
+        v: 1,
+        accounts: [
+          {
+            id: "work",
+            profileDir: join(dir, "home", "work"),
+            createdAt: Date.now(),
+            proxy: "socks5://127.0.0.1:1081",
+          },
+          {
+            id: "backup",
+            profileDir: join(dir, "home", "backup"),
+            createdAt: Date.now(),
+          },
+        ],
+      })
+    );
+    const bridge = new TabBridge({
+      ...DEFAULTS,
+      fleetFile,
+      fleetRoot: join(dir, "home"),
+      dbPath: "",
+      fleetProxyRequired: true,
+    });
+    try {
+      const h = bridge.health() as {
+        fleet: { alerts: string[] };
+        bridge_started_at: number;
+        uptime_ms: number;
+      };
+      assert.ok(
+        h.fleet.alerts.includes("proxy_required_but_missing"),
+        `expected proxy_required_but_missing in alerts, got ${JSON.stringify(h.fleet.alerts)}`
+      );
+      // G7 fields present.
+      assert.ok(typeof h.bridge_started_at === "number");
+      assert.ok(typeof h.uptime_ms === "number" && h.uptime_ms >= 0);
+    } finally {
+      bridge.dispose();
+    }
+
+    // Same fleet WITHOUT --fleet-proxy-required: no such alert.
+    const bridge2 = new TabBridge({
+      ...DEFAULTS,
+      fleetFile,
+      fleetRoot: join(dir, "home"),
+      dbPath: "",
+    });
+    try {
+      const h2 = bridge2.health() as { fleet: { alerts: string[] } };
+      assert.ok(!h2.fleet.alerts.includes("proxy_required_but_missing"));
+    } finally {
+      bridge2.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
