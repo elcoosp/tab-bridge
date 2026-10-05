@@ -135,8 +135,14 @@ export class TabBridge {
       mode: config.stateful ? "stateful" : "always-reset",
       ttlMs: config.ttlMs,
       persist: this.store,
-      onEvict: (sessionId) => {
+      onEvict: (sessionId, row) => {
         log.audit("session.evict", { sessionId });
+        // Bug-hunt E1: unwind the account's session counter. Without this,
+        // a TTL-expired session leaks an activeSessions slot on its account
+        // and the account eventually reports at-cap forever.
+        if (this.fleet && row.accountId !== undefined) {
+          this.fleet.accounts.noteSessionEnded(row.accountId);
+        }
         // E1: release with the RAW session id. The worker keys its
         // sessionTab map by raw id (stored at BIND); a prefixed id never
         // matches and the tab stays occupied forever.
@@ -338,6 +344,19 @@ export class TabBridge {
     // path — that keeps a bridge started with an empty fleet.json behaving
     // exactly like the pre-fleet bridge for its one real worker.
     const fleetActive = this.fleet !== null && this.fleet.registry.all().length > 0;
+    // Bug-hunt E4: a persisted row can still carry a binding to an account
+    // that no longer exists (removed while the bridge was down, or a
+    // journal write that raced removal before D2's fix). Clear it so the
+    // normal placement path below re-binds instead of routing to a ghost.
+    if (
+      fleetActive &&
+      !ephemeral &&
+      row.accountId !== undefined &&
+      this.fleet!.registry.byId(row.accountId) === undefined
+    ) {
+      row.accountId = undefined;
+      row.pendingReset = true;
+    }
     if (fleetActive && !ephemeral && row.accountId === undefined) {
       const placed = this.fleet!.accounts.placeSession();
       if (!placed.ok) {
@@ -1151,6 +1170,10 @@ export class TabBridge {
         w.reject(new Error("bridge disposed"));
       }
       this.probeWaiters.clear();
+      // Bug-hunt E3: also clear the per-account checkup guard so a later
+      // re-init of the bridge (or a test teardown that reuses the object)
+      // does not see a phantom in-flight checkup.
+      this.checkupInFlight.clear();
       try { this.fleet.launcher.killAll("shutdown"); } catch { /* ignore */ }
       try { this.fleet.router.detachAll("shutdown"); } catch { /* ignore */ }
       try { this.fleet.enrollment.discardAll(); } catch { /* ignore */ }

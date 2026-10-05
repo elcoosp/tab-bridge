@@ -573,6 +573,9 @@ async function handleSessions(
           created: r.createdAt,
           last_used: r.lastUsed,
           mode: r.mode,
+          // Bug-hunt E2: expose the fleet account binding so operators can
+          // tell which profile owns a session without opening the journal.
+          ...(typeof r.accountId === "string" ? { account_id: r.accountId } : {}),
           ...(typeof r.chatUrl === "string" ? { chat_url: r.chatUrl } : {}),
         })),
       });
@@ -638,6 +641,7 @@ async function handleSessions(
       created: row.createdAt,
       last_used: row.lastUsed,
       mode: row.mode,
+      ...(typeof row.accountId === "string" ? { account_id: row.accountId } : {}),
       ...(typeof row.chatUrl === "string" ? { chat_url: row.chatUrl } : {}),
     });
     return;

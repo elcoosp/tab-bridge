@@ -69,7 +69,11 @@ export interface RegistryOptions {
   ttlMs: number;
   sweepIntervalMs?: number;
   persist?: PersistStore;
-  onEvict?: (sessionId: string) => void;
+  /** Fired when a row is removed (TTL sweep, forced eviction). Bug-hunt E1:
+   * the callback now receives the removed row so fleet-aware callers can
+   * unwind the account's activeSessions counter — the row is gone from the
+   * registry by the time this fires, so callers cannot look it up by id. */
+  onEvict?: (sessionId: string, row: SessionRow) => void;
 }
 
 export class SessionRegistry {
@@ -229,8 +233,8 @@ export class SessionRegistry {
       if (!oldest || r.lastUsed < oldest.lastUsed) oldest = r;
     }
     if (oldest) {
-      this.delete(oldest.sessionId);
-      this.opts.onEvict?.(oldest.sessionId);
+      const row = this.delete(oldest.sessionId);
+      if (row) this.opts.onEvict?.(oldest.sessionId, row);
     }
     return oldest;
   }
@@ -250,8 +254,8 @@ export class SessionRegistry {
       if (now - r.lastUsed >= this.opts.ttlMs) expired.push(r.sessionId);
     }
     for (const id of expired) {
-      this.delete(id);
-      this.opts.onEvict?.(id);
+      const row = this.delete(id);
+      if (row) this.opts.onEvict?.(id, row);
     }
     this.sweepCount += 1;
     if (expired.length > 0 || this.sweepCount % 30 === 0) {

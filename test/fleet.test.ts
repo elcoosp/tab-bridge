@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AccountRegistry } from "../src/core/accounts.js";
+import { SessionRegistry } from "../src/core/registry.js";
 import { AccountTurnGate } from "../src/core/accountgate.js";
 import { GateRejectionError } from "../src/core/turngate.js";
 import {
@@ -891,5 +892,62 @@ test("group 29: fleetRawProxy strips credentials via _debug_proxy", async () => 
     assert.equal(bridge.fleetRawProxy("anything"), null);
   } finally {
     bridge.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 30: TTL sweep forwards the removed row to onEvict (E1)
+// ---------------------------------------------------------------------------
+test("group 30: SessionRegistry — sweep forwards the row to onEvict", () => {
+  const evicted: Array<{ id: string; accountId: string | undefined }> = [];
+  const reg = new SessionRegistry({
+    mode: "stateful",
+    ttlMs: 1,
+    sweepIntervalMs: 24 * 60 * 60 * 1000, // effectively off for the test
+    onEvict: (sessionId, row) => {
+      evicted.push({ id: sessionId, accountId: row.accountId });
+    },
+  });
+  try {
+    const row = reg.getOrCreate("sess-e1");
+    row.accountId = "work";
+    row.lastUsed = Date.now() - 10_000; // force TTL expiry
+    const expired = reg.sweep();
+    assert.ok(expired.includes("sess-e1"), "session must be swept");
+    assert.equal(evicted.length, 1, "onEvict fires exactly once");
+    assert.equal(evicted[0].id, "sess-e1");
+    assert.equal(evicted[0].accountId, "work", "row is forwarded so the caller can unwind account counters");
+  } finally {
+    reg.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 31: evictOldestIdle also forwards the row (E1)
+// ---------------------------------------------------------------------------
+test("group 31: SessionRegistry — evictOldestIdle forwards the row to onEvict", () => {
+  const evicted: Array<{ id: string; accountId: string | undefined }> = [];
+  const reg = new SessionRegistry({
+    mode: "stateful",
+    ttlMs: 60 * 60 * 1000,
+    sweepIntervalMs: 24 * 60 * 60 * 1000,
+    onEvict: (sessionId, row) => {
+      evicted.push({ id: sessionId, accountId: row.accountId });
+    },
+  });
+  try {
+    const a = reg.getOrCreate("sess-a");
+    a.accountId = "work";
+    a.lastUsed = Date.now() - 1000;
+    const b = reg.getOrCreate("sess-b");
+    b.accountId = "personal";
+    b.lastUsed = Date.now();
+    const oldest = reg.evictOldestIdle();
+    assert.ok(oldest);
+    assert.equal(oldest.sessionId, "sess-a");
+    assert.equal(evicted.length, 1);
+    assert.equal(evicted[0].accountId, "work");
+  } finally {
+    reg.dispose();
   }
 });
