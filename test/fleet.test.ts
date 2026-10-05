@@ -13,7 +13,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, chmodSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, chmodSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -949,5 +949,98 @@ test("group 31: SessionRegistry — evictOldestIdle forwards the row to onEvict"
     assert.equal(evicted[0].accountId, "work");
   } finally {
     reg.dispose();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 32: FleetRegistry.open with corrupt JSON throws a clear message (F8)
+// ---------------------------------------------------------------------------
+test("group 32: FleetRegistry.open — corrupt JSON yields a clear error", () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "fleet.json");
+    // Write malformed JSON.
+    writeFileSync(path, "{ not json");
+    assert.throws(
+      () => FleetRegistry.open(path, join(dir, "home")),
+      /not valid JSON/
+    );
+    // Wrong version.
+    writeFileSync(path, JSON.stringify({ v: 999, accounts: [] }));
+    assert.throws(
+      () => FleetRegistry.open(path, join(dir, "home")),
+      /unsupported fleet file version/
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 33: setSurface rejects malformed field types (F14)
+// ---------------------------------------------------------------------------
+test("group 33: FleetRegistry — setSurface validates field types", () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "fleet.json");
+    const reg = FleetRegistry.open(path, join(dir, "home"));
+    reg.add({ id: "a" });
+    // Valid.
+    reg.setSurface("a", { locale: "de-DE", canvasNoise: true });
+    // Wrong types.
+    assert.throws(
+      () => reg.setSurface("a", { locale: 123 as never }),
+      /invalid surface\.locale: expected string/
+    );
+    assert.throws(
+      () => reg.setSurface("a", { canvasNoise: "yes" as never }),
+      /invalid surface\.canvasNoise: expected boolean/
+    );
+    assert.throws(
+      () => reg.setSurface("a", { extraArgs: "not-an-array" as never }),
+      /invalid surface\.extraArgs: expected string\[\]/
+    );
+    assert.throws(
+      () => reg.setSurface("a", { extraArgs: [1, 2] as never }),
+      /invalid surface\.extraArgs: expected string\[\]/
+    );
+    // Clearing still works.
+    reg.setSurface("a", null);
+    const reg2 = FleetRegistry.open(path, join(dir, "home"));
+    assert.equal(reg2.byId("a")?.surface, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 34: fleet enroll — invalid id → typed BridgeError (F10)
+// ---------------------------------------------------------------------------
+test("group 34: fleet enroll — invalid id surfaces as a typed error", async () => {
+  const { TabBridge } = await import("../src/bridge.js");
+  const { DEFAULTS } = await import("../src/config.js");
+  const dir = tmpDir();
+  try {
+    const fleetFile = join(dir, "fleet.json");
+    // Initialize an empty fleet file so the constructor enables the fleet.
+    writeFileSync(fleetFile, JSON.stringify({ v: 1, accounts: [] }));
+    const bridge = new TabBridge({
+      ...DEFAULTS,
+      fleetFile,
+      fleetRoot: join(dir, "home"),
+      dbPath: "",
+    });
+    try {
+      // Direct call — the endpoint's BridgeError mapping is exercised
+      // separately; this asserts the underlying error kind.
+      assert.throws(
+        () => bridge.fleetEnroll({ id: "BAD ID WITH SPACES" }),
+        /invalid account id/
+      );
+    } finally {
+      bridge.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

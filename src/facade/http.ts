@@ -699,7 +699,16 @@ async function handleFleet(
     } catch (e) {
       // Bug-hunt C19: enrollment conflicts are caller errors, not 500s.
       // Translate the EnrollmentManager's generic Errors into a typed 409.
+      // Bug-hunt F10: a malformed id (fails the registry's ID_RE) is a 400,
+      // not a 500 — the operator typed something wrong.
       const msg = e instanceof Error ? e.message : String(e);
+      if (/invalid account id/.test(msg)) {
+        throw new BridgeError({
+          status: 400,
+          code: "bad_account_id",
+          message: msg,
+        });
+      }
       if (/enrollment already open|already exists/.test(msg)) {
         throw new BridgeError({
           status: 409,

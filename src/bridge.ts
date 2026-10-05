@@ -203,7 +203,21 @@ export class TabBridge {
       config.fleetFile.length > 0 &&
       existsSync(config.fleetFile);
     if (fleetEnabled) {
-      const fleetRegistry = FleetRegistry.open(config.fleetFile as string, config.fleetRoot);
+      // Bug-hunt F8: any failure to open the fleet file (corrupt JSON,
+      // unsupported version, permission) must surface as a clean,
+      // actionable error rather than an uncaught throw from deep inside
+      // the constructor. The operator's first signal should be a message
+      // naming the file, not a stack trace.
+      let fleetRegistry: FleetRegistry;
+      try {
+        fleetRegistry = FleetRegistry.open(config.fleetFile as string, config.fleetRoot);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(
+          `failed to load fleet file "${config.fleetFile}": ${msg}\n` +
+            `  → fix the file, or start with --fleet-file="" to run in single-account mode`
+        );
+      }
       const accounts = new AccountRegistry({
         maxSessionsPerAccount: config.maxSessionsPerAccount ?? 8,
       });

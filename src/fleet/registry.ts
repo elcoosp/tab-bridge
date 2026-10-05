@@ -210,12 +210,34 @@ export class FleetRegistry {
     return acct;
   }
 
-  /** ADR-18: set/clear the account's surface profile. */
+  /** ADR-18: set/clear the account's surface profile.
+   * Bug-hunt F14: validate each field's type at set time. A malformed
+   * object like `{ locale: 123 }` used to be stored silently and only
+   * misbehaved at launch. Rejecting early keeps the fleet file honest. */
   setSurface(id: string, surface: SurfaceProfile | null): FleetAccount {
     const acct = this.accounts.get(id);
     if (!acct) throw new Error(`no such account: ${id}`);
-    if (surface === null) delete acct.surface;
-    else acct.surface = surface;
+    if (surface === null) {
+      delete acct.surface;
+    } else {
+      const s = surface as Record<string, unknown>;
+      const stringFields = ["locale", "timezone", "windowSize", "windowPosition"] as const;
+      for (const f of stringFields) {
+        const v = s[f];
+        if (v !== undefined && typeof v !== "string") {
+          throw new Error(`invalid surface.${f}: expected string, got ${typeof v}`);
+        }
+      }
+      if (s.canvasNoise !== undefined && typeof s.canvasNoise !== "boolean") {
+        throw new Error(`invalid surface.canvasNoise: expected boolean, got ${typeof s.canvasNoise}`);
+      }
+      if (s.extraArgs !== undefined) {
+        if (!Array.isArray(s.extraArgs) || !s.extraArgs.every((a) => typeof a === "string")) {
+          throw new Error("invalid surface.extraArgs: expected string[]");
+        }
+      }
+      acct.surface = surface;
+    }
     this.persist();
     return acct;
   }
