@@ -174,6 +174,12 @@ export class AccountTurnGate {
     return new GateRejectionError("client_gone", 0, `client disconnected while turn was queued (session ${sessionId})`);
   }
 
+  /** Bug-hunt fix: expose total pending waiters for the health surface
+   * (the /healthz fleet block used to hardcode queueDepth=0). */
+  totalWaiting(): number {
+    return this.totalQueued();
+  }
+
   stats(): Record<string, unknown> {
     return {
       disabled: this.disabled,

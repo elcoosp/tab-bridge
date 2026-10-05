@@ -131,8 +131,20 @@ function parseSurfaceCsv(csv: string): SurfaceBody {
  * command line as a value the operator wrote; the endpoint is whatever
  * was stored in the fleet file (raw, possibly an env var expansion). */
 async function probeExitIp(proxy: string | null): Promise<string> {
+  // Bug-hunt fix: expand env-var references against the CLI's own environment
+  // BEFORE probing. The bridge stores proxies raw; without expansion the
+  // native probe would try to dial a literal place-holder host.
+  let endpoint: string | null = proxy;
+  if (proxy && proxy.includes("$" + "{") ) {
+    try {
+      const { expandEnvRefs } = await import("./fleet/registry.js");
+      endpoint = expandEnvRefs(proxy, process.env);
+    } catch (e) {
+      return `(unresolved-env: ${(e as Error).message})`;
+    }
+  }
   const { probeExitIpNative } = await import("./fleet/netprobe.js");
-  const r = await probeExitIpNative(proxy);
+  const r = await probeExitIpNative(endpoint);
   if (r.ip) return r.ip;
   return `(${r.status})`;
 }
@@ -332,6 +344,32 @@ export async function fleetMain(argv: string[]): Promise<void> {
       return;
     }
 
+    case "checkup": {
+      if (!id) throw new Error("usage: fleet checkup <id>");
+      console.log(`  checkup: probing "${id}"...`);
+      const out = (await post(`/v1/fleet/${id}/checkup`)) as {
+        checkup: {
+          canvasHash: string;
+          language: string;
+          timezone: string;
+          timezoneOffsetMin: number;
+          innerWidth: number;
+          innerHeight: number;
+          devicePixelRatio: number;
+          gpuRenderer: string | null;
+          exitIp: string | null;
+        };
+      };
+      const c = out.checkup;
+      console.log(`  canvas: ${c.canvasHash}`);
+      console.log(`  lang:   ${c.language}`);
+      console.log(`  tz:     ${c.timezone} (offset ${c.timezoneOffsetMin} min)`);
+      console.log(`  window: ${c.innerWidth}x${c.innerHeight} (dpr ${c.devicePixelRatio})`);
+      console.log(`  gpu:    ${c.gpuRenderer ?? "(unknown)"}`);
+      console.log(`  exit:   ${c.exitIp ?? "(unknown)"}`);
+      return;
+    }
+
     case "drain": {
       if (!id) throw new Error("usage: fleet drain <id> [--to <id|auto>] [--dry-run] [-y]");
       const target = getFlag(argv, "--to") ?? "auto";
@@ -363,7 +401,7 @@ export async function fleetMain(argv: string[]): Promise<void> {
 
     default:
       process.stderr.write(
-        "usage: tab-bridge fleet add|list|open|login|proxy|surface|doctor|drain|remove ...\n"
+        "usage: tab-bridge fleet add|list|open|login|proxy|surface|doctor|checkup|drain|remove ...\n"
       );
       process.exit(2);
   }

@@ -103,6 +103,8 @@ export class FleetRouter {
         /* ignore */
       }
     }, 5000);
+    // Bug-hunt fix: unref so a stuck upgrade cannot delay process shutdown.
+    guard.unref?.();
     conn.once("message", (raw: string) => {
       clearTimeout(guard);
       const hello = parseHello(raw);

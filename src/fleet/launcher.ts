@@ -256,7 +256,7 @@ export class FleetLauncher {
    * own. We do NOT track this child in `this.children` — the launcher's
    * `isLaunched()` semantics must reflect the long-lived session process,
    * not this one-shot tab opener. */
-  spawnProbeTab(profileDir: string, url: string): void {
+  spawnProbeTab(profileDir: string, url: string, tz?: string): void {
     let browser: string;
     try {
       browser = FleetLauncher.resolveBrowser(this.opts.browserPath);
@@ -270,9 +270,15 @@ export class FleetLauncher {
       "--no-default-browser-check",
       url,
     ];
+    // Bug-hunt fix: propagate the account's surface TZ so the probe measures
+    // the SAME timezone the account's real Chrome presents. Without this, a
+    // closed profile's probe reports the OS timezone and the doctor's
+    // isolation diff is wrong for TZ. Windows ignores TZ env (as in launch()).
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (tz && process.platform !== "win32") env.TZ = tz;
     const spawnFn = this.opts.spawnFn ?? ((cmd, a, o) => spawn(cmd, a, { stdio: "ignore", env: o.env }));
     try {
-      const child = spawnFn(browser, args, { env: process.env });
+      const child = spawnFn(browser, args, { env });
       child.on("error", (e) => log.error("fleet.probe-spawn-failed", { error: String(e) }));
       // Do not register in this.children: the child may exit immediately
       // (URL forwarded to an already-running Chrome) and would otherwise
@@ -280,6 +286,21 @@ export class FleetLauncher {
     } catch (e) {
       log.error("fleet.probe-spawn-failed", { error: String(e) });
     }
+  }
+
+  /** SIGTERM exactly one account's child (fleetRemove path). Returns true
+   * when a child was killed, false when the account had no running child. */
+  killOne(accountId: string, reason: string): boolean {
+    const child = this.children.get(accountId);
+    if (!child) return false;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    this.children.delete(accountId);
+    log.audit("fleet.kill-one", { accountId, reason });
+    return true;
   }
 
   /** SIGTERM every child we own (bridge shutdown / account removal). */

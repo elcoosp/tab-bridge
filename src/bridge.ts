@@ -506,6 +506,9 @@ export class TabBridge {
     } catch (err) {
       log.error("fleet.relaunch-proxy-unset", { accountId, error: String(err) });
     }
+    // Bug-hunt fix: surface launch failures to the caller so a config error
+    // (e.g. proxyRequired without an endpoint, browser binary missing) fails
+    // the turn with a clear bind_failed reason instead of a silent timeout.
     try {
       this.fleet.launcher.launch({
         accountId,
@@ -519,6 +522,7 @@ export class TabBridge {
       log.info("fleet.relaunch", { accountId });
     } catch (e) {
       log.error("fleet.relaunch-failed", { accountId, error: String(e) });
+      throw e;
     }
   }
 
@@ -668,7 +672,11 @@ export class TabBridge {
     // Open the enrollment claim window first: the pool's worker-up handler
     // attributes the next unknown instance to it. The promise is
     // fire-and-forget; the CLI polls /v1/accounts for state.
-    void this.fleet.enrollment.begin(persisted.id, 10 * 60_000).catch(() => {});
+    void this.fleet.enrollment.begin(persisted.id, 10 * 60_000).catch((e) => {
+      // Bug-hunt fix: log enrollment timeout (or claim failure) so operators
+      // have a server-side signal, not just a silently-hung CLI poll.
+      log.warn("fleet.enroll-timeout", { accountId: persisted.id, error: String(e) });
+    });
     // Launch the profile process.
     try {
       let proxyEndpoint: string | undefined;
@@ -792,7 +800,10 @@ export class TabBridge {
       timer.unref?.();
       this.probeWaiters.set(token, { accountId: id, settle, reject, timer });
     });
-    this.fleet.launcher.spawnProbeTab(acct.profileDir, url);
+    // Bug-hunt fix: pass the account's surface timezone so the probe measures
+    // the SAME TZ the account's real Chrome presents.
+    const tz = acct.surface?.timezone;
+    this.fleet.launcher.spawnProbeTab(acct.profileDir, url, tz);
     return promise;
   }
 
@@ -850,9 +861,10 @@ export class TabBridge {
         /* ignore */
       }
       this.adaptersByAccount.delete(id);
-      // Best-effort: kill the child if still running.
+      // Bug-hunt fix: kill ONLY this account's Chrome. The previous call to
+      // killAll() took down every other running profile too.
       try {
-        this.fleet.launcher.killAll(`removed:${id}`);
+        this.fleet.launcher.killOne(id, `removed:${id}`);
       } catch {
         /* ignore */
       }
@@ -931,7 +943,7 @@ export class TabBridge {
             needsRelogin: rows.filter((r) => r.state === "needs_relogin").length,
             awaitingLogin: rows.filter((r) => r.state === "awaiting_login").length,
             sessions: rows.reduce((s, r) => s + r.activeSessions, 0),
-            queueDepth: 0,
+            queueDepth: this.fleet!.gate.totalWaiting(),
             isolationFindings: findings.length,
             alerts,
           };
@@ -962,5 +974,19 @@ export class TabBridge {
   dispose(): void {
     this.registry.dispose();
     this.pool.detach("shutdown");
+    // Bug-hunt fix: clean up every fleet-owned resource so a bridge restart
+    // (or test teardown) does not leak pending probe timers, orphan Chrome
+    // processes, router pools, or an open enrollment.
+    if (this.fleet) {
+      for (const [, w] of this.probeWaiters) {
+        if (w.timer) clearTimeout(w.timer);
+        w.reject(new Error("bridge disposed"));
+      }
+      this.probeWaiters.clear();
+      try { this.fleet.launcher.killAll("shutdown"); } catch { /* ignore */ }
+      try { this.fleet.router.detachAll("shutdown"); } catch { /* ignore */ }
+      try { this.fleet.enrollment.discardAll(); } catch { /* ignore */ }
+      this.adaptersByAccount.clear();
+    }
   }
 }

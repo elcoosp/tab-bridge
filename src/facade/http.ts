@@ -90,12 +90,24 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers?: 
   res.end(JSON.stringify(body));
 }
 
-/** True when the request originated from the loopback interface. Used to
+/** True when the request originated from a same-machine origin. Used to
  * gate the probe routes, which are intentionally auth-exempt (the probe
- * page is a browser document and cannot present a bearer token). */
-function isLocalRequest(req: IncomingMessage): boolean {
+ * page is a browser document and cannot present a bearer token).
+ *
+ * Bug-hunt fix: previously loopback-only, which rejected the probe when the
+ * bridge was bound to a specific non-loopback address (`--host 10.0.0.5`):
+ * the profile's Chrome connects FROM that address, not from 127.0.0.1. Now
+ * accept loopback plus any explicitly configured bind host. */
+function isLocalRequest(req: IncomingMessage, extraHosts: string[] = []): boolean {
   const a = req.socket.remoteAddress ?? "";
-  return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1";
+  if (a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1") return true;
+  // `a` may carry the IPv4-mapped IPv6 prefix when the server listens on ::
+  const bare = a.startsWith("::ffff:") ? a.slice(7) : a;
+  for (const h of extraHosts) {
+    if (!h || h === "0.0.0.0" || h === "::") continue;
+    if (bare === h) return true;
+  }
+  return false;
 }
 
 function authOk(bridge: TabBridge, req: IncomingMessage): boolean {
@@ -130,12 +142,12 @@ async function handle(bridge: TabBridge, req: IncomingMessage, res: ServerRespon
   // Chrome; it cannot present a bearer token, so these two routes are auth-
   // exempt. Loopback-only enforcement keeps non-local callers out.
   if (method === "GET" && url === PROBE_PATH) {
-    if (!isLocalRequest(req)) throw notFound();
+    if (!isLocalRequest(req, [bridge.config.host])) throw notFound();
     bridge.serveProbeHtml(res, query.get("id") ?? "", query.get("token") ?? "");
     return;
   }
   if (method === "POST" && url === PROBE_RESULT_PATH) {
-    if (!isLocalRequest(req)) throw notFound();
+    if (!isLocalRequest(req, [bridge.config.host])) throw notFound();
     const raw = await readBody(req);
     let body: unknown;
     try {
