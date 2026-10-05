@@ -817,24 +817,59 @@ export class TabBridge {
     return acct?.proxy ?? null;
   }
 
-  /** Fleet CLI: set/clear the account's network identity. */
-  fleetSetProxy(id: string, proxy: string | null): void {
+  /** Bug-hunt fix (C12): true once the account's identity is live — i.e.
+   * it has been launched at least once. Only live accounts require --force
+   * to change their network identity or surface. */
+  private isLiveAccount(id: string): boolean {
+    if (!this.fleet) return false;
+    const rec = this.fleet.accounts.record(id);
+    if (!rec) return false;
+    // awaiting_login = enrolled but the human hasn't logged in yet;
+    // unlinked = enrolled, no worker link. Neither has accumulated identity
+    // history, so a change is cheap and safe.
+    return rec.state !== "awaiting_login" && rec.state !== "unlinked";
+  }
+
+  /** Fleet CLI: set/clear the account's network identity. Changing a LIVE
+   * account requires `force` (C12: identity is stable for the account's
+   * life; a mid-life change is what a risk engine reads as a different
+   * person behind the same jar). */
+  fleetSetProxy(id: string, proxy: string | null, force = false): void {
     if (!this.fleet) {
       throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
     }
     if (!this.fleet.registry.byId(id)) {
       throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
+    }
+    if (this.isLiveAccount(id) && !force) {
+      throw new BridgeError({
+        status: 409,
+        code: "account_live",
+        message:
+          `account "${id}" is live — changing its network identity mid-life is an identity change (C12). ` +
+          `Pass --force to proceed, or create a new profile instead.`,
+      });
     }
     this.fleet.registry.setProxy(id, proxy);
   }
 
-  /** Fleet CLI: set/clear the account's presentation surface. */
-  fleetSetSurface(id: string, surface: SurfaceProfile | null): void {
+  /** Fleet CLI: set/clear the account's presentation surface. Same stability
+   * rule as fleetSetProxy (C12). */
+  fleetSetSurface(id: string, surface: SurfaceProfile | null, force = false): void {
     if (!this.fleet) {
       throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
     }
     if (!this.fleet.registry.byId(id)) {
       throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
+    }
+    if (this.isLiveAccount(id) && !force) {
+      throw new BridgeError({
+        status: 409,
+        code: "account_live",
+        message:
+          `account "${id}" is live — changing its surface mid-life is an identity change (C12). ` +
+          `Pass --force to proceed, or create a new profile instead.`,
+      });
     }
     this.fleet.registry.setSurface(id, surface);
   }
@@ -853,6 +888,14 @@ export class TabBridge {
           row.accountId = undefined;
           row.pendingReset = true;
         }
+      }
+      // Bug-hunt fix: reject any waiters queued on the account's gate. Without
+      // this, a session that was waiting for a slot on the removed account
+      // hangs until queue_timeout because no release will ever come.
+      try {
+        this.fleet.gate.cancelAccount(id, `account "${id}" was removed`);
+      } catch {
+        /* ignore */
       }
       // Drop the account's pool + adapters so a later re-enroll starts clean.
       try {
@@ -900,6 +943,15 @@ export class TabBridge {
     } else {
       if (!this.fleet.registry.byId(to)) {
         throw new BridgeError({ status: 404, code: "no_account", message: `no such target account: ${to}` });
+      }
+      // Bug-hunt fix: a drain onto the same account is a no-op that still
+      // re-binds every session — a pointless reseed storm. Refuse loudly.
+      if (to === fromId) {
+        throw new BridgeError({
+          status: 400,
+          code: "drain_self",
+          message: `cannot drain "${fromId}" onto itself — pick a different target (or omit --to for auto)`,
+        });
       }
       target = to;
     }

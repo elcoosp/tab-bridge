@@ -180,6 +180,21 @@ export class AccountTurnGate {
     return this.totalQueued();
   }
 
+  /** Bug-hunt fix: reject every waiter queued on `accountId` (used when the
+   * account is removed). Without this, a session queued on an account that
+   * no longer exists hangs until queue_timeout — the slot it waits for can
+   * never free because the account cannot serve it. */
+  cancelAccount(accountId: string, reason: string): void {
+    const q = this.queues.get(accountId);
+    if (!q || q.length === 0) return;
+    const snapshot = [...q];
+    for (const waiter of snapshot) {
+      this.settle(waiter, () => {
+        waiter.reject(new GateRejectionError("client_gone", 0, reason));
+      });
+    }
+  }
+
   stats(): Record<string, unknown> {
     return {
       disabled: this.disabled,

@@ -693,9 +693,20 @@ async function handleFleet(
   // the `fleet doctor` CLI can run an exit-IP probe through the actual
   // endpoint. Never returns the value in any other response, never logs it,
   // and never persists it expanded (ADR-10v2 hygiene): the raw value may
-  // contain ${VAR} references which the CLI expands through process.env
+  // contain env-var references which the CLI expands through process.env
   // before probing.
+  //
+  // Bug-hunt fix: require the request to originate on this machine. The
+  // endpoint is a debugging convenience — it should not be reachable from
+  // off-host even when the bridge runs without --api-key-env.
   if (method === "GET" && sub === "_debug_proxy") {
+    if (!isLocalRequest(req, [bridge.config.host])) {
+      throw new BridgeError({
+        status: 403,
+        code: "non_local",
+        message: "the debug proxy endpoint is loopback-only",
+      });
+    }
     const raw = bridge.fleetRawProxy(id);
     sendJson(res, 200, { proxy: raw });
     return;
@@ -713,9 +724,9 @@ async function handleFleet(
   }
   if (method === "POST" && sub === "proxy") {
     const raw = await readBody(req);
-    let body: { proxy?: unknown };
+    let body: { proxy?: unknown; force?: unknown };
     try {
-      body = JSON.parse(raw.toString("utf8") || "{}") as { proxy?: unknown };
+      body = JSON.parse(raw.toString("utf8") || "{}") as { proxy?: unknown; force?: unknown };
     } catch {
       throw badRequest("body is not valid JSON");
     }
@@ -723,15 +734,15 @@ async function handleFleet(
     if (value !== null && typeof value !== "string") {
       throw badRequest("proxy must be a string or null");
     }
-    bridge.fleetSetProxy(id, value as string | null);
+    bridge.fleetSetProxy(id, value as string | null, body.force === true);
     sendJson(res, 200, { ok: true });
     return;
   }
   if (method === "POST" && sub === "surface") {
     const raw = await readBody(req);
-    let body: { surface?: unknown };
+    let body: { surface?: unknown; force?: unknown };
     try {
-      body = JSON.parse(raw.toString("utf8") || "{}") as { surface?: unknown };
+      body = JSON.parse(raw.toString("utf8") || "{}") as { surface?: unknown; force?: unknown };
     } catch {
       throw badRequest("body is not valid JSON");
     }
@@ -739,7 +750,7 @@ async function handleFleet(
     if (value !== null && typeof value !== "object") {
       throw badRequest("surface must be an object or null");
     }
-    bridge.fleetSetSurface(id, (value ?? null) as never);
+    bridge.fleetSetSurface(id, (value ?? null) as never, body.force === true);
     sendJson(res, 200, { ok: true });
     return;
   }

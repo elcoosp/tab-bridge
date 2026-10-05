@@ -128,13 +128,27 @@ export class FleetRouter {
     });
   }
 
-  /** Tear down one account's link (account removal, shutdown). */
+  /** Tear down one account's link (account removal, shutdown). Bug-hunt fix:
+   * also delete the map entry so a re-enrollment cycle does not accumulate
+   * one WorkerPool per removed account forever. `pool(accountId)` recreates
+   * the entry lazily on the next HELLO. */
   detach(accountId: string, reason: string): void {
+    const existing = this.pools.get(accountId);
+    if (existing) {
+      existing.detach(reason);
+      this.pools.delete(accountId);
+      return;
+    }
+    // No pool for this id — still emit a detach on a throwaway so any
+    // listener that expected the call sees the same shape (no-op otherwise).
     this.pool(accountId).detach(reason);
+    this.pools.delete(accountId);
   }
 
   detachAll(reason: string): void {
-    for (const id of this.pools.keys()) this.detach(id, reason);
+    // Snapshot the keys: detach() mutates the map as it goes, and the
+    // iterator would otherwise be invalidated mid-loop.
+    for (const id of [...this.pools.keys()]) this.detach(id, reason);
   }
 }
 

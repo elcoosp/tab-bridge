@@ -30,6 +30,8 @@ import {
   type SurfaceProfile,
 } from "../src/fleet/registry.js";
 import { EnrollmentManager } from "../src/fleet/enroll.js";
+import { FleetRouter, type FleetEvent } from "../src/pool/fleet.js";
+import type { PoolConfig } from "../src/pool/pool.js";
 import { FleetLauncher, staggerDelayMs, type LaunchRequest } from "../src/fleet/launcher.js";
 
 // ---------------------------------------------------------------------------
@@ -476,4 +478,144 @@ test("group 14: isolationConflicts — same path flagged, credentials ignored, d
   assert.ok(isolationConflicts(envProxy, { UP: "10.0.0.1:1080" }).length > 0);
   // Unset env degrades to raw comparison (still equal → flagged)
   assert.ok(isolationConflicts(envProxy, {}).length > 0);
+});
+
+// ---------------------------------------------------------------------------
+// group 15: launcher — killOne kills exactly one child
+// ---------------------------------------------------------------------------
+test("group 15: launcher — killOne targets one account only", () => {
+  const launched: string[] = [];
+  const killed: string[] = [];
+  // Fake child that reports on .on / .kill; matching the surface launcher uses.
+  const makeChild = (accountId: string) => ({
+    pid: 1,
+    exitCode: null,
+    on: (_ev: string, _fn: (...a: unknown[]) => void) => {},
+    kill: (_sig: string) => { killed.push(accountId); },
+  });
+  const launcher = new FleetLauncher({
+    // Use the running node binary as a stub path: guaranteed to exist on
+    // every platform (macOS has no /bin/true) and never actually spawned —
+    // spawnFn below replaces it.
+    browserPath: process.execPath,
+    spawnFn: ((cmd: string, args: string[], _opts: unknown) => {
+      const dir = args.find((a) => a.startsWith("--user-data-dir=")) ?? "";
+      const id = dir.split("/").pop() ?? "unknown";
+      launched.push(id);
+      return makeChild(id) as unknown as import("node:child_process").ChildProcess;
+    }) as unknown as (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => import("node:child_process").ChildProcess,
+  });
+  launcher.launch({ accountId: "a", profileDir: "/p/a", extensionDir: "/e" });
+  launcher.launch({ accountId: "b", profileDir: "/p/b", extensionDir: "/e" });
+  assert.deepEqual(launched, ["a", "b"]);
+  assert.equal(launcher.killOne("a", "test"), true);
+  assert.deepEqual(killed, ["a"]);
+  // b is still launched; a is gone.
+  assert.equal(launcher.isLaunched("a"), false);
+  assert.equal(launcher.isLaunched("b"), true);
+  // Kill on unknown id returns false.
+  assert.equal(launcher.killOne("nonexistent", "test"), false);
+});
+
+// ---------------------------------------------------------------------------
+// group 16: launcher — spawnProbeTab propagates the surface TZ
+// ---------------------------------------------------------------------------
+test("group 16: launcher — spawnProbeTab propagates surface TZ to Chrome env", () => {
+  const observed: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
+  const launcher = new FleetLauncher({
+    // See group 15's note: process.execPath always exists.
+    browserPath: process.execPath,
+    spawnFn: ((_cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => {
+      observed.push({ args, env: opts.env });
+      return { pid: 1, on: () => {}, kill: () => {} } as unknown as import("node:child_process").ChildProcess;
+    }) as unknown as (cmd: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => import("node:child_process").ChildProcess,
+  });
+  // On non-Windows, TZ is set. On Windows it is ignored (matching launch()).
+  launcher.spawnProbeTab("/p/work", "http://127.0.0.1:8789/fleet-probe?id=work", "Europe/Berlin");
+  assert.equal(observed.length, 1);
+  if (process.platform !== "win32") {
+    assert.equal(observed[0].env.TZ, "Europe/Berlin");
+  }
+  assert.ok(observed[0].args.some((a) => a.startsWith("http://")));
+  assert.ok(observed[0].args.includes("--user-data-dir=/p/work"));
+  // Without a timezone, TZ is not injected.
+  launcher.spawnProbeTab("/p/personal", "http://127.0.0.1:8789/fleet-probe?id=personal");
+  assert.equal(observed.length, 2);
+  if (process.platform !== "win32") {
+    // TZ may be inherited from the process env; only assert it is NOT the
+    // surface one.
+    assert.notEqual(observed[1].env.TZ, "Europe/Berlin");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 17: AccountTurnGate — totalWaiting + cancelAccount
+// ---------------------------------------------------------------------------
+test("group 17: AccountTurnGate — totalWaiting reflects queued waiters; cancelAccount rejects them", async () => {
+  const gate = new AccountTurnGate({ perAccountConcurrent: 1, capacity: 8, queueTimeoutMs: 0 });
+  assert.equal(gate.totalWaiting(), 0);
+  await gate.acquire("a", "held");
+  const p1 = gate.acquire("a", "q1");
+  const p2 = gate.acquire("a", "q2");
+  assert.equal(gate.totalWaiting(), 2);
+  // Cancel account a's pending waiters — both must reject.
+  gate.cancelAccount("a", "test cancel");
+  await assert.rejects(p1, (e: unknown) => e instanceof GateRejectionError && e.code === "client_gone");
+  await assert.rejects(p2, (e: unknown) => e instanceof GateRejectionError && e.code === "client_gone");
+  assert.equal(gate.totalWaiting(), 0);
+  // Cancel on an empty account is a no-op.
+  gate.cancelAccount("b", "no waiters");
+  assert.equal(gate.totalWaiting(), 0);
+  // Release the held slot; no new admittances should happen (all waiters gone).
+  gate.release("a");
+  assert.equal(gate.activeOn("a"), 0);
+});
+
+// ---------------------------------------------------------------------------
+// group 18: FleetRouter.detach cleans the pool map
+// ---------------------------------------------------------------------------
+test("group 18: FleetRouter — detach deletes the pool from the map (no leak)", () => {
+  const calls: string[] = [];
+  const poolConfig: PoolConfig = {
+    autoCreateTabs: false,
+    managedOnly: true,
+    warmTabs: 0,
+    maxTabs: 4,
+    tabIdleCloseMs: 15 * 60_000,
+  };
+  const router = new FleetRouter(poolConfig, {
+    route: () => ({ kind: "route", accountId: "x" }),
+    onFleetEvent: (e: FleetEvent) => calls.push(e.type),
+  });
+  // pool() creates on demand.
+  router.pool("a");
+  router.pool("b");
+  assert.deepEqual(router.accountIds().sort(), ["a", "b"]);
+  router.detach("a", "test");
+  assert.deepEqual(router.accountIds(), ["b"]);
+  // Detaching an unknown id is safe (no leak of a throwaway).
+  router.detach("never-existed", "test");
+  assert.deepEqual(router.accountIds(), ["b"]);
+  // detachAll clears everything.
+  router.detachAll("test");
+  assert.deepEqual(router.accountIds(), []);
+});
+
+// ---------------------------------------------------------------------------
+// group 19: registry — duplicate id add throws (bug-hunt regression)
+// ---------------------------------------------------------------------------
+test("group 19: registry — duplicate id add throws a clear error", () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "fleet.json");
+    const reg = FleetRegistry.open(path, join(dir, "home"));
+    reg.add({ id: "work" });
+    assert.throws(() => reg.add({ id: "work" }), /already exists/);
+    // Removing then re-adding is allowed.
+    reg.remove("work");
+    reg.add({ id: "work" });
+    assert.equal(reg.byId("work")?.id, "work");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

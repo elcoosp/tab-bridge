@@ -263,9 +263,10 @@ export async function fleetMain(argv: string[]): Promise<void> {
       return;
 
     case "proxy": {
-      if (!id) throw new Error("usage: fleet proxy <id> <url|off>");
+      if (!id) throw new Error("usage: fleet proxy <id> <url|off> [--force]");
       const value = argv[3];
-      await post(`/v1/fleet/${id}/proxy`, { proxy: value === "off" ? null : value });
+      const force = argv.includes("--force");
+      await post(`/v1/fleet/${id}/proxy`, { proxy: value === "off" ? null : value, force });
       console.log(`  proxy:  "${id}" network identity updated (stored raw; expanded at launch)`);
       return;
     }
@@ -275,7 +276,7 @@ export async function fleetMain(argv: string[]): Promise<void> {
       const surface = parseSurfaceArgs(argv.slice(3));
       const force = argv.includes("--force");
       await post(`/v1/fleet/${id}/surface`, { surface, force });
-      console.log(`  surface: "${id}" presentation updated (C12: was this forced?)`);
+      console.log(`  surface: "${id}" presentation updated${force ? " (forced)" : ""}`);
       return;
     }
 
