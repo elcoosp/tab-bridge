@@ -748,15 +748,16 @@ async function handleFleet(
   }
   if (method === "POST" && sub === "drain") {
     const raw = await readBody(req);
-    let body: { to?: unknown };
+    let body: { to?: unknown; dryRun?: unknown };
     try {
-      body = JSON.parse(raw.toString("utf8") || "{}") as { to?: unknown };
+      body = JSON.parse(raw.toString("utf8") || "{}") as { to?: unknown; dryRun?: unknown };
     } catch {
       throw badRequest("body is not valid JSON");
     }
     const to = typeof body.to === "string" && body.to.length > 0 ? body.to : "auto";
-    const moved = bridge.fleetDrain(id, to);
-    sendJson(res, 200, { ok: true, moved, target: to });
+    const dryRun = body.dryRun === true;
+    const result = bridge.fleetDrain(id, to, dryRun);
+    sendJson(res, 200, { ok: true, ...result });
     return;
   }
   throw badRequest(`unknown fleet endpoint: ${method} ${url}`);

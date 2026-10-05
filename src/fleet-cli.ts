@@ -131,35 +131,10 @@ function parseSurfaceCsv(csv: string): SurfaceBody {
  * command line as a value the operator wrote; the endpoint is whatever
  * was stored in the fleet file (raw, possibly an env var expansion). */
 async function probeExitIp(proxy: string | null): Promise<string> {
-  const { spawn } = await import("node:child_process");
-  return new Promise((resolve) => {
-    let cmd: string;
-    let args: string[];
-    if (proxy) {
-      // curl --socks5-hostname <host:port> ... so DNS rides the tunnel too.
-      const m = /^(socks5|socks5h|http|https):\/\/(?:[^@]*@)?(.+)$/i.exec(proxy);
-      if (!m) return resolve("(unparseable)");
-      const scheme = m[1].toLowerCase();
-      const hostport = m[2];
-      const flag =
-        scheme === "http" || scheme === "https"
-          ? "--proxy"
-          : "--socks5-hostname";
-      cmd = "curl";
-      args = [flag, hostport, "--silent", "--max-time", "8", "https://api.ipify.org"];
-    } else {
-      cmd = "curl";
-      args = ["--silent", "--max-time", "8", "https://api.ipify.org"];
-    }
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"] });
-    let out = "";
-    child.stdout?.on("data", (b: Buffer) => (out += b.toString("utf8")));
-    child.on("error", () => resolve("(no curl)"));
-    child.on("close", () => {
-      const ip = out.trim();
-      resolve(ip.length > 0 ? ip : "(probe failed)");
-    });
-  });
+  const { probeExitIpNative } = await import("./fleet/netprobe.js");
+  const r = await probeExitIpNative(proxy);
+  if (r.ip) return r.ip;
+  return `(${r.status})`;
 }
 
 function fmtElapsed(ms: number): string {
@@ -294,6 +269,12 @@ export async function fleetMain(argv: string[]): Promise<void> {
 
     case "doctor": {
       const data = (await getJson("/v1/accounts")) as AccountsResponse;
+      // --json: machine-readable snapshot for dashboards; identical data to
+      // the human rendering below (accounts + capacity + isolation).
+      if (argv.includes("--json")) {
+        process.stdout.write(JSON.stringify(data, null, 2) + "\n");
+        return;
+      }
       console.log(`  fleet doctor — ${data.accounts.length} account(s)`);
       // Network paths (with optional exit-IP probe).
       const probe = !argv.includes("--no-probe");
@@ -352,12 +333,25 @@ export async function fleetMain(argv: string[]): Promise<void> {
     }
 
     case "drain": {
-      if (!id) throw new Error("usage: fleet drain <id> [--to <id|auto>] [-y]");
+      if (!id) throw new Error("usage: fleet drain <id> [--to <id|auto>] [--dry-run] [-y]");
       const target = getFlag(argv, "--to") ?? "auto";
-      console.log(`  draining "${id}" -> "${target}"`);
-      console.log(`  cost:  each moved session replays its full history on the target (one-time)`);
-      const out = (await post(`/v1/fleet/${id}/drain`, { to: target })) as { moved?: number };
-      console.log(`  done:  ${out.moved ?? 0} session(s) moved`);
+      const dryRun = argv.includes("--dry-run");
+      if (dryRun) {
+        console.log(`  drain (dry-run): "${id}" -> "${target}"`);
+      } else {
+        console.log(`  draining "${id}" -> "${target}"`);
+        console.log(`  cost:  each moved session replays its full history on the target (one-time)`);
+      }
+      const out = (await post(`/v1/fleet/${id}/drain`, { to: target, dryRun })) as {
+        moved?: number;
+        target?: string;
+        dryRun?: boolean;
+      };
+      if (dryRun) {
+        console.log(`  plan:  would move ${out.moved ?? 0} session(s) to "${out.target ?? target}"`);
+      } else {
+        console.log(`  done:  ${out.moved ?? 0} session(s) moved`);
+      }
       return;
     }
 

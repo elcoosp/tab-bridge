@@ -860,9 +860,15 @@ export class TabBridge {
     return removed;
   }
 
-  /** Fleet CLI: drain sessions off one account onto another (ADR-13v3 escape
-   * hatch). Returns the number of sessions moved. Operator-invoked only. */
-  fleetDrain(fromId: string, to: string | "auto"): number {
+  /** Fleet CLI: plan (dry-run) or execute a drain — move sessions off one
+   * account onto another (ADR-13v3 escape hatch). Returns the account that
+   * WOULD receive the sessions plus the count of sessions that WOULD move;
+   * when `dryRun` is false, performs the move. Operator-invoked only. */
+  fleetDrain(fromId: string, to: string | "auto", dryRun = false): {
+    moved: number;
+    target: string;
+    dryRun: boolean;
+  } {
     if (!this.fleet) {
       throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
     }
@@ -888,13 +894,17 @@ export class TabBridge {
     let moved = 0;
     for (const row of this.registry.list()) {
       if (row.accountId !== fromId) continue;
+      if (dryRun) {
+        moved += 1;
+        continue;
+      }
       this.fleet.accounts.noteSessionEnded(fromId);
       row.accountId = target;
       row.pendingReset = true; // force reseed on the target (ADR-13v3)
       this.fleet.accounts.noteSessionBound(target);
       moved += 1;
     }
-    return moved;
+    return { moved, target, dryRun };
   }
 
   health(): Record<string, unknown> {
