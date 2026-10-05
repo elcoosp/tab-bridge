@@ -526,7 +526,7 @@ echoes the effective configuration so drift is visible.
 | `--tab-idle-close` | `15m` | Close ready+unbound tabs idle beyond this; `0` = never |
 | `--worker-origin <origin>` | `chrome-extension://*` | Comma-separated allowed Origin values for the worker upgrade |
 | **Fleet** | | |
-| `--fleet-file <path>` | `fleet.json` | Fleet registry JSON. **Empty string disables the fleet** (byte-for-byte pre-v4 behavior) |
+| `--fleet-file <path>` | `fleet.json` | Fleet registry JSON. **Empty string disables the fleet** (byte-for-byte single-account behavior) |
 | `--fleet-root <dir>` | beside fleet file | Profile dir root |
 | `--fleet-launch <mode>` | `on-demand` | `on-demand` \| `always` \| `never` — when the bridge launches account browsers |
 | `--fleet-launch-stagger <dur>` | `45s` | Boot-phase window for `launchAll`; `0` disables (ADR-19) |
@@ -637,7 +637,7 @@ cannot prove is DOM behavior — that is Tier 2's job.
   server.
 - **One DeepSeek account is one capacity unit**: rate-limit windows and the
   concurrency cap are account-wide, so parallel human use shares the same budget.
-  The v4 fleet multiplies *slots* (N accounts × `perAccountTurns`), not availability —
+  The fleet multiplies *slots* (N accounts × `perAccountTurns`), not availability —
   a cooling account's sessions wait on that account; they do not hop.
 - **Two accounts on one machine are not made unlinkable.** The fleet removes every
   linkage it can reach (exit IP, language, timezone, window geometry, canvas hash,

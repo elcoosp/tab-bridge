@@ -1,7 +1,7 @@
 wr:
     watchexec -w ./wr.sh --clear -r "./wr.sh"
 
-# Single-account legacy mode: no --fleet-file, exactly the pre-v4 bridge.
+# Single-account mode: no --fleet-file, exactly the pre-fleet bridge.
 serve:
     TAB_BRIDGE_DEBUG=1 node dist/src/index.js serve --port 8789 \
       --api-key-env TAB_BRIDGE_KEY \
