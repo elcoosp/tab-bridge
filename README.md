@@ -42,6 +42,7 @@
 - [Configuration](#configuration)
 - [Reliability and Error Semantics](#reliability-and-error-semantics)
 - [Testing](#testing)
+- [Fleet runbook](docs/RUNBOOK.md)
 - [Project Status](#project-status)
 
 ---
