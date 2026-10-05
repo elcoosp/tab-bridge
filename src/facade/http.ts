@@ -736,6 +736,11 @@ async function handleFleet(
     sendJson(res, 200, { ok: true, removed });
     return;
   }
+  if (method === "GET" && sub === "checkup-history") {
+    const history = bridge.fleetCheckupHistory(id);
+    sendJson(res, 200, { ok: true, history });
+    return;
+  }
   if (method === "POST" && sub === "checkup") {
     const entry = await bridge.fleetCheckup(id);
     sendJson(res, 200, { ok: true, checkup: entry });

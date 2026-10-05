@@ -200,13 +200,45 @@ export async function fleetMain(argv: string[]): Promise<void> {
       console.log("  launch: browser window opening — log into the account in that window");
       const acct = await waitForReady(base, headers, id, 10 * 60_000);
       console.log(`  login:  ok — "${id}" is ready`);
-      // Compact checkup line: surface + network facts.
+      // Compact summary line: configured surface + network facts.
       const surfaceFacts = acct.surface && Object.keys(acct.surface).length > 0
         ? Object.entries(acct.surface).map(([k, v]) => `${k}=${String(v)}`).join(" ")
         : "(no surface profile set)";
       console.log(`  checkup: ${surfaceFacts}`);
       const proxyFacts = acct.network.proxy ? "proxied" : "(direct)";
       console.log(`  checkup: network ${proxyFacts}`);
+      // §6.1: with ≥2 accounts, run the fingerprint probe on the new
+      // profile so the operator sees the *measured* isolation, not just
+      // the configured surface. Best-effort: a probe that never returns
+      // (profile closed, bridge port unreachable from the tab) prints a
+      // one-line warning but does not fail the enrollment.
+      const listing = (await getJson("/v1/accounts")) as AccountsResponse;
+      if (listing.accounts.length >= 2) {
+        console.log("  probe:  measuring fingerprint in the new profile...");
+        try {
+          const res = await fetch(`${base}/v1/fleet/${id}/checkup`, {
+            method: "POST",
+            headers,
+            signal: AbortSignal.timeout(45_000),
+          });
+          if (!res.ok) {
+            console.log(`  probe:  (skipped: HTTP ${res.status})`);
+          } else {
+            const body = (await res.json()) as {
+              checkup: {
+                canvasHash: string; language: string; timezone: string;
+                innerWidth: number; innerHeight: number; exitIp: string | null;
+              };
+            };
+            const c = body.checkup;
+            console.log(
+              `  probe:  canvas ${c.canvasHash.slice(0, 8)}… · lang ${c.language} · tz ${c.timezone} · ${c.innerWidth}x${c.innerHeight} · exit ${c.exitIp ?? "(unknown)"}`
+            );
+          }
+        } catch (e) {
+          console.log(`  probe:  (skipped: ${(e as Error).message})`);
+        }
+      }
       return;
     }
 

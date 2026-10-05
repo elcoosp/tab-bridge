@@ -750,6 +750,13 @@ export class TabBridge {
     return { ok: true };
   }
 
+  /** §7.3: the recorded checkup history for one account, newest first. */
+  fleetCheckupHistory(id: string): CheckupEntry[] {
+    if (!this.fleet) return [];
+    const acct = this.fleet.registry.byId(id);
+    return acct?.checkupHistory ?? [];
+  }
+
   /** §7.3: run a fresh fingerprint checkup — open the probe page in a new
    * tab of the account's profile, wait up to timeoutMs for the result. */
   async fleetCheckup(id: string, timeoutMs = 30_000): Promise<CheckupEntry> {
