@@ -130,7 +130,12 @@ function parseSurfaceCsv(csv: string): SurfaceBody {
  * printable string (never throws). Credentials are never passed on the
  * command line as a value the operator wrote; the endpoint is whatever
  * was stored in the fleet file (raw, possibly an env var expansion). */
-async function probeExitIp(proxy: string | null): Promise<string> {
+async function probeExitIp(proxy: string | null | undefined): Promise<string> {
+  // Bug-hunt D5: `undefined` means 'we could not determine the account\'s
+  // endpoint' — do NOT fall through to a direct probe (that would return
+  // the operator\'s own IP and mislead the doctor). `null` means the account
+  // is explicitly direct; that is a legitimate same-host probe.
+  if (proxy === undefined) return "(unknown: no endpoint)";
   // Bug-hunt fix: expand env-var references against the CLI's own environment
   // BEFORE probing. The bridge stores proxies raw; without expansion the
   // native probe would try to dial a literal place-holder host.
@@ -299,9 +304,14 @@ export async function fleetMain(argv: string[]): Promise<void> {
         // direct, plus (when probing) the observed exit IP.
         let suffix = a.network.proxy ? "proxied" : "(direct) — shares the host uplink";
         if (probe && a.network.proxy) {
-          const ip = await probeExitIp(await fetchRawProxy(base, headers, a.id));
+          // fetchRawProxy returns null on 403/404/network failure. Convert
+          // that to `undefined` so the probe tells the operator "unknown"
+          // instead of "the operator's own IP" (bug-hunt D5).
+          const raw = await fetchRawProxy(base, headers, a.id);
+          const ip = await probeExitIp(raw ?? undefined);
           suffix += ` · exit ${ip}`;
         } else if (probe && !a.network.proxy) {
+          // Explicitly direct: a genuine same-host probe is meaningful here.
           const ip = await probeExitIp(null);
           suffix += ` · exit ${ip}`;
         }

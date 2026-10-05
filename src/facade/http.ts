@@ -100,9 +100,11 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers?: 
  * accept loopback plus any explicitly configured bind host. */
 function isLocalRequest(req: IncomingMessage, extraHosts: string[] = []): boolean {
   const a = req.socket.remoteAddress ?? "";
-  if (a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1") return true;
-  // `a` may carry the IPv4-mapped IPv6 prefix when the server listens on ::
+  // Bug-hunt D10: the whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+  // Some stacks also use ::1 and the IPv4-mapped IPv6 form.
   const bare = a.startsWith("::ffff:") ? a.slice(7) : a;
+  if (bare === "::1") return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) return true;
   for (const h of extraHosts) {
     if (!h || h === "0.0.0.0" || h === "::") continue;
     if (bare === h) return true;

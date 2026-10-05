@@ -28,6 +28,15 @@ import { existsSync } from "node:fs";
 import { randomId } from "./util/async.js";
 import { log } from "./log.js";
 
+/** Bug-hunt D12: strip userinfo from a proxy URL, keeping scheme + host:port.
+ * Returns the input unchanged when it has no userinfo or is a ${VAR}-form
+ * reference whose host is unknowable until launch — those are safe because
+ * they name an environment variable, not a credential. */
+function stripProxyCredentials(proxy: string): string {
+  if (proxy.includes("${")) return proxy;
+  return proxy.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]+@/i, "$1");
+}
+
 export const MODEL_CHAT = "deepseek-web-chat";
 export const MODEL_THINK = "deepseek-web-think";
 export const MODELS = [MODEL_CHAT, MODEL_THINK];
@@ -804,7 +813,14 @@ export class TabBridge {
     }
     // Token: random hex, unique per invocation.
     const token = `probe-${randomId(24)}`;
-    const host = this.config.host === "0.0.0.0" ? "127.0.0.1" : this.config.host;
+    // Bug-hunt D3: ALWAYS use 127.0.0.1 for the probe URL. The probe tab
+    // runs in the account's own Chrome, whose --proxy-server would route
+    // any other address through the exit proxy — so binding to e.g.
+    // 10.0.0.5 or 192.168.x.y would silently break every checkup (the tab
+    // cannot reach the bridge through the proxy). Loopback is always
+    // reachable from the local browser and rides the OS routing table,
+    // not the proxy.
+    const host = "127.0.0.1";
     const url =
       `http://${host}:${this.config.port}${PROBE_PATH}` +
       `?id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}`;
@@ -841,11 +857,19 @@ export class TabBridge {
   /** Fleet CLI: raw (unexpanded) proxy string for the doctor probe.
    * Never logged, never surfaced in /v1/accounts, never expanded here —
    * the caller is responsible for expanding ${VAR} against its own
-   * environment (fail-closed). Returns null when the account has no proxy. */
+   * environment (fail-closed). Returns null when the account has no proxy.
+   *
+   * Bug-hunt D12: strip any credentials embedded in the endpoint before
+   * returning. _debug_proxy is loopback-only, but on a host with a shared
+   * user account (or a browser XSS on another tab in the same profile)
+   * that still means any local process can read it. The CLI needs only
+   * the transport address for its exit-IP probe; the credentials belong
+   * to the operator's environment and never leave it. */
   fleetRawProxy(id: string): string | null {
     if (!this.fleet) return null;
     const acct = this.fleet.registry.byId(id);
-    return acct?.proxy ?? null;
+    if (!acct?.proxy) return null;
+    return stripProxyCredentials(acct.proxy);
   }
 
   /** Bug-hunt fix (C12): true once the account's identity is live — i.e.
@@ -913,11 +937,25 @@ export class TabBridge {
     const removed = this.fleet.registry.remove(id);
     if (removed) {
       // Release any sessions still bound to it so we do not leak counters.
+      // Bug-hunt D2: ALSO compact the journal after clearing row.accountId,
+      // so a restart does not resurrect a session pinned to a removed
+      // account. Without this, the next boot's `restore()` reads the stale
+      // accountId and pre-flight fails (or worse — placement sees ready
+      // accounts and tries to route with a ghost id).
+      let clearedAny = false;
       for (const row of this.registry.list()) {
         if (row.accountId === id) {
           this.fleet.accounts.noteSessionEnded(id);
           row.accountId = undefined;
           row.pendingReset = true;
+          clearedAny = true;
+        }
+      }
+      if (clearedAny) {
+        try {
+          this.registry.persistCompact();
+        } catch {
+          /* best effort */
         }
       }
       // Bug-hunt fix: reject any waiters queued on the account's gate. Without
@@ -981,15 +1019,39 @@ export class TabBridge {
     this.drainInFlight = true;
     let target: string;
     if (to === "auto") {
-      const placed = this.fleet.accounts.placeSession();
-      if (!placed.ok) {
+      // Bug-hunt D1: auto-pick must never choose the source account.
+      // placeSession() is a general-purpose helper with no notion of "not
+      // this account"; if fromId happens to be least-loaded it would
+      // return fromId itself, rebinding every session onto the same
+      // account (a pointless reseed storm). Loop by temporarily removing
+      // the source from consideration: call placeSession repeatedly via
+      // a snapshot of the registry minus `fromId`, falling back to the
+      // explicit refusal the manual path uses.
+      const source = this.fleet.registry.byId(fromId);
+      let chosen: string | null = null;
+      if (source) {
+        // Temporarily remove fromId from placement by clearing its record
+        // state to `unlinked`, restoring it in the finally below. This is
+        // the cheapest way to reuse the existing placement logic without
+        // adding a filter parameter.
+        const rec = this.fleet.accounts.record(fromId);
+        const savedState = rec?.state;
+        if (rec) rec.state = "unlinked";
+        try {
+          const placed = this.fleet.accounts.placeSession();
+          if (placed.ok) chosen = placed.accountId;
+        } finally {
+          if (rec && savedState !== undefined) rec.state = savedState;
+        }
+      }
+      if (chosen === null) {
         throw new BridgeError({
           status: 503,
           code: "fleet_busy",
-          message: "no target account available for drain",
+          message: "no target account available for drain (excluding the source)",
         });
       }
-      target = placed.accountId;
+      target = chosen;
     } else {
       if (!this.fleet.registry.byId(to)) {
         throw new BridgeError({ status: 404, code: "no_account", message: `no such target account: ${to}` });

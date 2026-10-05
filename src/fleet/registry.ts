@@ -175,12 +175,37 @@ export class FleetRegistry {
 
   /** ADR-17: set/clear the account's network identity. Stored raw —
    * ${VAR} references are expanded only at launch (never persisted
-   * expanded), so authenticated proxy URLs do not rest in the file. */
+   * expanded), so authenticated proxy URLs do not rest in the file.
+   *
+   * Bug-hunt D6: validate the endpoint shape at set time. A typo like
+   * "banana" would otherwise be handed to Chrome as `--proxy-server=banana`,
+   * which either refuses to launch or silently routes direct — an identity
+   * leak from the operator's point of view. ${VAR}-bearing values are
+   * allowed through (their shape is unknowable until expansion). */
   setProxy(id: string, proxy: string | null): FleetAccount {
     const acct = this.accounts.get(id);
     if (!acct) throw new Error(`no such account: ${id}`);
-    if (proxy === null) delete acct.proxy;
-    else acct.proxy = proxy;
+    if (proxy === null) {
+      delete acct.proxy;
+    } else {
+      if (proxy.includes("${")) {
+        // Env-ref form: shape is unknowable until launch; accept.
+      } else {
+        // Require EITHER scheme://host[:port] with a known proxy scheme,
+        // OR host:port (no scheme). A bare word like "banana" is neither
+        // and gets refused — it would otherwise be handed to Chrome as
+        // `--proxy-server=banana` and silently route direct.
+        const trimmed = proxy.trim();
+        const withScheme = /^(?:http|https|socks4|socks4a|socks5|socks5h):\/\/(?:[^@/\s]+@)?[A-Za-z0-9._-]+(?::\d{1,5})?$/i.test(trimmed);
+        const hostPort = /^(?:[^@/\s]+@)?[A-Za-z0-9._-]+:\d{1,5}$/.test(trimmed);
+        if (!withScheme && !hostPort) {
+          throw new Error(
+            `invalid proxy endpoint: ${proxy} (expected scheme://host:port or host:port with known scheme http|https|socks4|socks4a|socks5|socks5h; use \${VAR} for authenticated upstreams)`
+          );
+        }
+      }
+      acct.proxy = proxy;
+    }
     this.persist();
     return acct;
   }

@@ -99,6 +99,8 @@ export class WorkerPool extends EventEmitter {
           /* ignore */
         }
       }, 5000);
+      // Bug-hunt D7: unref so a stuck upgrade does not delay shutdown.
+      guard.unref?.();
       conn.once("message", (raw: string) => {
         clearTimeout(guard);
         let instance = "unknown";

@@ -59,18 +59,46 @@ export interface CheckupEntry {
   exitIp: string | null;
 }
 
+/** Bug-hunt D4: bound every string field to a sane length so a malicious
+ * local process cannot POST a multi-megabyte value and bloat the
+ * checkupHistory inside fleet.json. 256 chars is generous for a canvas
+ * hash (16 hex), a locale tag, an IANA timezone, an IPv6 literal, or a
+ * WebGL renderer string. */
+const PROBE_STR_MAX = 256;
+function boundStr(s: unknown, max = PROBE_STR_MAX): string | null {
+  if (typeof s !== "string") return null;
+  return s.length > max ? s.slice(0, max) : s;
+}
+
 export function probeResultToEntry(p: ProbeResult): CheckupEntry {
+  const canvasHash = boundStr(p.canvasHash);
+  const language = boundStr(p.language);
+  const timezone = boundStr(p.timezone);
+  const gpu = boundStr(p.gpuRenderer);
+  const exit = boundStr(p.exitIp);
   return {
-    at: typeof p.at === "number" ? p.at : Date.now(),
-    canvasHash: typeof p.canvasHash === "string" ? p.canvasHash : "",
-    language: typeof p.language === "string" ? p.language : "",
-    timezone: typeof p.timezone === "string" ? p.timezone : "",
-    timezoneOffsetMin: typeof p.timezoneOffsetMin === "number" ? p.timezoneOffsetMin : 0,
-    innerWidth: typeof p.innerWidth === "number" ? p.innerWidth : 0,
-    innerHeight: typeof p.innerHeight === "number" ? p.innerHeight : 0,
-    devicePixelRatio: typeof p.devicePixelRatio === "number" ? p.devicePixelRatio : 1,
-    gpuRenderer: typeof p.gpuRenderer === "string" ? p.gpuRenderer : null,
-    exitIp: typeof p.exitIp === "string" ? p.exitIp : null,
+    at: typeof p.at === "number" && Number.isFinite(p.at) ? p.at : Date.now(),
+    canvasHash: canvasHash ?? "",
+    language: language ?? "",
+    timezone: timezone ?? "",
+    timezoneOffsetMin:
+      typeof p.timezoneOffsetMin === "number" && Number.isFinite(p.timezoneOffsetMin)
+        ? Math.max(-24 * 60, Math.min(24 * 60, Math.trunc(p.timezoneOffsetMin)))
+        : 0,
+    innerWidth:
+      typeof p.innerWidth === "number" && Number.isFinite(p.innerWidth)
+        ? Math.max(0, Math.min(100_000, Math.trunc(p.innerWidth)))
+        : 0,
+    innerHeight:
+      typeof p.innerHeight === "number" && Number.isFinite(p.innerHeight)
+        ? Math.max(0, Math.min(100_000, Math.trunc(p.innerHeight)))
+        : 0,
+    devicePixelRatio:
+      typeof p.devicePixelRatio === "number" && Number.isFinite(p.devicePixelRatio)
+        ? Math.max(0, Math.min(100, p.devicePixelRatio))
+        : 1,
+    gpuRenderer: gpu,
+    exitIp: exit,
   };
 }
 
