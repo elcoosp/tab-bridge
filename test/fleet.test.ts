@@ -13,7 +13,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, chmodSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -32,6 +32,7 @@ import {
 import { EnrollmentManager } from "../src/fleet/enroll.js";
 import { FleetRouter, type FleetEvent } from "../src/pool/fleet.js";
 import type { PoolConfig } from "../src/pool/pool.js";
+import { SseStream } from "../src/facade/sse.js";
 import { FleetLauncher, staggerDelayMs, type LaunchRequest } from "../src/fleet/launcher.js";
 
 // ---------------------------------------------------------------------------
@@ -668,4 +669,121 @@ test("group 20: FleetRouter — isKnownAccount refuses unknown route target", ()
   router2.attach(conn2 as never);
   conn2.fire("message", JSON.stringify({ t: "HELLO", v: 1, ext: "x", instance: "i-2" }));
   assert.ok(accepted > 0, "known account must accept the connection");
+});
+
+// ---------------------------------------------------------------------------
+// group 21: SSE sendMeta before any frame keeps SSE headers (C10)
+// ---------------------------------------------------------------------------
+test("group 21: SseStream — sendMeta starts the stream with correct headers", () => {
+  const headers: Array<{ status: number; hdrs: Record<string, string> }> = [];
+  const writes: string[] = [];
+  const res = {
+    destroyed: false,
+    writableEnded: false,
+    writeHead(status: number, hdrs: Record<string, string>) {
+      headers.push({ status, hdrs });
+      return this;
+    },
+    flushHeaders() {},
+    write(s: string) { writes.push(s); return true; },
+    end() { this.writableEnded = true; },
+  };
+  const sse = new SseStream(res as never);
+  sse.sendMeta({ "x-fleet-account": "work" }, "deepseek-web-chat");
+  assert.equal(headers.length, 1, "sendMeta must call start() so headers land once");
+  assert.match(headers[0].hdrs["content-type"], /text\/event-stream/);
+  assert.equal(headers[0].hdrs["x-bridge-model"], "deepseek-web-chat");
+  assert.ok(writes.some((w) => w.startsWith(": meta ")));
+  sse.sendChoice(
+    { delta: { role: "assistant", content: "" }, finish_reason: null },
+    "deepseek-web-chat",
+    "id",
+    0
+  );
+  assert.equal(headers.length, 1, "headers must be sent exactly once");
+});
+
+// ---------------------------------------------------------------------------
+// group 22: parseDuration accepts bare "0" (C18)
+// ---------------------------------------------------------------------------
+test("group 22: parseDuration — bare 0 means zero ms", () => {
+  // Local import so the test is self-contained.
+  const cfgPath = new URL("../src/config.js", import.meta.url).href;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return import(cfgPath).then((m) => {
+    const parseDuration = (m as { parseDuration: (s: string) => number }).parseDuration;
+    assert.equal(parseDuration("0"), 0);
+    assert.equal(parseDuration("0ms"), 0);
+    assert.equal(parseDuration("5s"), 5000);
+    assert.throws(() => parseDuration("nonsense"), /invalid duration/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// group 23: registry — persist produces no leftover tmp files (C2)
+// ---------------------------------------------------------------------------
+test("group 23: registry — persist leaves no tmp file behind", () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "fleet.json");
+    const reg = FleetRegistry.open(path, join(dir, "home"));
+    reg.add({ id: "a" });
+    reg.setProxy("a", "socks5://127.0.0.1:1080");
+    reg.add({ id: "b" });
+    reg.setSurface("b", { locale: "de-DE" });
+    const reg2 = FleetRegistry.open(path, join(dir, "home"));
+    assert.equal(reg2.byId("a")?.proxy, "socks5://127.0.0.1:1080");
+    assert.deepEqual(reg2.byId("b")?.surface, { locale: "de-DE" });
+    // No leftover tmp files in the dir.
+    const entries = readdirSync(dir) as string[];
+    assert.equal(entries.filter((f) => f.includes(".tmp-")).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 24: registry — idempotent setProxy / setSurface calls
+// ---------------------------------------------------------------------------
+test("group 24: registry — setProxy/setSurface are safe to call with same value", () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "fleet.json");
+    const reg = FleetRegistry.open(path, join(dir, "home"));
+    reg.add({ id: "a" });
+    reg.setProxy("a", "socks5://127.0.0.1:1080");
+    reg.setProxy("a", "socks5://127.0.0.1:1080");
+    const reg2 = FleetRegistry.open(path, join(dir, "home"));
+    assert.equal(reg2.byId("a")?.proxy, "socks5://127.0.0.1:1080");
+    reg.setProxy("a", null);
+    const reg3 = FleetRegistry.open(path, join(dir, "home"));
+    assert.equal(reg3.byId("a")?.proxy, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// group 25: DeepSeekAdapter exposes detachPool (C11)
+// ---------------------------------------------------------------------------
+test("group 25: DeepSeekAdapter exposes detachPool()", async () => {
+  const { DeepSeekAdapter } = await import("../src/adapter/deepseek.js");
+  const listeners: Array<(...a: unknown[]) => void> = [];
+  const fakePool = {
+    on(_ev: string, fn: (...a: unknown[]) => void) { listeners.push(fn); },
+    off(_ev: string, fn: (...a: unknown[]) => void) {
+      const i = listeners.indexOf(fn);
+      if (i >= 0) listeners.splice(i, 1);
+    },
+    ping: async () => [],
+    sendTurnIntent: async () => {},
+    resetIntent: async () => "ok",
+    release: async () => {},
+    abortIntent: () => {},
+  };
+  const adapter = new DeepSeekAdapter(fakePool as never);
+  assert.equal(typeof (adapter as unknown as { detachPool?: () => void }).detachPool, "function");
+  assert.equal(listeners.length, 1, "constructor registers one 'raw' listener");
+  (adapter as unknown as { detachPool: () => void }).detachPool();
+  assert.equal(listeners.length, 0, "detachPool removes the listener");
 });

@@ -53,12 +53,21 @@ export class SseStream {
     this.res.flushHeaders?.();
   }
 
-  /** v4 §10.3: emit a metadata prelude as an SSE comment frame
-   * (universal compatibility — every OpenAI-compatible SSE client
-   * ignores comment lines). Used to advertise X-Fleet-Account as early
-   * as possible without requiring clients to parse extra data frames. */
-  sendMeta(fields: Record<string, unknown>): void {
+  /** §10.3: emit a metadata prelude as an SSE comment frame (universal
+   * compatibility — every OpenAI-compatible SSE client ignores comment
+   * lines). Used to advertise X-Fleet-Account as early as possible without
+   * requiring clients to parse extra data frames.
+   *
+   * Bug-hunt C10: MUST call start() first. Node's ServerResponse.write()
+   * implicitly flushes headers on the first write with the DEFAULT header
+   * set — so a comment frame written before start() would lock in the
+   * wrong content-type, and the subsequent start()'s writeHead() would
+   * throw ERR_HTTP_HEADERS_SENT, breaking the entire SSE response.
+   * Taking the model name lets us call start() safely here (the header
+   * value only appears in the response headers, not in the comment). */
+  sendMeta(fields: Record<string, unknown>, model: string): void {
     if (this.clientGone) return;
+    this.start(model);
     try {
       this.res.write(`: meta ${JSON.stringify(fields)}\n\n`);
     } catch {

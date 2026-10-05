@@ -121,7 +121,9 @@ export class FleetRegistry {
     const body =
       JSON.stringify({ v: FLEET_FILE_VERSION, accounts: [...this.accounts.values()] } satisfies FleetFile, null, 2) +
       "\n";
-    const tmp = `${this.path}.tmp-${process.pid}`;
+    // Bug-hunt C2: append a short random suffix to the tmp file name so two
+    // (rare) interleaved persists cannot race on the same tmp path.
+    const tmp = `${this.path}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
     mkdirSync(dirname(this.path) || ".", { recursive: true });
     const fh = openSync(tmp, "w", 0o600);
     try {

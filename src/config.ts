@@ -102,7 +102,11 @@ export const DEFAULTS: Config = {
 };
 
 export function parseDuration(s: string): number {
-  const m = /^(\d+)(ms|s|m|h)$/.exec(s.trim());
+  // Bug-hunt C18: a bare "0" is a common way to mean "disabled". Accept it
+  // as zero milliseconds so duration flags parse without needing "0ms".
+  const trimmed = s.trim();
+  if (trimmed === "0") return 0;
+  const m = /^(\d+)(ms|s|m|h)$/.exec(trimmed);
   if (!m) throw new Error(`invalid duration: ${s}`);
   const n = Number(m[1]);
   switch (m[2]) {

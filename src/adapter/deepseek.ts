@@ -48,12 +48,21 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
   /** reqId of the SEND issued by the last sendTurn, per tab. */
   private pendingByTab = new Map<number, string>();
 
+  /** Bug-hunt C11: the pool listener registered in the constructor is
+   * remembered so `dispose()` can remove it. Without this, removing a
+   * fleet account leaves the adapter subscribed forever — it keeps
+   * dispatching into a stale buffer map, and it holds a strong reference
+   * to the (soon-detached) WorkerPool. */
+  private readonly poolListener: (o: WorkerObservation) => void;
+
   constructor(pool: WorkerPool, caps?: Partial<AdapterCapabilities>) {
     this.pool = pool;
     this.caps = { ...DEFAULT_CAPS, ...caps };
     // Permanent dispatch: observations land in per-reqId buffers whether or
-    // not a consumer has attached yet.
-    this.pool.on("raw", (o: WorkerObservation) => this.dispatch(o));
+    // not a consumer has attached yet. Stored as a field so dispose() can
+    // unsubscribe.
+    this.poolListener = (o: WorkerObservation) => this.dispatch(o);
+    this.pool.on("raw", this.poolListener);
   }
 
   private dispatch(o: WorkerObservation): void {
@@ -297,6 +306,17 @@ export class DeepSeekAdapter implements ChatProviderAdapter {
     } catch {
       return { state: "degraded", detail: "ping-failed" };
     }
+  }
+
+  /** Bug-hunt C11: unsubscribe the pool listener. Fleet callers invoke this
+   * on account removal (see bridge.fleetRemove → adaptersByAccount.delete
+   * path); the adapter's own dispose(tab) below also calls into it. A
+   * separate detachPool() is exposed because the caller may not have a
+   * tab to hand dispose(). */
+  detachPool(): void {
+    this.pool.off("raw", this.poolListener);
+    this.buffers.clear();
+    this.pendingByTab.clear();
   }
 
   async dispose(tab: ManagedTab): Promise<void> {

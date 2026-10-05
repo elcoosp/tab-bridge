@@ -447,7 +447,9 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
       // v4 §10.3: SSE comment frame carrying X-Fleet-Account as soon as
       // the account is known — universal-compatibility metadata channel.
       onAccount: (accountId: string) => {
-        sse.sendMeta({ "x-fleet-account": accountId });
+        // Pass the model so sendMeta can start() the stream with the
+        // correct SSE headers BEFORE writing the comment frame (C10).
+        sse.sendMeta({ "x-fleet-account": accountId }, model);
       },
       onContent: (text: string) => {
         // P6: a client that has gone away cannot read the stream — stop
@@ -680,12 +682,27 @@ async function handleFleet(
       body.surface !== null && typeof body.surface === "object"
         ? (body.surface as Record<string, unknown>)
         : undefined;
-    const result = bridge.fleetEnroll({
-      id,
-      ...(readString(body.label) !== undefined ? { label: readString(body.label)! } : {}),
-      ...(readString(body.proxy) !== undefined ? { proxy: readString(body.proxy)! } : {}),
-      ...(surface !== undefined ? { surface: surface as never } : {}),
-    });
+    let result: { id: string };
+    try {
+      result = bridge.fleetEnroll({
+        id,
+        ...(readString(body.label) !== undefined ? { label: readString(body.label)! } : {}),
+        ...(readString(body.proxy) !== undefined ? { proxy: readString(body.proxy)! } : {}),
+        ...(surface !== undefined ? { surface: surface as never } : {}),
+      });
+    } catch (e) {
+      // Bug-hunt C19: enrollment conflicts are caller errors, not 500s.
+      // Translate the EnrollmentManager's generic Errors into a typed 409.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/enrollment already open|already exists/.test(msg)) {
+        throw new BridgeError({
+          status: 409,
+          code: "enroll_conflict",
+          message: msg,
+        });
+      }
+      throw e;
+    }
     sendJson(res, 201, { ok: true, accountId: result.id });
     return;
   }

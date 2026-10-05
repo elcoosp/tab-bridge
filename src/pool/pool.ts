@@ -173,7 +173,13 @@ export class WorkerPool extends EventEmitter {
   startHeartbeat(intervalMs = 25_000, staleAfterMs = 75_000): void {
     this.stopHeartbeat();
     this.lastPongAt = Date.now();
-    this.heartbeatTimer = setInterval(() => {
+    // Bug-hunt: unref the heartbeat interval so it cannot keep the Node
+    // process alive by itself. Its job is to detect a half-open socket on a
+    // live conn — a stale timer on a detached pool has nothing to do and
+    // must not delay shutdown. (This manifested as a ~75 s hang at the end
+    // of the fleet test suite when a FleetRouter pool was created and left
+    // unattached.)
+    const timer = setInterval(() => {
       const conn = this.conn;
       if (!conn || !conn.isOpen) return;
       if (Date.now() - this.lastPongAt > staleAfterMs) {
@@ -187,6 +193,8 @@ export class WorkerPool extends EventEmitter {
         /* send failure surfaces via the socket close path */
       }
     }, intervalMs);
+    timer.unref?.();
+    this.heartbeatTimer = timer;
   }
 
   stopHeartbeat(): void {

@@ -97,6 +97,13 @@ export class TabBridge {
    * turn is routed to an account. The default `this.adapter` is used for the
    * legacy (fleet-disabled) path so existing deployments are untouched. */
   private readonly adaptersByAccount = new Map<string, ChatProviderAdapter>();
+  /** Bug-hunt C1: at most one in-flight checkup per account. Opening two
+   * probe tabs concurrently used to orphan the second promise (its token
+   * was claimed by the first POST) AND pile up probe tabs in the profile. */
+  private readonly checkupInFlight = new Map<string, string>();
+  /** Bug-hunt C5: only one drain runs at a time. Two concurrent drains on
+   * the same source would double-move the same session rows. */
+  private drainInFlight = false;
   /** Pending probe invocations, keyed by token. Resolved when the probe
    * page POSTs back; timed out by an internal timer. */
   private readonly probeWaiters = new Map<string, {
@@ -373,6 +380,7 @@ export class TabBridge {
     }
     let gateHeld = false;
     let usedFleetGate = false;
+    let turnStarted = false;
     let onClientAbortRef: (() => void) | null = null;
     try {
       // Fleet turns ride the per-account FIFO gate (ADR-12v3); legacy turns
@@ -387,7 +395,10 @@ export class TabBridge {
         }
         gateHeld = true;
         usedFleetGate = true;
+        // Bug-hunt C3: mark the start so the finally block only calls
+        // noteTurnEnd when noteTurnStart actually ran.
         this.fleet!.accounts.noteTurnStart(row.accountId);
+        turnStarted = true;
       } else {
         gateWaitMs = await this.turnGate.acquire(row.sessionId, params.signal);
         gateHeld = true;
@@ -462,7 +473,7 @@ export class TabBridge {
       }
       if (gateHeld) {
         if (usedFleetGate && row.accountId !== undefined) {
-          this.fleet!.accounts.noteTurnEnd(row.accountId);
+          if (turnStarted) this.fleet!.accounts.noteTurnEnd(row.accountId);
           this.fleet!.gate.release(row.accountId);
         } else {
           this.turnGate.release();
@@ -783,6 +794,14 @@ export class TabBridge {
     if (!acct) {
       throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
     }
+    // Bug-hunt C1: one in-flight checkup per account.
+    if (this.checkupInFlight.has(id)) {
+      throw new BridgeError({
+        status: 409,
+        code: "checkup_in_flight",
+        message: `a checkup for "${id}" is already running — wait for it to finish`,
+      });
+    }
     // Token: random hex, unique per invocation.
     const token = `probe-${randomId(24)}`;
     const host = this.config.host === "0.0.0.0" ? "127.0.0.1" : this.config.host;
@@ -791,9 +810,14 @@ export class TabBridge {
       `?id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}`;
     // Register the waiter BEFORE spawning: the probe page can POST back
     // within milliseconds of the tab opening.
+    const self = this;
+    const cleanup = (): void => {
+      self.checkupInFlight.delete(id);
+    };
     const promise = new Promise<CheckupEntry>((settle, reject) => {
       const timer = setTimeout(() => {
         this.probeWaiters.delete(token);
+        cleanup();
         reject(
           new Error(
             `fingerprint probe for "${id}" did not return within ${timeoutMs}ms ` +
@@ -802,8 +826,11 @@ export class TabBridge {
         );
       }, timeoutMs);
       timer.unref?.();
-      this.probeWaiters.set(token, { accountId: id, settle, reject, timer });
+      const wrappedSettle = (r: CheckupEntry): void => { cleanup(); settle(r); };
+      const wrappedReject = (e: Error): void => { cleanup(); reject(e); };
+      this.probeWaiters.set(token, { accountId: id, settle: wrappedSettle, reject: wrappedReject, timer });
     });
+    this.checkupInFlight.set(id, token);
     // Bug-hunt fix: pass the account's surface timezone so the probe measures
     // the SAME TZ the account's real Chrome presents.
     const tz = acct.surface?.timezone;
@@ -901,13 +928,24 @@ export class TabBridge {
       } catch {
         /* ignore */
       }
-      // Drop the account's pool + adapters so a later re-enroll starts clean.
+      // Bug-hunt C11: detach the adapter's pool listener BEFORE dropping the
+      // pool so it does not keep dispatching into a stale buffer map or hold
+      // a strong reference to the soon-detached WorkerPool.
+      const staleAdapter = this.adaptersByAccount.get(id) as
+        | (ChatProviderAdapter & { detachPool?: () => void })
+        | undefined;
+      try {
+        staleAdapter?.detachPool?.();
+      } catch {
+        /* ignore */
+      }
+      this.adaptersByAccount.delete(id);
+      // Drop the account's pool so a later re-enroll starts clean.
       try {
         this.fleet.router.detach(id, `removed:${id}`);
       } catch {
         /* ignore */
       }
-      this.adaptersByAccount.delete(id);
       // Bug-hunt fix: kill ONLY this account's Chrome. The previous call to
       // killAll() took down every other running profile too.
       try {
@@ -931,8 +969,16 @@ export class TabBridge {
     if (!this.fleet) {
       throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
     }
+    if (this.drainInFlight) {
+      throw new BridgeError({
+        status: 409,
+        code: "drain_in_flight",
+        message: "another drain is already running — drains are serialized",
+      });
+    }
     const from = this.fleet.registry.byId(fromId);
     if (!from) throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${fromId}` });
+    this.drainInFlight = true;
     let target: string;
     if (to === "auto") {
       const placed = this.fleet.accounts.placeSession();
@@ -959,20 +1005,24 @@ export class TabBridge {
       }
       target = to;
     }
-    let moved = 0;
-    for (const row of this.registry.list()) {
-      if (row.accountId !== fromId) continue;
-      if (dryRun) {
+    try {
+      let moved = 0;
+      for (const row of this.registry.list()) {
+        if (row.accountId !== fromId) continue;
+        if (dryRun) {
+          moved += 1;
+          continue;
+        }
+        this.fleet.accounts.noteSessionEnded(fromId);
+        row.accountId = target;
+        row.pendingReset = true; // force reseed on the target (ADR-13v3)
+        this.fleet.accounts.noteSessionBound(target);
         moved += 1;
-        continue;
       }
-      this.fleet.accounts.noteSessionEnded(fromId);
-      row.accountId = target;
-      row.pendingReset = true; // force reseed on the target (ADR-13v3)
-      this.fleet.accounts.noteSessionBound(target);
-      moved += 1;
+      return { moved, target, dryRun };
+    } finally {
+      this.drainInFlight = false;
     }
-    return { moved, target, dryRun };
   }
 
   health(): Record<string, unknown> {
