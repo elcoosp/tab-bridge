@@ -38,7 +38,7 @@
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)
 - [Usage](#usage)
-- [Multi-account fleet (v4)](#multi-account-fleet-v4)
+- [Multi-account fleet](#multi-account-fleet)
 - [Configuration](#configuration)
 - [Reliability and Error Semantics](#reliability-and-error-semantics)
 - [Testing](#testing)
@@ -323,6 +323,180 @@ with 900 s and `rate_limit_wait_secs = 1500`, which sleeps out DeepSeek's full
 
 ---
 
+## Multi-account fleet
+
+Running more than one DeepSeek account from one machine is only safe if the accounts
+do not present shared evidence of that machine. Without help, N Chrome profiles on
+one laptop show the same exit IP, the same language, the same timezone, the same
+canvas hash, and boot in the same second — exactly the signature a risk engine looks
+for when it bans a farm. The fleet layer removes every linkage that is cheap for the
+fleet to remove and leaves the operator a short runbook for the behavioral residue.
+
+The model: **one DeepSeek account lives in its own Chrome profile** (own cookie jar,
+own login, captcha included, human-performed). The bridge launches those profiles with
+**per-account network identities and presentation profiles**, watches their worker
+links and tab health, and places each *session* on exactly one account at bind time.
+The account's concurrent turn slots (`perAccountTurns`, default 2) bound its sessions'
+generations; its 20-minute rate-limit window pauses them typed and visible; its login
+wall pauses them harder, until a human returns.
+
+- **Place** — a session's account is decided once, at its first turn, by least-loaded
+  placement among ready accounts. Ties break to least-recently-placed, then by id.
+- **Stick** — the session's account never changes. No failover, no rotation, no
+  mid-turn account hops. A 429 fails the turn typed and the next turn after the
+  window goes to the **same** account.
+- **Pause** — on a login wall the account quarantines as `needs_relogin`; its
+  sessions' turns return `account_paused` (503) until the human re-logs in, then
+  resume pinned. Same proxy, same surface — from the risk engine's chair it is the
+  same person who came back.
+- **Scale** — N ready accounts ⇒ N × `perAccountTurns` turn slots and up to N ×
+  `maxSessionsPerAccount` owned sessions. Capacity is the product of accounts, not
+  of churn.
+- **Isolate** — every account gets, at enrollment, its own exit IP (proxy), its own
+  presentation profile (locale / timezone / window / canvas noise), its own launch
+  phase (deterministic stagger), and a once-only fingerprint checkup that **measures**
+  (not assumes) that these differ across accounts. `fleet doctor` finds shared paths;
+  `--fleet-proxy-required` can refuse them.
+
+### The isolation stack
+
+| Layer | Separates | Mechanism |
+|-------|-----------|-----------|
+| **L0 · process & storage** | cookies, tokens, extension state | one Chrome process per account, own `--user-data-dir` |
+| **L1 · network identity** | exit IP, WebRTC surface | per-account `--proxy-server` + `--webrtc-ip-handling-policy=disable_non_proxied_udp` |
+| **L2 · presentation** | language, timezone, window metrics, canvas hashes | per-account `--lang`, `TZ`, `--window-*`, canvas-noise switches |
+| **L3 · timing** | synchronized boots | deterministic per-account launch stagger (default window: 45 s) |
+| **L4 · behavior** | login clustering, content echoing, ban-response mistakes | operator runbook (`fleet doctor` flags what it can; the rest is yours) |
+
+L0 was already provided by the profile boundary. L1–L3 are the fleet's code; L4 is the
+operator's short checklist (see the doctor output). The stack is ordered by how much
+linkage weight each layer removes: network path first, presentation second, timing
+third, behavior always.
+
+### What stays shared
+
+The bridge removes every linkage it can reach. What remains shared on one machine —
+TLS / JA4 fingerprint, GPU strings, font list, screen resolution, OS timezone on
+Windows — is deliberately **not** spoofed (a self-contradicting fingerprint is a
+stronger flag than a shared one) and is the same residue produced by millions of
+ordinary humans who keep two Chrome profiles on one laptop. With distinct, plausible,
+stable exit paths and stable per-profile surfaces, that residue reads as *"same laptop,
+different people"* — the pattern providers tolerate — rather than *"one automation
+harness wearing N faces"*.
+
+### Quick start
+
+```bash
+# 1. Start the bridge with the fleet enabled (see `just serve-fleet`).
+node dist/src/index.js serve --port 8789 \
+  --api-key-env TAB_BRIDGE_KEY \
+  --stateful=true --auto-create-tabs --managed-only \
+  --fleet-file=fleet.json --fleet-root=fleet-home \
+  --fleet-launch=on-demand \
+  --fleet-launch-stagger=45s
+
+# 2. Enroll the first account. The bridge launches a fresh profile, opens a
+#    window, and waits for you to log in (captcha included).
+node dist/src/index.js fleet add work \
+  --proxy 'socks5://127.0.0.1:1081' \
+  --surface 'locale=de-DE,tz=Europe/Berlin'
+
+# 3. Enroll a second account (its own proxy + surface).
+node dist/src/index.js fleet add personal \
+  --proxy 'socks5://127.0.0.1:1082' \
+  --surface 'locale=fr-FR,tz=Europe/Paris'
+
+#    With ≥2 accounts, `fleet add` runs the fingerprint probe on the new
+#    profile and prints the measured canvas / lang / tz / window / exit IP.
+
+# 4. See what actually differs.
+node dist/src/index.js fleet doctor
+#    network:  work      socks5://127.0.0.1:1081  exit 198.51.100.23 (DE, probe ok)
+#              personal  socks5://127.0.0.1:1082  exit 198.51.100.31 (FR, probe ok)
+#    findings: none — distinct network paths and surfaces
+#    surface:  work      de-DE / Europe/Berlin / 1440x900 / canvas-noise on
+#              personal  fr-FR / Europe/Paris  / 1680x1050 / canvas-noise on
+#    schedule: work boot phase 12.1s · personal 33.7s (window 45s, deterministic)
+```
+
+Every subsequent request through `POST /v1/chat/completions` is bound to one of the
+enrolled accounts. The OpenAI request surface is unchanged; `X-Fleet-Account` names
+the account that served the turn (JSON and SSE), and `/v1/accounts` exposes the whole
+table for dashboards.
+
+### Fleet CLI (thin HTTP client)
+
+The CLI talks to a **running** bridge; the server owns the fleet file, so there is
+exactly one writer.
+
+| Command | Purpose |
+|---------|---------|
+| `fleet add <id> [--label L] [--proxy URL] [--surface k=v,…]` | Enroll: create record, launch profile, claim the worker, wait for login, run fingerprint checkup when ≥2 accounts exist |
+| `fleet list` | Accounts at a glance: state, cooldown, sessions / cap, turns, link, network |
+| `fleet open <id>` | Open the account's window without touching enrollment |
+| `fleet login <id>` | Open the window landing on the login page (guided re-login) |
+| `fleet proxy <id> <url\|off>` | Set or clear the account's network identity (stored raw; `${VAR}` allowed) |
+| `fleet surface <id> [--locale L] [--tz Z] [--window WxH] [--pos XxY] [--canvas-noise on\|off] [--arg "…"] [--force]` | Set the presentation surface. `--force` required to change a live account (identity stability) |
+| `fleet doctor [--no-probe] [--json]` | Isolation report: network paths (+ native exit-IP probe), surfaces, boot phases, enrollment clustering, findings. `--json` for dashboards |
+| `fleet checkup <id>` | Re-run the fingerprint probe in one profile and print the measured diff |
+| `fleet drain <id> [--to <id\|auto>] [--dry-run] [-y]` | Move the account's sessions (priced, explicit, serialized). `--dry-run` plans without moving |
+| `fleet remove <id> [--purge]` | Unbind the account. `--purge` deletes the profile dir (destructive) |
+
+### HTTP surface
+
+| Endpoint | Behavior |
+|----------|----------|
+| `GET /v1/accounts` | Fleet table: accounts, capacity, isolation findings, latest checkup per account |
+| `GET /v1/fleet/:id/checkup-history` | Newest-first checkup history (drift forensics) |
+| `POST /v1/fleet/enroll` | Enroll a new account (used by `fleet add`) |
+| `POST /v1/fleet/:id/open` / `:id/relogin` | Open the account window (relogin lands on the login page) |
+| `POST /v1/fleet/:id/proxy` / `:id/surface` | Set/clear network identity / presentation surface |
+| `POST /v1/fleet/:id/checkup` | Run a fresh fingerprint probe (waits up to 30 s) |
+| `POST /v1/fleet/:id/drain` | Plan or execute a session move (`{ to, dryRun }`) |
+| `POST /v1/fleet/:id/remove` | Unbind (profile dir kept unless the caller purges) |
+| `GET /fleet-probe` | The fingerprint probe page (loopback-only, no auth) |
+| `POST /v1/fleet/_probe_result` | The probe's result upload endpoint (loopback-only, no auth) |
+| `GET /healthz` | Includes a `fleet` block with state counts, `isolationFindings`, and capacity alerts |
+
+### Typed errors for fleet conditions
+
+| Condition | Response | Caller recovery |
+|-----------|----------|-----------------|
+| Account cooling (pre-flight or mid-turn 429) | `429 rate_limited` + `Retry-After: <remaining>` + `accountId` | Retry after the window; same session, same account |
+| Account needs re-login | `503 account_paused` + `accountId`, `reason: "relogin_required"` | Retry after the human re-logs in (or `fleet drain`) |
+| No placeable account at bind | `503 fleet_busy` + `retryAfterSec` (shortest cooldown, else 60) | Retry; add accounts; check `fleet list` |
+| Profile link didn't come up in budget | `503 bind_failed` + `accountId`, `timeoutMs` | Retry (relaunch was already attempted) |
+| Legacy queue conditions (`queue_full` / `queue_timeout` / `client_gone`) | unchanged shapes (now per-account) | unchanged semantics |
+
+### Migration
+
+No `fleet.json` ⇒ exactly the pre-fleet bridge, bit for bit. Enabling the fleet is
+adding `--fleet-file=fleet.json` (and optionally `--fleet-root`, `--fleet-launch=on-demand`,
+etc.); rolling back is deleting `fleet.json`. Proxy credentials live in the operator's
+environment (`${VAR}` references in the fleet file are expanded only at launch,
+fail-closed); the fleet file itself contains no secrets.
+
+### Fleet safety notes
+
+- **One exit path per account, forever.** Never two accounts on one proxy, and never
+  rotate an account's IP mid-life — that is an identity change, not a maintenance
+  action. Need a new IP ⇒ new profile ⇒ fresh login ⇒ new identity.
+- **Keep the surface plausible and stable.** Match locale / timezone to the exit IP's
+  geography; set once at enrollment; let the checkup *prove* differences instead of
+  assuming them.
+- **Log in like a human, from the account's own path.** Captcha means the human does
+  it in the account's own window through the account's own proxy.
+- **Treat challenges as stop signs.** A captcha on a logged-in account is the risk
+  engine talking. Park the account (`needs_relogin` does this), solve once, resume.
+- **Don't echo content across accounts.** The same prompt pasted into 3 accounts
+  within minutes is a similarity signature no fingerprint spoof will mask. Parallel
+  work should be *different* work.
+- **After a ban, change identity, not just credentials.** New profile, new exit path,
+  new surface, days later — never a re-login of a sibling profile "while the IP is
+  still warm".
+
+---
+
 ## Configuration
 
 Behavior is consolidated into `serve` flags — every ADR has a knob, and `/healthz`
@@ -351,7 +525,7 @@ echoes the effective configuration so drift is visible.
 | `--max-tabs` | `4` | Cap on worker-managed tabs; `0` = unbounded |
 | `--tab-idle-close` | `15m` | Close ready+unbound tabs idle beyond this; `0` = never |
 | `--worker-origin <origin>` | `chrome-extension://*` | Comma-separated allowed Origin values for the worker upgrade |
-| **Fleet (v4)** | | |
+| **Fleet** | | |
 | `--fleet-file <path>` | `fleet.json` | Fleet registry JSON. **Empty string disables the fleet** (byte-for-byte pre-v4 behavior) |
 | `--fleet-root <dir>` | beside fleet file | Profile dir root |
 | `--fleet-launch <mode>` | `on-demand` | `on-demand` \| `always` \| `never` — when the bridge launches account browsers |
