@@ -48,6 +48,14 @@ export interface SessionRow {
    * the JSONL journal like the rest of the row; validated on restore.
    */
   chatUrl?: string | null;
+  /**
+   * ADR-13v3 (place-then-stick): the fleet account this session is bound
+   * to, decided once at bind time and immutable for the session's lifetime.
+   * Undefined means "not yet placed" (fresh session) — placement runs on the
+   * first turn under an active fleet. Absent entirely for ephemeral and for
+   * legacy single-pool deployments.
+   */
+  accountId?: string;
 }
 
 export interface PersistStore {

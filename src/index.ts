@@ -27,7 +27,7 @@ function readPkgVersion(): string {
 }
 const pkgVersion: string = readPkgVersion();
 
-function main(argv: string[]): void {
+async function main(argv: string[]): Promise<void> {
   const [cmd, ...rest] = argv;
   if (cmd === "--help" || cmd === "-h" || cmd === "help" || !cmd) {
     process.stdout.write(usage() + "\n");
@@ -36,6 +36,11 @@ function main(argv: string[]): void {
   if (cmd === "--version" || cmd === "-v") {
     process.stdout.write("tab-bridge " + pkgVersion + "\n");
     process.exit(0);
+  }
+  if (cmd === "fleet") {
+    const { fleetMain } = await import("./fleet-cli.js");
+    await fleetMain(rest);
+    return;
   }
   if (cmd !== "serve") {
     process.stderr.write(`unknown command: ${cmd}\n\n${usage()}\n`);
@@ -101,4 +106,7 @@ function main(argv: string[]): void {
   });
 }
 
-main(process.argv.slice(2));
+main(process.argv.slice(2)).catch((e) => {
+  process.stderr.write(`error: ${(e as Error).message}\n`);
+  process.exit(1);
+});

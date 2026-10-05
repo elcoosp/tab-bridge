@@ -45,6 +45,30 @@ export interface Config {
    * explicit list to pin extension ids (missing Origin is then rejected).
    */
   workerOrigins?: string[];
+  /** ADR-15: fleet registry file. Empty disables the fleet entirely (single
+   * account legacy mode). Optional in the interface so legacy test fixtures
+   * keep compiling; parseServeArgs always populates it. */
+  fleetFile?: string;
+  /** ADR-15: root for per-account profile dirs (default: beside fleetFile). */
+  fleetRoot?: string;
+  /** ADR-15: when the bridge launches account browsers. */
+  fleetLaunch?: "on-demand" | "always" | "never";
+  /** Browser binary override (probed when absent). */
+  browserPath?: string;
+  /** Unpacked extension dir for --load-extension (default: ./extension). */
+  extensionDir?: string;
+  /** Skip --load-extension (branded-stable fallback, C5). */
+  fleetManualExtension?: boolean;
+  /** ADR-14v3: auto-open the profile window when re-login is needed. */
+  fleetReloginWindow?: "auto" | "never";
+  /** ADR-12v3: turn slots per account. */
+  perAccountTurns?: number;
+  /** ADR-13v3: sessions bound per account (0 = unbounded). */
+  maxSessionsPerAccount?: number;
+  /** ADR-17 (v4): refuse to launch accounts without a network identity. */
+  fleetProxyRequired?: boolean;
+  /** ADR-19 (v4): boot phase window for launchAll (0 = off). */
+  fleetLaunchStaggerMs?: number;
 }
 
 export const DEFAULTS: Config = {
@@ -68,6 +92,13 @@ export const DEFAULTS: Config = {
   resetOnSeed: "auto",
   maxTabs: 4,
   tabIdleCloseMs: 15 * 60_000,
+  fleetFile: "fleet.json",
+  fleetLaunch: "on-demand",
+  fleetReloginWindow: "auto",
+  perAccountTurns: 2,
+  maxSessionsPerAccount: 8,
+  fleetProxyRequired: false,
+  fleetLaunchStaggerMs: 45_000,
 };
 
 export function parseDuration(s: string): number {
@@ -229,6 +260,55 @@ export function parseServeArgs(argv: string[]): Config {
       case "--tab-idle-close":
         cfg.tabIdleCloseMs = parseDuration(val());
         break;
+      case "--fleet-file":
+        cfg.fleetFile = val();
+        break;
+      case "--fleet-root":
+        cfg.fleetRoot = val();
+        break;
+      case "--fleet-launch": {
+        const mode = val();
+        if (mode !== "on-demand" && mode !== "always" && mode !== "never") {
+          throw new Error("--fleet-launch must be on-demand|always|never");
+        }
+        cfg.fleetLaunch = mode;
+        break;
+      }
+      case "--browser-path":
+        cfg.browserPath = val();
+        break;
+      case "--extension-dir":
+        cfg.extensionDir = val();
+        break;
+      case "--fleet-manual-extension":
+        cfg.fleetManualExtension = true;
+        break;
+      case "--fleet-relogin-window": {
+        const mode = val();
+        if (mode !== "auto" && mode !== "never") {
+          throw new Error("--fleet-relogin-window must be auto|never");
+        }
+        cfg.fleetReloginWindow = mode;
+        break;
+      }
+      case "--per-account-turns":
+        cfg.perAccountTurns = Number(val());
+        if (!Number.isInteger(cfg.perAccountTurns) || cfg.perAccountTurns < 0) {
+          throw new Error("--per-account-turns must be an integer >= 0");
+        }
+        break;
+      case "--max-sessions-per-account":
+        cfg.maxSessionsPerAccount = Number(val());
+        if (!Number.isInteger(cfg.maxSessionsPerAccount) || cfg.maxSessionsPerAccount < 0) {
+          throw new Error("--max-sessions-per-account must be an integer >= 0 (0 = unbounded)");
+        }
+        break;
+      case "--fleet-proxy-required":
+        cfg.fleetProxyRequired = boolFlag();
+        break;
+      case "--fleet-launch-stagger":
+        cfg.fleetLaunchStaggerMs = parseDuration(val());
+        break;
       default:
         throw new Error(`unknown flag: ${flag}`);
     }
@@ -265,5 +345,18 @@ export function usage(): string {
     "  --max-tabs=<n>              cap on worker-managed tabs, 0 = unbounded (default 4)",
     "  --tab-idle-close=<dur>      close ready+unbound tabs idle beyond dur, 0 = never (default 15m)",
     "  --worker-origin=<origin>    comma-separated allowed Origin values (default: chrome-extension://*)",
+    "",
+    "  FLEET (multi-account; ADR-15):",
+    "  --fleet-file=<path>         fleet registry JSON; \"\" disables the fleet (default ./fleet.json)",
+    "  --fleet-root=<dir>          profile dir root (default: beside fleet file)",
+    "  --fleet-launch=<mode>       on-demand | always | never (default on-demand)",
+    "  --browser-path=<path>       browser binary override (else probe order)",
+    "  --extension-dir=<dir>       unpacked extension for --load-extension (default ./extension)",
+    "  --fleet-manual-extension    skip --load-extension (branded-stable fallback)",
+    "  --fleet-relogin-window=     auto|never (default auto)",
+    "  --per-account-turns=<n>     generation slots per account (default 2)",
+    "  --max-sessions-per-account=<n> cap of sessions bound per account (default 8)",
+    "  --fleet-proxy-required      refuse to launch accounts with no network identity (ADR-17)",
+    "  --fleet-launch-stagger=<dur> boot phase window for launchAll (default 45s; 0=off)",
   ].join("\n");
 }

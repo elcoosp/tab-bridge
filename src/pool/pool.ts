@@ -22,6 +22,10 @@ export interface PoolConfig {
 export interface WorkerInfo {
   ext: string;
   connectedAt: number;
+  /** The stable per-profile instance id the extension sent in HELLO
+   * (chrome.storage.local). Used by the fleet layer to attribute the
+   * connection to a specific account; optional for backward compat. */
+  instance?: string;
 }
 
 export type PoolEvent =
@@ -81,7 +85,7 @@ export class WorkerPool extends EventEmitter {
    * there is no traffic to keep the incumbent fresh and the fight never
    * settles. A dead incumbent delivers a socket close, which clears the slot.
    */
-  attach(conn: WsConnection): void {
+  attach(conn: WsConnection, opts?: { hello?: { t: "HELLO"; v: number; ext: string; extVersion?: string; instance?: string; account?: string } }): void {
     if (this.conn && this.conn.isOpen) {
       // Peek at the newcomer's HELLO before refusing: the refusal log then
       // names WHICH worker was turned away. One repeating instance id = a
@@ -131,6 +135,27 @@ export class WorkerPool extends EventEmitter {
     conn.on("message", (raw: string) => this.onMessage(raw));
     conn.on("close", (info: WsCloseInfo) => this.onDown(info));
     this.send({ t: "HELLO_OK", v: WORKER_PROTOCOL, config: this.config } as unknown as WorkerIntent);
+    // The fleet router may have consumed the first frame (HELLO) to decide
+    // routing; replay the greeting so bookkeeping is not lost.
+    if (opts?.hello) this.greet(opts.hello);
+  }
+
+  /** HELLO bookkeeping, shared by the message pump and fleet hand-off. */
+  private greet(hello: { t: "HELLO"; v: number; ext: string; extVersion?: string; instance?: string }): void {
+    if (hello.v !== WORKER_PROTOCOL) {
+      this.conn?.sendText(
+        JSON.stringify({ t: "HELLO_REFUSED", reason: `protocol version ${hello.v} not supported` })
+      );
+      this.detach("protocol-mismatch");
+      return;
+    }
+    this.info = {
+      ext: hello.ext,
+      connectedAt: Date.now(),
+      ...(hello.instance !== undefined ? { instance: hello.instance } : {}),
+    };
+    log.info("worker.up", { ext: hello.ext, extVersion: hello.extVersion ?? "unknown", instance: hello.instance ?? "unknown" });
+    this.emit("event", { type: "worker-up", info: this.info } satisfies PoolEvent);
   }
 
   /** Detect half-open worker sockets: ping on an interval, detach when
@@ -360,17 +385,7 @@ export class WorkerPool extends EventEmitter {
     if (!o) return;
     this.traceObservation(o);
     if (o.t === "HELLO") {
-      const hello = o as unknown as { t: "HELLO"; v: number; ext: string; extVersion?: string; instance?: string };
-      if (hello.v !== WORKER_PROTOCOL) {
-        this.conn?.sendText(
-          JSON.stringify({ t: "HELLO_REFUSED", reason: `protocol version ${hello.v} not supported` })
-        );
-        this.detach("protocol-mismatch");
-        return;
-      }
-      this.info = { ext: hello.ext, connectedAt: Date.now() };
-      log.info("worker.up", { ext: hello.ext, extVersion: hello.extVersion ?? "unknown", instance: hello.instance ?? "unknown" });
-      this.emit("event", { type: "worker-up", info: this.info } satisfies PoolEvent);
+      this.greet(o as unknown as { t: "HELLO"; v: number; ext: string; extVersion?: string; instance?: string });
     }
     if (o.t === "HEALTH") {
       const h = o as { t: "HEALTH"; tabId?: number; state: string; detail?: string };

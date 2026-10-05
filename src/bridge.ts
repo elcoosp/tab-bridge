@@ -15,6 +15,12 @@ import type { ToolSpec } from "./emulation/types.js";
 import type { ChatProviderAdapter } from "./adapter/types.js";
 import { BridgeError, queueFull, queueTimeout, clientGone } from "./facade/errors.js";
 import { TurnGate, GateRejectionError } from "./core/turngate.js";
+import { FleetRegistry, fingerprintOfDir, proxyOf, isolationConflicts, type SurfaceProfile } from "./fleet/registry.js";
+import { FleetLauncher } from "./fleet/launcher.js";
+import { EnrollmentManager } from "./fleet/enroll.js";
+import { AccountRegistry } from "./core/accounts.js";
+import { AccountTurnGate } from "./core/accountgate.js";
+import { existsSync } from "node:fs";
 import { log } from "./log.js";
 
 export const MODEL_CHAT = "deepseek-web-chat";
@@ -60,6 +66,27 @@ export class TabBridge {
   /** Caps concurrent provider generations (DeepSeek limit: ~2 per account);
    * excess turns queue FIFO. See src/core/turngate.ts. */
   readonly turnGate: TurnGate;
+  /**
+   * Fleet subsystem (ADR-11v2+). Present only when `--fleet-file` is set
+   * to a non-empty path; absent (null) means "legacy single-pool mode" —
+   * exactly the pre-fleet behavior. When the fleet file has zero accounts,
+   * turns fall through to the single-pool path; the fleet only becomes
+   * "active" once at least one account is enrolled.
+   *
+   * Wiring note: this pass wires the *bookkeeping* layers (registry,
+   * accounts, placement, gate, launcher, HTTP surface). Pool-per-account
+   * routing via FleetRouter is a follow-up: today all turns still ride the
+   * default single WorkerPool. Fleet state is therefore authoritative for
+   * placement, cooldowns, surfaces, and HTTP, but the physical routing
+   * remains single-link.
+   */
+  readonly fleet: {
+    registry: FleetRegistry;
+    accounts: AccountRegistry;
+    launcher: FleetLauncher;
+    enrollment: EnrollmentManager;
+    gate: AccountTurnGate;
+  } | null;
   private readonly wsServer: WsServer;
   private readonly bindTabImpl: (
     sessionId: string,
@@ -119,6 +146,128 @@ export class TabBridge {
       ...(config.workerOrigins !== undefined ? { allowedOrigins: config.workerOrigins } : {}),
       onConnection: (conn) => this.pool.attach(conn),
     });
+
+    // ---- Fleet subsystem (ADR-15) -----------------------------------------
+    // Enabled when --fleet-file is a non-empty path AND the file exists.
+    // Absent file ⇒ legacy single-pool mode, bit-for-bit. Empty path ⇒
+    // fleet explicitly disabled.
+    const fleetEnabled =
+      typeof config.fleetFile === "string" &&
+      config.fleetFile.length > 0 &&
+      existsSync(config.fleetFile);
+    if (fleetEnabled) {
+      const fleetRegistry = FleetRegistry.open(config.fleetFile as string, config.fleetRoot);
+      const accounts = new AccountRegistry({
+        maxSessionsPerAccount: config.maxSessionsPerAccount ?? 8,
+      });
+      for (const a of fleetRegistry.all()) {
+        accounts.upsert({
+          id: a.id,
+          ...(a.label !== undefined ? { label: a.label } : {}),
+          ...(a.instanceId !== undefined ? { instanceId: a.instanceId } : {}),
+          fingerprint: fingerprintOfDir(a.profileDir),
+          initial: a.instanceId ? "awaiting_login" : "unlinked",
+        });
+      }
+      // Replay persisted session→account bindings into the live counters so
+      // placement sees the same load the persisted state shows.
+      for (const row of this.registry.list()) {
+        if (row.accountId && accounts.record(row.accountId)) {
+          accounts.noteSessionBound(row.accountId);
+        }
+      }
+      const launcher = new FleetLauncher({
+        ...(config.browserPath !== undefined ? { browserPath: config.browserPath } : {}),
+        onExit: (id: string) => accounts.markWorkerDown(id),
+      });
+      const enrollment = new EnrollmentManager();
+      const gate = new AccountTurnGate({
+        perAccountConcurrent: config.perAccountTurns ?? 2,
+        capacity: config.queueCapacity,
+        queueTimeoutMs: config.queueTimeoutMs,
+      });
+      this.fleet = { registry: fleetRegistry, accounts, launcher, enrollment, gate };
+
+      // Bridge the single pool's events into fleet account state. Until
+      // FleetRouter-per-account routing lands, every worker HELLO carries an
+      // instance that we attribute to whatever enrollment is currently open
+      // (serialized by construction); every HEALTH ok promotes the most
+      // recently-added awaiting_login account to ready. This is the honest
+      // bridge for a single-link deployment; multi-account parallel
+      // enrollment needs the router.
+      this.pool.on("event", (e) => {
+        if (!this.fleet) return;
+        if (e.type === "worker-up") {
+          const pending = this.fleet.enrollment.pendingAccountId;
+          if (pending && e.info.instance) {
+            try {
+              this.fleet.registry.bindInstance(pending, e.info.instance);
+            } catch (err) {
+              log.warn("fleet.instance-bind-failed", {
+                accountId: pending,
+                instance: e.info.instance,
+                error: String(err),
+              });
+            }
+            this.fleet.accounts.markWorkerLinked(pending);
+            this.fleet.enrollment.consider(
+              { t: "HELLO", v: 1, ext: e.info.ext, instance: e.info.instance },
+              false
+            );
+          } else {
+            // No open enrollment: mark every known instance-linked account
+            // as linked (best-effort single-pool behaviour).
+            for (const a of this.fleet.registry.all()) {
+              if (a.instanceId) this.fleet.accounts.markWorkerLinked(a.id);
+            }
+          }
+        } else if (e.type === "worker-down") {
+          for (const r of this.fleet.accounts.all()) {
+            if (r.workerLinked) this.fleet.accounts.markWorkerDown(r.id);
+          }
+        } else if (e.type === "health" && e.state === "ok") {
+          const awaiting = this.fleet.accounts
+            .all()
+            .filter((r) => r.state === "awaiting_login");
+          if (awaiting.length > 0) {
+            this.fleet.accounts.markLoginOk(awaiting[0].id);
+            const acct = this.fleet.registry.byId(awaiting[0].id);
+            if (acct) this.fleet.registry.markEnrolled(acct.id);
+          }
+        }
+      });
+
+      // --fleet-launch=always ⇒ launch every persisted account at boot with
+      // its own deterministic stagger phase (ADR-19).
+      if (config.fleetLaunch === "always") {
+        try {
+          launcher.launchAll(
+            fleetRegistry.all().map((acct) => {
+              let proxy: string | undefined;
+              try {
+                proxy = proxyOf(acct, process.env) ?? undefined;
+              } catch (err) {
+                log.error("fleet.boot-proxy-unset", { accountId: acct.id, error: String(err) });
+              }
+              return {
+                accountId: acct.id,
+                profileDir: acct.profileDir,
+                extensionDir: config.extensionDir ?? "./extension",
+                manualExtension: config.fleetManualExtension === true,
+                ...(proxy !== undefined ? { proxy } : {}),
+                ...(acct.surface !== undefined ? { surface: acct.surface } : {}),
+                proxyRequired: config.fleetProxyRequired === true,
+              };
+            }),
+            config.fleetLaunchStaggerMs ?? 45_000
+          );
+        } catch (e) {
+          log.error("fleet.boot-launch-failed", { error: String(e) });
+        }
+      }
+    } else {
+      this.fleet = null;
+    }
   }
 
   /** Attach the worker-link upgrade handler to an HTTP server. */
@@ -131,44 +280,90 @@ export class TabBridge {
     return this.registry.getOrCreate(sessionId);
   }
 
-  async handleChat(params: ChatParams): Promise<TurnOutput> {
+  async handleChat(params: ChatParams): Promise<TurnOutput & { accountId?: string }> {
     const ephemeral = params.sessionId === null;
     const row = ephemeral
       ? this.registry.createEphemeral()
       : this.registry.getOrCreate(params.sessionId as string);
 
+    // ---- Fleet: place-then-stick (ADR-13v3) ------------------------------
+    // A non-ephemeral session is bound to exactly one account, once. When
+    // the fleet has zero accounts, fall through to the legacy single-pool
+    // path — that keeps a bridge started with an empty fleet.json behaving
+    // exactly like the pre-fleet bridge for its one real worker.
+    const fleetActive = this.fleet !== null && this.fleet.registry.all().length > 0;
+    if (fleetActive && !ephemeral && row.accountId === undefined) {
+      const placed = this.fleet!.accounts.placeSession();
+      if (!placed.ok) {
+        const retry = this.fleet!.accounts.shortestCooldownSec() ?? 60;
+        throw new BridgeError({
+          status: 503,
+          code: "fleet_busy",
+          message:
+            placed.reason === "none_ready"
+              ? `no ready account for this session (retry in ~${retry}s)`
+              : "every ready account is at its session cap",
+          retryAfter: retry,
+        });
+      }
+      row.accountId = placed.accountId;
+      this.fleet!.accounts.noteSessionBound(row.accountId);
+    }
+
+    // ---- Fleet: pre-flight (typed, fail-fast — ADR-16) -------------------
+    if (fleetActive && row.accountId !== undefined) {
+      const cooling = this.fleet!.accounts.cooldownSec(row.accountId);
+      if (cooling !== null) {
+        throw new BridgeError({
+          status: 429,
+          code: "rate_limited",
+          message: `account "${row.accountId}" is cooling; retry in ~${cooling}s`,
+          retryAfter: cooling,
+        });
+      }
+      const rec = this.fleet!.accounts.record(row.accountId);
+      if (rec && rec.state === "needs_relogin") {
+        throw new BridgeError({
+          status: 503,
+          code: "account_paused",
+          message: `account "${row.accountId}" needs a human re-login`,
+          headers: { "x-fleet-account": row.accountId },
+        });
+      }
+    }
+
     // Same-session overlap is a caller bug: reject, never queue (ADR-7/R6).
-    // The generation gate below is a DIFFERENT axis: it caps how many turns
-    // run against the provider account at once (DeepSeek refuses a 3rd
-    // concurrent generation with "Another message is being generated").
-    // Cross-session turns queue FIFO; same-session overlap still 409s here,
-    // before the gate is ever consulted.
     const mutex = this.registry.lockFor(row.sessionId);
     if (!mutex.tryAcquire()) {
-      const err = new BridgeError({
+      throw new BridgeError({
         status: 409,
         code: "session_busy",
         message: `session ${row.sessionId} already has a turn in flight`,
       });
-      throw err;
     }
     let gateHeld = false;
-    // P9: declared here so the finally block can drop the listener.
+    let usedFleetGate = false;
     let onClientAbortRef: (() => void) | null = null;
     try {
-      // Blocks (FIFO) until one of maxConcurrentTurns generation slots frees
-      // up. Throws GateRejectionError on queue_full / queue_timeout /
-      // client_gone — mapped to BridgeError below. To callers this is just a
-      // longer time-to-first-byte ("thinking"); nothing else changes.
-      const gateWaitMs = await this.turnGate.acquire(row.sessionId, params.signal);
-      gateHeld = true;
+      // Fleet turns ride the per-account FIFO gate (ADR-12v3); legacy turns
+      // ride the global turn gate (unchanged).
+      let gateWaitMs = 0;
+      if (fleetActive && row.accountId !== undefined) {
+        try {
+          gateWaitMs = await this.fleet!.gate.acquire(row.accountId, row.sessionId, params.signal);
+        } catch (e) {
+          if (e instanceof GateRejectionError) throw mapGateRejection(e);
+          throw e;
+        }
+        gateHeld = true;
+        usedFleetGate = true;
+        this.fleet!.accounts.noteTurnStart(row.accountId);
+      } else {
+        gateWaitMs = await this.turnGate.acquire(row.sessionId, params.signal);
+        gateHeld = true;
+      }
       // P9: after admission, a client that gives up would otherwise leave
-      // the bridge streaming DeepSeek's full reply into a dead socket for
-      // up to the turn timeout, holding a generation slot and consuming the
-      // account's send-frequency budget. Translate an abort into a worker
-      // ABORT intent for the exact reqId this adapter has pending for the
-      // tab. The injector handles ABORT (finishTurn aborted → TURN_ABORTED),
-      // and streamResponse maps STATUS aborted → stopReason "aborted".
+      // the bridge streaming DeepSeek's full reply into a dead socket.
       const adapterWithReqId = this.adapter as ChatProviderAdapter & {
         reqIdForTab?: (tabId: number) => string | undefined;
       };
@@ -182,8 +377,7 @@ export class TabBridge {
         if (params.signal.aborted) onClientAbort();
         else params.signal.addEventListener("abort", onClientAbort, { once: true });
       }
-      // E5: background-class ephemeral traffic binds with noCreate so it can
-      // never force a new tab; it waits only for a free one (fail-fast 429).
+      // E5: background-class ephemeral traffic binds with noCreate.
       const noCreate = ephemeral && params.background === true;
       const bindTab = noCreate
         ? (
@@ -209,17 +403,13 @@ export class TabBridge {
         },
         params.events
       );
-      return { ...out, ...(gateWaitMs > 0 ? { gateWaitMs } : {}) };
+      return {
+        ...out,
+        ...(gateWaitMs > 0 ? { gateWaitMs } : {}),
+        ...(row.accountId !== undefined ? { accountId: row.accountId } : {}),
+      };
     } catch (e) {
-      if (e instanceof GateRejectionError) {
-        // A queued-phase rejection never addressed the tab: no prompt was
-        // placed, no navigation issued. tabHash must survive (same reasoning
-        // as task T8 of the integration plan).
-        throw mapGateRejection(e);
-      }
-      // Only a failure AFTER the tab was addressed leaves tab state
-      // unknown; `markFailed` already handled the row for those. Bind/
-      // readiness failures must leave the chain anchor untouched.
+      if (e instanceof GateRejectionError) throw mapGateRejection(e);
       const postSubmit = Boolean(
         (e as Error & { postSubmit?: boolean })?.postSubmit
       );
@@ -228,19 +418,21 @@ export class TabBridge {
       }
       throw e;
     } finally {
-      // P9: drop the abort listener now that the turn has resolved.
       if (params.signal && onClientAbortRef !== null) {
         params.signal.removeEventListener("abort", onClientAbortRef);
       }
-      // Release the gate slot first so the next queued turn starts before
-      // the session bookkeeping unwinds (both are synchronous).
-      if (gateHeld) this.turnGate.release();
+      if (gateHeld) {
+        if (usedFleetGate && row.accountId !== undefined) {
+          this.fleet!.accounts.noteTurnEnd(row.accountId);
+          this.fleet!.gate.release(row.accountId);
+        } else {
+          this.turnGate.release();
+        }
+      }
       mutex.release();
       this.registry.dropLock(row.sessionId);
       if (ephemeral) {
         this.registry.delete(row.sessionId);
-        // Free the worker-side binding so the tab returns to the allocatable
-        // pool instead of leaking one tab per sessionless request.
         if (row.tabId !== null) {
           this.pool.release(row.sessionId, 3_000).catch(() => {});
         }
@@ -248,7 +440,247 @@ export class TabBridge {
     }
   }
 
+  /** Fleet status snapshot — the wire shape of GET /v1/accounts. */
+  fleetStatus(): Record<string, unknown> {
+    if (!this.fleet) {
+      return {
+        accounts: [],
+        capacity: {
+          readyAccounts: 0,
+          turnSlots: 0,
+          sessionSlots: 0,
+          shortestCooldownInSec: null,
+        },
+        isolation: { findings: [], checkedAt: Date.now() },
+      };
+    }
+    const rows = this.fleet.accounts.all();
+    const maxSessions = this.config.maxSessionsPerAccount ?? 8;
+    const maxTurns = this.config.perAccountTurns ?? 2;
+    const accounts = rows.map((r) => {
+      const acct = this.fleet!.registry.byId(r.id);
+      return {
+        id: r.id,
+        ...(r.label !== undefined ? { label: r.label } : {}),
+        state: r.state,
+        cooldownInSec: this.fleet!.accounts.cooldownSec(r.id),
+        sessions: r.activeSessions,
+        maxSessions,
+        activeTurns: r.activeTurns,
+        maxTurns,
+        linked: r.workerLinked,
+        fingerprint: r.fingerprint,
+        awaitingHuman: r.state === "awaiting_login" || r.state === "needs_relogin",
+        network: { proxy: acct?.proxy ? true : false, exitIp: null, exitProbe: "skipped" },
+        surface: acct?.surface ?? {},
+      };
+    });
+    const readyRows = rows.filter((r) => r.state === "ready" && r.workerLinked);
+    return {
+      accounts,
+      capacity: {
+        readyAccounts: readyRows.length,
+        turnSlots: readyRows.length * maxTurns,
+        sessionSlots: rows.reduce((s, r) => s + r.activeSessions, 0),
+        shortestCooldownInSec: this.fleet.accounts.shortestCooldownSec(),
+      },
+      isolation: {
+        findings: isolationConflicts(this.fleet.registry.all()),
+        checkedAt: Date.now(),
+      },
+    };
+  }
+
+  /** Bookkeeping hook for the DELETE /v1/sessions path. */
+  releaseSession(sessionId: string): void {
+    if (!this.fleet) return;
+    const row = this.registry.get(sessionId);
+    if (row?.accountId !== undefined) {
+      this.fleet.accounts.noteSessionEnded(row.accountId);
+    }
+  }
+
+  /** Fleet CLI: enroll a new account (add + launch + open enrollment). */
+  fleetEnroll(input: {
+    id: string;
+    label?: string;
+    proxy?: string;
+    surface?: SurfaceProfile;
+  }): { id: string } {
+    if (!this.fleet) {
+      throw new BridgeError({
+        status: 503,
+        code: "fleet_disabled",
+        message: "fleet is not enabled (set --fleet-file to a non-empty path and restart)",
+      });
+    }
+    const acct = this.fleet.registry.add({
+      id: input.id,
+      ...(input.label !== undefined ? { label: input.label } : {}),
+    });
+    if (input.proxy !== undefined) this.fleet.registry.setProxy(acct.id, input.proxy);
+    if (input.surface !== undefined) this.fleet.registry.setSurface(acct.id, input.surface);
+    const persisted = this.fleet.registry.byId(acct.id)!;
+    this.fleet.accounts.upsert({
+      id: persisted.id,
+      ...(persisted.label !== undefined ? { label: persisted.label } : {}),
+      fingerprint: fingerprintOfDir(persisted.profileDir),
+      initial: "awaiting_login",
+    });
+    // Open the enrollment claim window first: the pool's worker-up handler
+    // attributes the next unknown instance to it. The promise is
+    // fire-and-forget; the CLI polls /v1/accounts for state.
+    void this.fleet.enrollment.begin(persisted.id, 10 * 60_000).catch(() => {});
+    // Launch the profile process.
+    try {
+      let proxyEndpoint: string | undefined;
+      try {
+        proxyEndpoint = proxyOf(persisted, process.env) ?? undefined;
+      } catch (err) {
+        log.error("fleet.proxy-unset", { accountId: persisted.id, error: String(err) });
+      }
+      this.fleet.launcher.launch({
+        accountId: persisted.id,
+        profileDir: persisted.profileDir,
+        extensionDir: this.config.extensionDir ?? "./extension",
+        manualExtension: this.config.fleetManualExtension === true,
+        ...(proxyEndpoint !== undefined ? { proxy: proxyEndpoint } : {}),
+        ...(persisted.surface !== undefined ? { surface: persisted.surface } : {}),
+        proxyRequired: this.config.fleetProxyRequired === true,
+      });
+    } catch (e) {
+      log.error("fleet.enroll-launch-failed", { accountId: persisted.id, error: String(e) });
+      // The record persists; the operator can retry with `fleet open`.
+    }
+    return { id: persisted.id };
+  }
+
+  /** Fleet CLI: open the account's window without touching enrollment. */
+  fleetOpenWindow(id: string): void {
+    if (!this.fleet) {
+      throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
+    }
+    const acct = this.fleet.registry.byId(id);
+    if (!acct) throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
+    let proxyEndpoint: string | undefined;
+    try {
+      proxyEndpoint = proxyOf(acct, process.env) ?? undefined;
+    } catch (err) {
+      log.error("fleet.proxy-unset", { accountId: id, error: String(err) });
+    }
+    this.fleet.launcher.launch({
+      accountId: acct.id,
+      profileDir: acct.profileDir,
+      extensionDir: this.config.extensionDir ?? "./extension",
+      manualExtension: this.config.fleetManualExtension === true,
+      ...(proxyEndpoint !== undefined ? { proxy: proxyEndpoint } : {}),
+      ...(acct.surface !== undefined ? { surface: acct.surface } : {}),
+      proxyRequired: this.config.fleetProxyRequired === true,
+    });
+  }
+
+  /** Fleet CLI: set/clear the account's network identity. */
+  fleetSetProxy(id: string, proxy: string | null): void {
+    if (!this.fleet) {
+      throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
+    }
+    if (!this.fleet.registry.byId(id)) {
+      throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
+    }
+    this.fleet.registry.setProxy(id, proxy);
+  }
+
+  /** Fleet CLI: set/clear the account's presentation surface. */
+  fleetSetSurface(id: string, surface: SurfaceProfile | null): void {
+    if (!this.fleet) {
+      throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
+    }
+    if (!this.fleet.registry.byId(id)) {
+      throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
+    }
+    this.fleet.registry.setSurface(id, surface);
+  }
+
+  /** Fleet CLI: unbind the account (profile dir kept unless --purge). */
+  fleetRemove(id: string): boolean {
+    if (!this.fleet) {
+      throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
+    }
+    const removed = this.fleet.registry.remove(id);
+    if (removed) {
+      // Release any sessions still bound to it so we do not leak counters.
+      for (const row of this.registry.list()) {
+        if (row.accountId === id) {
+          this.fleet.accounts.noteSessionEnded(id);
+          row.accountId = undefined;
+          row.pendingReset = true;
+        }
+      }
+      // Best-effort: kill the child if still running.
+      try {
+        this.fleet.launcher.killAll(`removed:${id}`);
+      } catch {
+        /* ignore */
+      }
+    }
+    return removed;
+  }
+
+  /** Fleet CLI: drain sessions off one account onto another (ADR-13v3 escape
+   * hatch). Returns the number of sessions moved. Operator-invoked only. */
+  fleetDrain(fromId: string, to: string | "auto"): number {
+    if (!this.fleet) {
+      throw new BridgeError({ status: 503, code: "fleet_disabled", message: "fleet is not enabled" });
+    }
+    const from = this.fleet.registry.byId(fromId);
+    if (!from) throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${fromId}` });
+    let target: string;
+    if (to === "auto") {
+      const placed = this.fleet.accounts.placeSession();
+      if (!placed.ok) {
+        throw new BridgeError({
+          status: 503,
+          code: "fleet_busy",
+          message: "no target account available for drain",
+        });
+      }
+      target = placed.accountId;
+    } else {
+      if (!this.fleet.registry.byId(to)) {
+        throw new BridgeError({ status: 404, code: "no_account", message: `no such target account: ${to}` });
+      }
+      target = to;
+    }
+    let moved = 0;
+    for (const row of this.registry.list()) {
+      if (row.accountId !== fromId) continue;
+      this.fleet.accounts.noteSessionEnded(fromId);
+      row.accountId = target;
+      row.pendingReset = true; // force reseed on the target (ADR-13v3)
+      this.fleet.accounts.noteSessionBound(target);
+      moved += 1;
+    }
+    return moved;
+  }
+
   health(): Record<string, unknown> {
+    const fleetBlock = this.fleet
+      ? (() => {
+          const rows = this.fleet!.accounts.all();
+          const findings = isolationConflicts(this.fleet!.registry.all());
+          return {
+            enabled: true,
+            accounts: rows.length,
+            ready: rows.filter((r) => r.state === "ready").length,
+            cooling: rows.filter((r) => r.state === "cooling").length,
+            needsRelogin: rows.filter((r) => r.state === "needs_relogin").length,
+            awaitingLogin: rows.filter((r) => r.state === "awaiting_login").length,
+            sessions: rows.reduce((s, r) => s + r.activeSessions, 0),
+            queueDepth: 0,
+            isolationFindings: findings.length,
+          };
+        })()
+      : { enabled: false };
     return {
       ok: true,
       mode: this.registry.mode,
@@ -267,6 +699,7 @@ export class TabBridge {
         ? { ext: this.pool.workerInfo.ext, connected: true }
         : { connected: false },
       tabs: this.pool.tabHealth(),
+      fleet: fleetBlock,
     };
   }
 

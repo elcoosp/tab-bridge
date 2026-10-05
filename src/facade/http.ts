@@ -135,6 +135,18 @@ async function handle(bridge: TabBridge, req: IncomingMessage, res: ServerRespon
     return;
   }
 
+  // ---- /v1/accounts (fleet view) ---------------------------------------------
+  if (method === "GET" && url === "/v1/accounts") {
+    sendJson(res, 200, bridge.fleetStatus());
+    return;
+  }
+
+  // ---- /v1/fleet/* (CLI surface; see src/fleet-cli.ts) -----------------------
+  if (url.startsWith("/v1/fleet/")) {
+    await handleFleet(bridge, req, res, url, method);
+    return;
+  }
+
   // ---- /v1/sessions ----------------------------------------------------------
   if (url === "/v1/sessions" || url.startsWith("/v1/sessions/")) {
     await handleSessions(bridge, req, res, url, method, query);
@@ -348,6 +360,10 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
       }));
     }
     const warnings = out.warnings;
+    // X-Fleet-Account (v4): the account id that served this turn, so an
+    // operator can tell which Chrome profile (jar) produced the completion.
+    const accountHeader: Record<string, string> =
+      out.accountId !== undefined ? { "x-fleet-account": out.accountId } : {};
     sendJson(
       res,
       200,
@@ -366,7 +382,7 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
         usage: out.usage,
         ...(warnings.length > 0 ? { x_bridge_warning: warnings } : {}),
       },
-      { ...headers, "x-bridge-queued-ms": String(out.gateWaitMs ?? 0) }
+      { ...headers, "x-bridge-queued-ms": String(out.gateWaitMs ?? 0), ...accountHeader }
     );
     return;
   }
@@ -526,6 +542,8 @@ async function handleSessions(
       });
     }
     try {
+      // Fleet bookkeeping: drop the session's slot on its account (ADR-13v3).
+      bridge.releaseSession(sessionId);
       const row = bridge.registry.delete(sessionId);
       if (!row) throw notFound(`no such session: ${sessionId}`);
       try {
@@ -566,4 +584,120 @@ async function handleSessions(
   }
 
   throw badRequest(`unsupported method ${method} for /v1/sessions/:id`);
+}
+
+// ---------------------------------------------------------------------------
+// /v1/fleet/* handlers
+// ---------------------------------------------------------------------------
+
+interface FleetEnrollBody {
+  id?: unknown;
+  label?: unknown;
+  proxy?: unknown;
+  surface?: unknown;
+}
+
+function readString(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+async function handleFleet(
+  bridge: TabBridge,
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: string,
+  method: string
+): Promise<void> {
+  const parts = url.split("/").filter(Boolean); // ["v1","fleet",id?,sub?]
+  // /v1/fleet/enroll
+  if (parts.length === 3 && parts[2] === "enroll" && method === "POST") {
+    const raw = await readBody(req);
+    let body: FleetEnrollBody;
+    try {
+      body = JSON.parse(raw.toString("utf8") || "{}") as FleetEnrollBody;
+    } catch {
+      throw badRequest("body is not valid JSON");
+    }
+    const id = readString(body.id);
+    if (!id) throw badRequest("fleet enroll requires id");
+    const surface =
+      body.surface !== null && typeof body.surface === "object"
+        ? (body.surface as Record<string, unknown>)
+        : undefined;
+    const result = bridge.fleetEnroll({
+      id,
+      ...(readString(body.label) !== undefined ? { label: readString(body.label)! } : {}),
+      ...(readString(body.proxy) !== undefined ? { proxy: readString(body.proxy)! } : {}),
+      ...(surface !== undefined ? { surface: surface as never } : {}),
+    });
+    sendJson(res, 201, { ok: true, accountId: result.id });
+    return;
+  }
+
+  // All other endpoints take an :id
+  if (parts.length < 4) throw badRequest(`unknown fleet endpoint: ${method} ${url}`);
+  const id = parts[2];
+  const sub = parts[3];
+
+  if (method === "POST" && sub === "open") {
+    bridge.fleetOpenWindow(id);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (method === "POST" && sub === "relogin") {
+    bridge.fleetOpenWindow(id);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (method === "POST" && sub === "proxy") {
+    const raw = await readBody(req);
+    let body: { proxy?: unknown };
+    try {
+      body = JSON.parse(raw.toString("utf8") || "{}") as { proxy?: unknown };
+    } catch {
+      throw badRequest("body is not valid JSON");
+    }
+    const value = body.proxy;
+    if (value !== null && typeof value !== "string") {
+      throw badRequest("proxy must be a string or null");
+    }
+    bridge.fleetSetProxy(id, value as string | null);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (method === "POST" && sub === "surface") {
+    const raw = await readBody(req);
+    let body: { surface?: unknown };
+    try {
+      body = JSON.parse(raw.toString("utf8") || "{}") as { surface?: unknown };
+    } catch {
+      throw badRequest("body is not valid JSON");
+    }
+    const value = body.surface;
+    if (value !== null && typeof value !== "object") {
+      throw badRequest("surface must be an object or null");
+    }
+    bridge.fleetSetSurface(id, (value ?? null) as never);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (method === "POST" && sub === "remove") {
+    const removed = bridge.fleetRemove(id);
+    sendJson(res, 200, { ok: true, removed });
+    return;
+  }
+  if (method === "POST" && sub === "drain") {
+    const raw = await readBody(req);
+    let body: { to?: unknown };
+    try {
+      body = JSON.parse(raw.toString("utf8") || "{}") as { to?: unknown };
+    } catch {
+      throw badRequest("body is not valid JSON");
+    }
+    const to = typeof body.to === "string" && body.to.length > 0 ? body.to : "auto";
+    const moved = bridge.fleetDrain(id, to);
+    sendJson(res, 200, { ok: true, moved, target: to });
+    return;
+  }
+  throw badRequest(`unknown fleet endpoint: ${method} ${url}`);
 }
