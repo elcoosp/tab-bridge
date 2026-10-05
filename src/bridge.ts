@@ -18,11 +18,14 @@ import { TurnGate, GateRejectionError } from "./core/turngate.js";
 import { FleetRegistry, fingerprintOfDir, proxyOf, isolationConflicts, type SurfaceProfile } from "./fleet/registry.js";
 import { FleetLauncher, staggerDelayMs } from "./fleet/launcher.js";
 import { EnrollmentManager } from "./fleet/enroll.js";
+import { PROBE_PATH, renderProbeHtml, probeResultToEntry, type ProbeResult, type CheckupEntry } from "./fleet/probe.js";
+import type { ServerResponse } from "node:http";
 import { FleetRouter, type HelloFrame } from "./pool/fleet.js";
 import type { PoolConfig } from "./pool/pool.js";
 import { AccountRegistry } from "./core/accounts.js";
 import { AccountTurnGate } from "./core/accountgate.js";
 import { existsSync } from "node:fs";
+import { randomId } from "./util/async.js";
 import { log } from "./log.js";
 
 export const MODEL_CHAT = "deepseek-web-chat";
@@ -94,6 +97,14 @@ export class TabBridge {
    * turn is routed to an account. The default `this.adapter` is used for the
    * legacy (fleet-disabled) path so existing deployments are untouched. */
   private readonly adaptersByAccount = new Map<string, ChatProviderAdapter>();
+  /** Pending probe invocations, keyed by token. Resolved when the probe
+   * page POSTs back; timed out by an internal timer. */
+  private readonly probeWaiters = new Map<string, {
+    accountId: string;
+    settle: (r: CheckupEntry) => void;
+    reject: (e: Error) => void;
+    timer: NodeJS.Timeout | null;
+  }>();
   private readonly wsServer: WsServer;
   private readonly bindTabImpl: (
     sessionId: string,
@@ -592,6 +603,11 @@ export class TabBridge {
         bootPhaseMs,
         ...(acct?.enrolledAt !== undefined ? { enrolledAt: acct.enrolledAt } : {}),
         ...(acct?.createdAt !== undefined ? { createdAt: acct.createdAt } : {}),
+        // §7.3: the latest probe result (if any) so a dashboard can render
+        // the measured fingerprint without re-running the probe.
+        checkup: acct?.checkupHistory && acct.checkupHistory.length > 0
+          ? acct.checkupHistory[0]
+          : null,
       };
     });
     const readyRows = rows.filter((r) => r.state === "ready" && r.workerLinked);
@@ -696,6 +712,78 @@ export class TabBridge {
       ...(acct.surface !== undefined ? { surface: acct.surface } : {}),
       proxyRequired: this.config.fleetProxyRequired === true,
     });
+  }
+
+  /** §7.3: serve the fingerprint probe page. The page is static; the account
+   * id and token arrive via the query string and are read by the page. */
+  serveProbeHtml(res: ServerResponse, _accountId: string, _token: string): void {
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+    });
+    res.end(renderProbeHtml());
+  }
+
+  /** §7.3: accept a probe result POSTed by the probe page. Local-trust only
+   * (the probe page is served by this bridge, from a loopback browser);
+   * the caller in http.ts enforces the loopback source address before
+   * invoking this. Matches the token, resolves the waiting checkup, and
+   * persists the entry on the account. */
+  fleetRecordProbeResult(payload: unknown): { ok: boolean; reason?: string } {
+    const p = payload as Partial<ProbeResult>;
+    if (typeof p?.accountId !== "string" || typeof p?.token !== "string") {
+      return { ok: false, reason: "missing accountId/token" };
+    }
+    const w = this.probeWaiters.get(p.token);
+    if (!w) return { ok: false, reason: "no such probe (expired or unknown token)" };
+    if (w.accountId !== p.accountId) {
+      return { ok: false, reason: `token belongs to a different account ("${w.accountId}")` };
+    }
+    const entry = probeResultToEntry(p as ProbeResult);
+    if (this.fleet) this.fleet.registry.recordCheckup(p.accountId, entry);
+    this.probeWaiters.delete(p.token);
+    if (w.timer) clearTimeout(w.timer);
+    w.settle(entry);
+    return { ok: true };
+  }
+
+  /** §7.3: run a fresh fingerprint checkup — open the probe page in a new
+   * tab of the account's profile, wait up to timeoutMs for the result. */
+  async fleetCheckup(id: string, timeoutMs = 30_000): Promise<CheckupEntry> {
+    if (!this.fleet) {
+      throw new BridgeError({
+        status: 503,
+        code: "fleet_disabled",
+        message: "fleet is not enabled (set --fleet-file to a non-empty path and restart)",
+      });
+    }
+    const acct = this.fleet.registry.byId(id);
+    if (!acct) {
+      throw new BridgeError({ status: 404, code: "no_account", message: `no such account: ${id}` });
+    }
+    // Token: random hex, unique per invocation.
+    const token = `probe-${randomId(24)}`;
+    const host = this.config.host === "0.0.0.0" ? "127.0.0.1" : this.config.host;
+    const url =
+      `http://${host}:${this.config.port}${PROBE_PATH}` +
+      `?id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}`;
+    // Register the waiter BEFORE spawning: the probe page can POST back
+    // within milliseconds of the tab opening.
+    const promise = new Promise<CheckupEntry>((settle, reject) => {
+      const timer = setTimeout(() => {
+        this.probeWaiters.delete(token);
+        reject(
+          new Error(
+            `fingerprint probe for "${id}" did not return within ${timeoutMs}ms ` +
+              `(check that the profile is logged in and the tab can reach ${host}:${this.config.port})`
+          )
+        );
+      }, timeoutMs);
+      timer.unref?.();
+      this.probeWaiters.set(token, { accountId: id, settle, reject, timer });
+    });
+    this.fleet.launcher.spawnProbeTab(acct.profileDir, url);
+    return promise;
   }
 
   /** Fleet CLI: raw (unexpanded) proxy string for the doctor probe.

@@ -45,6 +45,10 @@ export interface SurfaceProfile {
   extraArgs?: string[];
 }
 
+/** v4 §7.3: the recorded outcome of a fingerprint probe. Same shape as the
+ * probe's own measurement, minus the transport fields. */
+export type { CheckupEntry } from "./probe.js";
+
 export interface FleetAccount {
   id: string;
   label?: string;
@@ -62,6 +66,10 @@ export interface FleetAccount {
   proxy?: string;
   /** ADR-18: presentation knobs applied at launch (see SurfaceProfile). */
   surface?: SurfaceProfile;
+  /** §7.3: newest-first fingerprint probe results. The most recent is the
+   * "current" fingerprint `fleet doctor` shows; the history allows drift
+   * forensics (an account's canvas hash should not change mid-life). */
+  checkupHistory?: import("./probe.js").CheckupEntry[];
 }
 
 interface FleetFile {
@@ -181,6 +189,19 @@ export class FleetRegistry {
     if (!acct) throw new Error(`no such account: ${id}`);
     if (surface === null) delete acct.surface;
     else acct.surface = surface;
+    this.persist();
+    return acct;
+  }
+
+  /** §7.3: record a fingerprint probe result. Prepends to history, capped
+   * at 20 entries (a large drift log belongs in the operator's notes, not
+   * the fleet file). */
+  recordCheckup(id: string, entry: import("./probe.js").CheckupEntry): FleetAccount | null {
+    const acct = this.accounts.get(id);
+    if (!acct) return null;
+    const hist = acct.checkupHistory ?? [];
+    hist.unshift(entry);
+    acct.checkupHistory = hist.slice(0, 20);
     this.persist();
     return acct;
   }

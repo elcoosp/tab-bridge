@@ -15,6 +15,7 @@ import {
   notFound,
   mapTurnError,
 } from "./errors.js";
+import { PROBE_PATH, PROBE_RESULT_PATH } from "../fleet/probe.js";
 import { randomId } from "../util/async.js";
 import { log } from "../log.js";
 
@@ -89,6 +90,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers?: 
   res.end(JSON.stringify(body));
 }
 
+/** True when the request originated from the loopback interface. Used to
+ * gate the probe routes, which are intentionally auth-exempt (the probe
+ * page is a browser document and cannot present a bearer token). */
+function isLocalRequest(req: IncomingMessage): boolean {
+  const a = req.socket.remoteAddress ?? "";
+  return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1";
+}
+
 function authOk(bridge: TabBridge, req: IncomingMessage): boolean {
   if (!bridge.config.apiKey) return true;
   const header = req.headers.authorization ?? "";
@@ -113,6 +122,30 @@ async function handle(bridge: TabBridge, req: IncomingMessage, res: ServerRespon
   // ---- public health endpoint (no auth) -----------------------------------
   if (method === "GET" && url === "/healthz") {
     sendJson(res, 200, bridge.health());
+    return;
+  }
+
+  // ---- fingerprint probe (ADR-18, §7.3): loopback-only, no auth -----------
+  // The probe page is served by this bridge and loaded by the operator's own
+  // Chrome; it cannot present a bearer token, so these two routes are auth-
+  // exempt. Loopback-only enforcement keeps non-local callers out.
+  if (method === "GET" && url === PROBE_PATH) {
+    if (!isLocalRequest(req)) throw notFound();
+    bridge.serveProbeHtml(res, query.get("id") ?? "", query.get("token") ?? "");
+    return;
+  }
+  if (method === "POST" && url === PROBE_RESULT_PATH) {
+    if (!isLocalRequest(req)) throw notFound();
+    const raw = await readBody(req);
+    let body: unknown;
+    try {
+      body = JSON.parse(raw.toString("utf8") || "{}");
+    } catch {
+      throw badRequest("body is not valid JSON");
+    }
+    const r = bridge.fleetRecordProbeResult(body);
+    if (!r.ok) throw badRequest(`probe result rejected: ${r.reason ?? "unknown"}`);
+    sendJson(res, 200, { ok: true });
     return;
   }
 
@@ -696,6 +729,11 @@ async function handleFleet(
   if (method === "POST" && sub === "remove") {
     const removed = bridge.fleetRemove(id);
     sendJson(res, 200, { ok: true, removed });
+    return;
+  }
+  if (method === "POST" && sub === "checkup") {
+    const entry = await bridge.fleetCheckup(id);
+    sendJson(res, 200, { ok: true, checkup: entry });
     return;
   }
   if (method === "POST" && sub === "drain") {

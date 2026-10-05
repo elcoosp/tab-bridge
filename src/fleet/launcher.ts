@@ -250,6 +250,38 @@ export class FleetLauncher {
     return handles;
   }
 
+  /** §7.3: open a URL in a new tab of the given profile. When the profile's
+   * Chrome is already running, Chrome forwards the URL to the existing
+   * process and this transient child exits; the profile lock is Chrome's
+   * own. We do NOT track this child in `this.children` — the launcher's
+   * `isLaunched()` semantics must reflect the long-lived session process,
+   * not this one-shot tab opener. */
+  spawnProbeTab(profileDir: string, url: string): void {
+    let browser: string;
+    try {
+      browser = FleetLauncher.resolveBrowser(this.opts.browserPath);
+    } catch (e) {
+      log.error("fleet.probe-spawn-failed", { error: String(e) });
+      return;
+    }
+    const args = [
+      `--user-data-dir=${profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      url,
+    ];
+    const spawnFn = this.opts.spawnFn ?? ((cmd, a, o) => spawn(cmd, a, { stdio: "ignore", env: o.env }));
+    try {
+      const child = spawnFn(browser, args, { env: process.env });
+      child.on("error", (e) => log.error("fleet.probe-spawn-failed", { error: String(e) }));
+      // Do not register in this.children: the child may exit immediately
+      // (URL forwarded to an already-running Chrome) and would otherwise
+      // leave a stale map entry.
+    } catch (e) {
+      log.error("fleet.probe-spawn-failed", { error: String(e) });
+    }
+  }
+
   /** SIGTERM every child we own (bridge shutdown / account removal). */
   killAll(reason: string): void {
     for (const [id, child] of this.children) {
