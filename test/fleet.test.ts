@@ -1208,3 +1208,21 @@ test("group 38: /healthz — proxy_required_but_missing fires when an account la
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// group 39: AccountRegistry.remove drops the runtime record (E2E finding B)
+// ---------------------------------------------------------------------------
+test("group 39: AccountRegistry — remove() drops the runtime record", () => {
+  const reg = new AccountRegistry({});
+  upsertReady(reg, "a", fp("a"));
+  upsertReady(reg, "b", fp("b"));
+  assert.ok(reg.record("a"));
+  assert.equal(reg.remove("a"), true, "removing an existing account returns true");
+  assert.equal(reg.record("a"), undefined, "removed account is gone from record()");
+  assert.ok(
+    !reg.all().some((r) => r.id === "a"),
+    "removed account is gone from all()",
+  );
+  assert.ok(reg.all().some((r) => r.id === "b"), "other accounts survive the removal");
+  assert.equal(reg.remove("never-existed"), false, "removing an unknown id returns false");
+});

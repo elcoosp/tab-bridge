@@ -21,6 +21,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { log } from "../log.js";
 import type { SurfaceProfile } from "./registry.js";
 
@@ -148,8 +149,14 @@ export class FleetLauncher {
       "--no-default-browser-check",
     ];
     if (!req.manualExtension) {
-      args.push(`--disable-extensions-except=${req.extensionDir}`);
-      args.push(`--load-extension=${req.extensionDir}`);
+      // Chrome-family builds are inconsistent about resolving relative
+      // --load-extension paths. A caller who passed "./extension" can
+      // silently load nothing (no error, no SW, no HELLO) — we hit this
+      // in the E2E harness. Resolve to absolute here so the launch is
+      // independent of the child process's cwd.
+      const extDir = resolve(req.extensionDir);
+      args.push(`--disable-extensions-except=${extDir}`);
+      args.push(`--load-extension=${extDir}`);
     }
     if (req.proxy) {
       args.push(`--proxy-server=${req.proxy}`);

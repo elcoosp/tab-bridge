@@ -757,49 +757,78 @@ export class TabBridge {
         message: "fleet is not enabled (set --fleet-file to a non-empty path and restart)",
       });
     }
+    // E2E-harness fix A.1: fail fast before touching any state.
+    // Enrollments are serialized; starting a second one while the first is
+    // still open is a caller error, not a reason to add a dangling record.
+    // (Single-threaded event loop: no interleaving between this check and
+    // the begin() call below.)
+    const pending = this.fleet.enrollment.pendingAccountId;
+    if (pending !== null) {
+      throw new Error(
+        `enrollment already open for "${pending}" — complete or cancel it first (enrollments are serialized)`,
+      );
+    }
+    // E2E-harness fix A.2: registry.add validates id + duplicates itself;
+    // its throws happen BEFORE any state is mutated, so no rollback is
+    // needed for this step.
     const acct = this.fleet.registry.add({
       id: input.id,
       ...(input.label !== undefined ? { label: input.label } : {}),
     });
-    if (input.proxy !== undefined) this.fleet.registry.setProxy(acct.id, input.proxy);
-    if (input.surface !== undefined) this.fleet.registry.setSurface(acct.id, input.surface);
-    const persisted = this.fleet.registry.byId(acct.id)!;
-    this.fleet.accounts.upsert({
-      id: persisted.id,
-      ...(persisted.label !== undefined ? { label: persisted.label } : {}),
-      fingerprint: fingerprintOfDir(persisted.profileDir),
-      initial: "awaiting_login",
-    });
-    // Open the enrollment claim window first: the pool's worker-up handler
-    // attributes the next unknown instance to it. The promise is
-    // fire-and-forget; the CLI polls /v1/accounts for state.
-    void this.fleet.enrollment.begin(persisted.id, 10 * 60_000).catch((e) => {
-      // Bug-hunt fix: log enrollment timeout (or claim failure) so operators
-      // have a server-side signal, not just a silently-hung CLI poll.
-      log.warn("fleet.enroll-timeout", { accountId: persisted.id, error: String(e) });
-    });
-    // Launch the profile process.
+    // E2E-harness fix A.3: everything below this point can, in principle,
+    // fail (proxy URL validation, surface shape validation, an enrolment
+    // manager change, a filesystem error). Wrap it so a partial add is
+    // undone — otherwise the account sits in both registries in
+    // `awaiting_login` forever with no enrollment and no Chrome.
     try {
-      let proxyEndpoint: string | undefined;
-      try {
-        proxyEndpoint = proxyOf(persisted, process.env) ?? undefined;
-      } catch (err) {
-        log.error("fleet.proxy-unset", { accountId: persisted.id, error: String(err) });
-      }
-      this.fleet.launcher.launch({
-        accountId: persisted.id,
-        profileDir: persisted.profileDir,
-        extensionDir: this.config.extensionDir ?? "./extension",
-        manualExtension: this.config.fleetManualExtension === true,
-        ...(proxyEndpoint !== undefined ? { proxy: proxyEndpoint } : {}),
-        ...(persisted.surface !== undefined ? { surface: persisted.surface } : {}),
-        proxyRequired: this.config.fleetProxyRequired === true,
+      if (input.proxy !== undefined) this.fleet.registry.setProxy(acct.id, input.proxy);
+      if (input.surface !== undefined) this.fleet.registry.setSurface(acct.id, input.surface);
+      const persisted = this.fleet.registry.byId(acct.id)!;
+      this.fleet.accounts.upsert({
+        id: persisted.id,
+        ...(persisted.label !== undefined ? { label: persisted.label } : {}),
+        fingerprint: fingerprintOfDir(persisted.profileDir),
+        initial: "awaiting_login",
       });
+      // Open the enrollment claim window: the router's HELLO handler
+      // attributes the next unknown instance to it. The promise is
+      // fire-and-forget; the CLI polls /v1/accounts for state.
+      void this.fleet.enrollment.begin(persisted.id, 10 * 60_000).catch((e) => {
+        log.warn("fleet.enroll-timeout", { accountId: persisted.id, error: String(e) });
+      });
+      // Launch the profile process. A launch failure here is a
+      // configuration problem (proxy env unset, browser binary missing);
+      // the operator's next `fleet open` can retry, so we log but do NOT
+      // roll back — the record is a valid account, just not yet launched.
+      try {
+        let proxyEndpoint: string | undefined;
+        try {
+          proxyEndpoint = proxyOf(persisted, process.env) ?? undefined;
+        } catch (err) {
+          log.error("fleet.proxy-unset", { accountId: persisted.id, error: String(err) });
+        }
+        this.fleet.launcher.launch({
+          accountId: persisted.id,
+          profileDir: persisted.profileDir,
+          extensionDir: this.config.extensionDir ?? "./extension",
+          manualExtension: this.config.fleetManualExtension === true,
+          ...(proxyEndpoint !== undefined ? { proxy: proxyEndpoint } : {}),
+          ...(persisted.surface !== undefined ? { surface: persisted.surface } : {}),
+          proxyRequired: this.config.fleetProxyRequired === true,
+        });
+      } catch (e) {
+        log.error("fleet.enroll-launch-failed", { accountId: persisted.id, error: String(e) });
+        // The record persists; the operator can retry with `fleet open`.
+      }
+      return { id: persisted.id };
     } catch (e) {
-      log.error("fleet.enroll-launch-failed", { accountId: persisted.id, error: String(e) });
-      // The record persists; the operator can retry with `fleet open`.
+      // Roll back the registry mutations so no half-enrolled account
+      // remains. Order: runtime first, then persistent.
+      try { this.fleet.accounts.remove(acct.id); } catch { /* ignore */ }
+      try { this.fleet.registry.remove(acct.id); } catch { /* ignore */ }
+      log.warn("fleet.enroll-rollback", { accountId: acct.id, error: String(e) });
+      throw e;
     }
-    return { id: persisted.id };
   }
 
   /** Fleet CLI: open the account's window without touching enrollment. */
@@ -1016,6 +1045,11 @@ export class TabBridge {
     }
     const removed = this.fleet.registry.remove(id);
     if (removed) {
+      // E2E-harness fix B: also drop the runtime account record. Without
+      // this, /v1/accounts and /healthz keep listing the removed account
+      // forever, because they iterate `accounts.all()` — a different
+      // structure from `registry.all()`.
+      this.fleet.accounts.remove(id);
       // Release any sessions still bound to it so we do not leak counters.
       // Bug-hunt D2: ALSO compact the journal after clearing row.accountId,
       // so a restart does not resurrect a session pinned to a removed

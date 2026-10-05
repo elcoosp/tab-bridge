@@ -200,7 +200,57 @@ Endpoint shapes accepted by `fleet proxy`:
 Rejected: unknown schemes (`ftp://`), bare words (`banana`), whitespace
 in the host.
 
-### 3.3 Identity stability (C12)
+### 3.3 Worker tokens on real deployments
+
+A fresh fleet profile's extension dials `ws://127.0.0.1:8789/worker` on
+first boot, with **no `?token=`**. If the bridge requires a bearer (i.e.
+you passed `--api-key-env`), the WebSocket upgrade is rejected with
+`HTTP 401` (visible in the profile's DevTools console as *"HTTP
+Authentication failed; no valid credentials available"*), and the worker
+link never comes up.
+
+There are two ways to reconcile this:
+
+**Option A (recommended for a loopback desktop deployment): run the
+bridge keyless.**
+
+```bash
+node dist/src/index.js serve --host 127.0.0.1 --port 8789 \
+  --fleet-file=/var/lib/tab-bridge/fleet.json \
+  ...
+```
+
+Loopback-only bind is the trust boundary; the HTTP surface is not
+reachable from off-host. This is the deployment the E2E harness runs.
+
+**Option B (required when the HTTP surface is reachable beyond
+loopback): pre-seed each profile's `wsUrl` before first boot.**
+
+1. Launch the profile **without** the extension (or with the extension
+   but expect the dial to fail on the first attempt — that is fine).
+2. Open that profile's DevTools (⌥⌘I / Ctrl+Shift+I), Console tab.
+3. Run:
+
+   ```js
+   chrome.storage.sync.set({
+     wsUrl: "ws://127.0.0.1:8789/worker?token=YOUR_BEARER_TOKEN"
+   });
+   ```
+
+4. Reload the extension (chrome://extensions → Tab Bridge Worker → ⟳).
+5. Confirm the link: `fleet list` shows the account `ready`.
+
+Do this **once per profile**. `chrome.storage.sync` persists across
+browser restarts, and the token never leaves the profile's storage.
+
+**Do not** ship the token in the extension source; the extension is
+already installed by the time you know which bridge it will talk to.
+The runtime-set `wsUrl` is the correct place.
+
+A future version of `fleet add` may automate this via CDP; until then,
+the manual step above is the honest procedure.
+
+### 3.4 Identity stability (C12)
 
 An account's proxy and surface are part of its identity. Changing them
 mid-life is what a risk engine reads as "a different person behind the

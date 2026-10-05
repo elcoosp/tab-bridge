@@ -15,7 +15,8 @@
     "build": "tsc -p tsconfig.json",
     "test": "pnpm run build && node --test dist/test/*.test.js",
     "e2e": "node e2e/run-e2e.mjs",
-    "start": "node dist/src/index.js"
+    "start": "node dist/src/index.js",
+    "e2e-fleet": "node scripts/e2e-fleet.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

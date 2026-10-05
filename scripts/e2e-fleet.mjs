@@ -13,7 +13,12 @@
  *   - a real chat turn round-trip
  *   - 429 cooldown behavior
  *   - login-wall detection
- * Those remain human-driven drills; see docs/RUNBOOK.md.
+ * Those remain human-driven drills; see docs/RUNBOOK.md §8.
+ *
+ * Package manager: the harness never invokes npm or pnpm. The build step
+ * calls node_modules/.bin/tsc directly; the bridge is launched with the
+ * local node binary against dist/. This keeps the harness agnostic of
+ * pnpm-vs-npm and portable across CI images that ship only one of them.
  *
  * Environment:
  *   E2E_FLEET_KEEP=1           keep the temp dir on exit (for inspection)
@@ -26,15 +31,14 @@
  *   1  at least one failed
  *   2  skipped (no Chromium-family browser available)
  *
- * Run via: just e2e-fleet  (or)  node scripts/e2e-fleet.mjs
+ * Run via: pnpm e2e-fleet  (or)  node scripts/e2e-fleet.mjs
  */
 
 import { createHash } from "node:crypto";
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -50,11 +54,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
 const KEEP = process.env.E2E_FLEET_KEEP === "1";
 const TIMEOUT_MS = Number(process.env.E2E_FLEET_TIMEOUT_MS ?? 45_000);
-const PORT = Number(
-  process.env.E2E_FLEET_PORT ?? 19_000 + Math.floor(Math.random() * 1_000),
-);
+// The tab-bridge extension dials a FIXED default URL (its chrome.storage.sync
+// wsUrl, which ships as ws://127.0.0.1:8789/worker — see extension/README.md).
+// The harness MUST bind the same port, or the extension loads and silently
+// fails to dial. Default to 8789; E2E_FLEET_PORT is an advanced override
+// for operators who have pre-seeded each profile's wsUrl.
+const PORT = Number(process.env.E2E_FLEET_PORT ?? 8789);
+if (PORT !== 8789) {
+  console.log(
+    `WARN: E2E_FLEET_PORT=${PORT} differs from the extension's default 8789. ` +
+      `The worker will not link unless each profile's chrome.storage.sync.wsUrl ` +
+      `has been pre-seeded to ws://127.0.0.1:${PORT}/worker.`,
+  );
+}
 const BROWSER_OVERRIDE = process.env.E2E_FLEET_BROWSER;
-const API_KEY = "e2e-secret-key";
+// Empty: the harness bridge is keyless (see the spawn call's comment).
+// Override to test a keyed bridge — but a fresh profile cannot be told the
+// token, so a keyed run will time out at step 4. Kept as a knob for
+// forward-compat only.
+const API_KEY = "";
 
 const STAGGER_WINDOW_MS = 5_000;
 const BRIDGE_URL = `http://127.0.0.1:${PORT}`;
@@ -113,15 +131,17 @@ async function waitFor(pred, timeoutMs, intervalMs = 250) {
   return false;
 }
 
-/** Fetch JSON with the bearer token applied. Throws on non-2xx. */
+/** Fetch JSON. Sends a bearer only when API_KEY is non-empty (forward-compat
+ * with keyed bridges); the harness's own bridge runs keyless on loopback. */
 async function api(path, init = {}) {
+  const headers = {
+    "content-type": "application/json",
+    ...(API_KEY ? { authorization: `Bearer ${API_KEY}` } : {}),
+    ...(init.headers ?? {}),
+  };
   const res = await fetch(`${BRIDGE_URL}${path}`, {
     ...init,
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${API_KEY}`,
-      ...(init.headers ?? {}),
-    },
+    headers,
   });
   const text = await res.text();
   if (!res.ok) {
@@ -131,7 +151,7 @@ async function api(path, init = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Setup
+// Header
 // ---------------------------------------------------------------------------
 
 console.log("================================================================");
@@ -144,12 +164,19 @@ console.log(`  keep:          ${KEEP}`);
 console.log("");
 
 // -- Step 0: build ---------------------------------------------------------
-console.log("Step 0 — build (npm run build)");
+console.log("Step 0 — build (node_modules/.bin/tsc)");
+const tscBin = join(REPO_ROOT, "node_modules", ".bin", "tsc");
 try {
-  execSync("npm run build", { cwd: REPO_ROOT, stdio: "pipe" });
+  if (!existsSync(tscBin)) {
+    throw new Error(`tsc not found at ${tscBin} — run pnpm install first`);
+  }
+  execFileSync(tscBin, ["-p", "tsconfig.json"], { cwd: REPO_ROOT, stdio: "pipe" });
   check("build succeeds", true);
 } catch (e) {
-  const stderr = (e.stderr ?? Buffer.alloc(0)).toString("utf8");
+  const stderr =
+    e && typeof e.stderr !== "undefined"
+      ? e.stderr.toString("utf8")
+      : String(e);
   check("build succeeds", false, stderr.split("\n").slice(-3).join(" | "));
   process.exit(1);
 }
@@ -160,18 +187,14 @@ console.log("Step 1 — detect a non-stable Chromium-family browser");
 
 let browserPath = null;
 try {
-  const script = `
-    import('./dist/src/fleet/launcher.js').then(m => {
-      try { process.stdout.write(m.FleetLauncher.resolveBrowser(${JSON.stringify(BROWSER_OVERRIDE)})); }
-      catch (e) { process.stderr.write(String(e.message)); process.exit(1); }
-    });
-  `;
-  browserPath = execSync(`node --input-type=module -e ${JSON.stringify(script)}`, {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-  }).trim();
+  // The harness is ESM; import the compiled launcher directly. Previous
+  // versions shelled out with `node -e <multiline>` and the shell mangled
+  // the escaped newlines into a literal token, causing a SyntaxError even
+  // when a browser WAS available.
+  const mod = await import(`file://${REPO_ROOT}/dist/src/fleet/launcher.js`);
+  browserPath = mod.FleetLauncher.resolveBrowser(BROWSER_OVERRIDE);
 } catch (e) {
-  const msg = (e.stderr ?? Buffer.alloc(0)).toString("utf8").trim();
+  const msg = e instanceof Error ? e.message : String(e);
   console.log("");
   console.log(`SKIP — no Chromium-family browser available: ${msg || "(unknown)"}`);
   console.log("");
@@ -196,18 +219,24 @@ check("temp dir ready", existsSync(fleetFile));
 console.log("");
 console.log("Step 3 — start bridge (fleet enabled, launch=never, stagger=5s)");
 
-const bridgeEnv = {
-  ...process.env,
-  E2E_KEY: API_KEY,
-};
+// The harness runs the bridge keyless.
+//
+// Why: a fresh fleet profile's extension dials ws://127.0.0.1:<port>/worker
+// with no ?token=. If the bridge requires a bearer, the WS upgrade is
+// rejected with HTTP 401 (visible in the SW console as "HTTP Authentication
+// failed; no valid credentials available") and the SW flaps forever. There
+// is no way for the harness to inject the token into a fresh profile
+// without pre-seeding chrome.storage.sync.wsUrl via CDP, which is out of
+// scope here. On a real deployment the operator pre-seeds the wsUrl; see
+// docs/RUNBOOK.md §3.5. For the E2E, loopback-only + keyless is correct.
+const bridgeEnv = { ...process.env };
 const bridge = spawn(
-  "node",
+  process.execPath,
   [
-    "dist/src/index.js",
+    join(REPO_ROOT, "dist", "src", "index.js"),
     "serve",
     "--port", String(PORT),
     "--host", "127.0.0.1",
-    "--api-key-env", "E2E_KEY",
     "--stateful=true",
     "--auto-create-tabs=true",
     "--managed-only=true",
@@ -217,6 +246,9 @@ const bridge = spawn(
     "--fleet-launch", "never",
     "--fleet-launch-stagger", `${STAGGER_WINDOW_MS}ms`,
     "--fleet-checkup-timeout", "60s",
+    // Absolute path: relative --load-extension was silently ignored by
+    // some Chrome builds (the root cause of the first E2E failure).
+    "--extension-dir", join(REPO_ROOT, "extension"),
   ],
   {
     cwd: REPO_ROOT,
@@ -243,8 +275,17 @@ const bridgeReady = await waitFor(async () => {
 }, TIMEOUT_MS);
 check("bridge started and answered /healthz", bridgeReady);
 if (!bridgeReady) {
+  const tail = bridgeLog.join("").split("\n").slice(-15).join("\n      ");
   info("bridge log tail:");
-  info(bridgeLog.join("").split("\n").slice(-10).join("\n      "));
+  info(tail || "(empty)");
+  // Common failure: another process on the same port (e.g. a dev bridge
+  // already running on 8789). Make that explicit.
+  if (/EADDRINUSE|address already in use/i.test(tail)) {
+    info("");
+    info(`HINT: port ${PORT} is already in use. Stop the other process, or run`);
+    info(`      with E2E_FLEET_PORT=<port> (requires pre-seeding each profile's`);
+    info(`      wsUrl). The extension's default URL is ws://127.0.0.1:8789/worker.`);
+  }
   try { bridge.kill("SIGKILL"); } catch {}
   if (!KEEP) rmSync(tmpRoot, { recursive: true, force: true });
   process.exit(1);
@@ -284,6 +325,43 @@ try {
     } catch { return false; }
   }, TIMEOUT_MS);
   check("work enrolled and worker linked", workLinked);
+  if (!workLinked) {
+    const full = bridgeLog.join("");
+    info("");
+    info(`DIAGNOSTIC — the worker did not link within ${TIMEOUT_MS}ms.`);
+    info("");
+    info("Rendered launch args (from FleetLauncher.argsFor):");
+    try {
+      const mod = await import(`file://${REPO_ROOT}/dist/src/fleet/launcher.js`);
+      const probe = new mod.FleetLauncher({ browserPath });
+      const args = probe.argsFor({
+        accountId: "work",
+        profileDir: join(fleetRoot, "work"),
+        extensionDir: join(REPO_ROOT, "extension"),
+      });
+      for (const a of args) info(`  ${a}`);
+    } catch (e) {
+      info(`  (failed to reconstruct: ${String(e)})`);
+    }
+    info("");
+    info("Worker-link evidence in bridge log:");
+    const workerLines = full
+      .split("\n")
+      .filter(
+        (l) =>
+          /worker\.|fleet\.enroll|fleet\.launch|worker\.refused|uncaught|unhandled/i.test(l),
+      );
+    if (workerLines.length === 0) {
+      info("  (none — the extension never dialed, or the bridge rejected with");
+      info("   no log line, or nothing was captured)");
+    } else {
+      for (const l of workerLines.slice(-12)) info(`  ${l}`);
+    }
+    info("");
+    info(`Bridge log line count: ${full.split("\n").length}`);
+    info(`Bridge exit code observed: ${bridgeExited ? "yes" : "no"}`);
+    info("");
+  }
 
   await enroll("personal", surfacePersonal);
   const personalLinked = await waitFor(async () => {
@@ -310,7 +388,9 @@ check("two accounts present", !!work && !!personal, `count=${status.accounts.len
 check(
   "fingerprints differ (distinct profile dirs)",
   !!work && !!personal && work.fingerprint !== personal.fingerprint,
-  work && personal ? `${work.fingerprint.slice(0, 8)} / ${personal.fingerprint.slice(0, 8)}` : "",
+  work && personal
+    ? `${work.fingerprint.slice(0, 8)} / ${personal.fingerprint.slice(0, 8)}`
+    : "",
 );
 check(
   "work surface echoed as configured",
@@ -482,9 +562,7 @@ check(
 // -- Cleanup ----------------------------------------------------------------
 console.log("");
 console.log("Cleanup");
-if (bridgeExited) {
-  /* already dead */
-} else {
+if (!bridgeExited) {
   try { bridge.kill("SIGKILL"); } catch {}
 }
 // Best-effort kill any remaining Chrome from this run.
@@ -505,6 +583,10 @@ console.log("================================================================");
 console.log(`Result: ${passed} passed, ${failed} failed`);
 console.log("================================================================");
 if (failed > 0) {
+  console.log("");
+  console.log("Full bridge log tail (last 30 lines):");
+  const tailLines = bridgeLog.join("").split("\n").filter(Boolean).slice(-30);
+  for (const l of tailLines) console.log("  " + l);
   console.log("");
   console.log("Note: this harness exercises the fleet's plumbing (process launch,");
   console.log("WS routing, per-account pools, checkup, cleanup). It does NOT cover");

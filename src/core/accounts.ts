@@ -112,6 +112,14 @@ export class AccountRegistry {
     return r === undefined ? undefined : lazilyExpire(r);
   }
 
+  /** Remove an account from the runtime registry. Called by fleetRemove
+   * and by a rolled-back fleetEnroll. Without this the runtime record
+   * lingers forever in `all()` — the leak the E2E harness caught as
+   * "/v1/accounts still lists the removed account". */
+  remove(id: string): boolean {
+    return this.records.delete(id);
+  }
+
   all(): AccountRecord[] {
     return [...this.records.values()].map(lazilyExpire);
   }
