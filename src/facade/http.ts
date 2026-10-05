@@ -181,6 +181,12 @@ async function handle(bridge: TabBridge, req: IncomingMessage, res: ServerRespon
   }
 
   // ---- /v1/accounts (fleet view) ---------------------------------------------
+  // Bug-hunt B8: this endpoint is behind the normal auth gate (see the
+  // `if (!authOk(...))` check above) — it never returns proxy URLs or
+  // credentials, only booleans and observed exit IPs. When the bridge is
+  // started WITHOUT an api-key env, every authenticated endpoint (this one
+  // included) is open by design; that is the operator's choice, documented
+  // in the README's security section.
   if (method === "GET" && url === "/v1/accounts") {
     sendJson(res, 200, bridge.fleetStatus());
     return;

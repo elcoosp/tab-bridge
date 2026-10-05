@@ -55,6 +55,10 @@ export class FleetRouter {
       route: (hello: HelloFrame) => RouteDecision;
       /** Receives fleet-aggregated pool events (worker-up/down, health). */
       onFleetEvent?: (e: FleetEvent) => void;
+      /** Bug-hunt B7: optional sanity check for the account id returned by
+       * route(). When provided, attach() refuses a decision that names an
+       * unknown account instead of silently creating a throwaway pool. */
+      isKnownAccount?: (accountId: string) => boolean;
     }
   ) {}
 
@@ -121,6 +125,20 @@ export class FleetRouter {
           reason: decision.reason,
         });
         refuse(conn, decision.reason);
+        return;
+      }
+      // Bug-hunt B7: defensive check — a route() implementation must never
+      // return an account id that has no pool. In practice the bridge's
+      // route() only returns ids from the fleet registry or an active
+      // enrollment, but a future bug that typos an id would otherwise
+      // silently create a throwaway pool that no account ever populates.
+      if (this.opts.isKnownAccount && !this.opts.isKnownAccount(decision.accountId)) {
+        log.warn("worker.refused-unknown-route", {
+          remote: conn.remoteAddress,
+          accountId: decision.accountId,
+          reason: "route() returned an id with no registered account",
+        });
+        refuse(conn, "route target is not a registered account");
         return;
       }
       // Hand the connection AND the consumed HELLO to the target pool.

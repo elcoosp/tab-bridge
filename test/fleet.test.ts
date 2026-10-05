@@ -619,3 +619,53 @@ test("group 19: registry — duplicate id add throws a clear error", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// group 20: FleetRouter.attach — refuses unknown route targets (B7)
+// ---------------------------------------------------------------------------
+test("group 20: FleetRouter — isKnownAccount refuses unknown route target", () => {
+  const poolConfig: PoolConfig = {
+    autoCreateTabs: false,
+    managedOnly: true,
+    warmTabs: 0,
+    maxTabs: 4,
+    tabIdleCloseMs: 15 * 60_000,
+  };
+  let refused = 0;
+  let accepted = 0;
+  // Fake WsConnection: implements the tiny surface attach() touches.
+  const makeConn = () => {
+    const listeners: Record<string, Array<(...a: unknown[]) => void>> = {};
+    return {
+      isOpen: true,
+      remoteAddress: "127.0.0.1",
+      once(ev: string, fn: (...a: unknown[]) => void) { (listeners[ev] ??= []).push(fn); },
+      on(_ev: string, _fn: (...a: unknown[]) => void) {},
+      sendText(_s: string) { accepted += 1; },
+      sendPing(_b: Buffer) {},
+      close(_code?: number) { refused += 1; },
+      fire(ev: string, payload: unknown) {
+        for (const fn of listeners[ev] ?? []) fn(payload);
+      },
+    };
+  };
+  const router = new FleetRouter(poolConfig, {
+    route: () => ({ kind: "route", accountId: "ghost" }),
+    isKnownAccount: (id: string) => id === "real",
+  });
+  const conn = makeConn();
+  router.attach(conn as never);
+  // Feed a HELLO so the route() callback runs.
+  conn.fire("message", JSON.stringify({ t: "HELLO", v: 1, ext: "x", instance: "i-1" }));
+  // Refused because "ghost" is not known.
+  assert.ok(refused > 0, "unknown account must refuse the connection");
+  // With a known account, the same setup accepts.
+  const router2 = new FleetRouter(poolConfig, {
+    route: () => ({ kind: "route", accountId: "real" }),
+    isKnownAccount: (id: string) => id === "real",
+  });
+  const conn2 = makeConn();
+  router2.attach(conn2 as never);
+  conn2.fire("message", JSON.stringify({ t: "HELLO", v: 1, ext: "x", instance: "i-2" }));
+  assert.ok(accepted > 0, "known account must accept the connection");
+});

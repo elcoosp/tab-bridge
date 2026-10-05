@@ -241,6 +241,10 @@ export class TabBridge {
             reason: "unknown instance — run `fleet add <id>` in this profile",
           };
         },
+        // Bug-hunt B7: refuse a routing decision that names an account the
+        // fleet registry does not know. Defensive only — the route() callback
+        // above already only returns registry-known ids.
+        isKnownAccount: (accountId: string) => fleetRegistry.byId(accountId) !== undefined,
         onFleetEvent: (e) => {
           if (e.type === "worker-up") {
             accounts.markWorkerLinked(e.accountId);
