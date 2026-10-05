@@ -476,6 +476,53 @@ export class TabBridge {
     return a;
   }
 
+  /** On-demand relaunch (ADR-15, §6.5): when the fleet is active and a turn
+   * is placed on an account whose Chrome is not running, spawn it with the
+   * account's persisted identity (proxy + surface). No-op when the account
+   * is already running or when the fleet is disabled. Launcher failures are
+   * logged and swallowed — the caller's bind will surface the real error. */
+  private relaunchIfDown(accountId: string): void {
+    if (!this.fleet) return;
+    const acct = this.fleet.registry.byId(accountId);
+    if (!acct) return;
+    if (this.fleet.launcher.isLaunched(accountId)) return;
+    let proxy: string | undefined;
+    try {
+      proxy = proxyOf(acct, process.env) ?? undefined;
+    } catch (err) {
+      log.error("fleet.relaunch-proxy-unset", { accountId, error: String(err) });
+    }
+    try {
+      this.fleet.launcher.launch({
+        accountId,
+        profileDir: acct.profileDir,
+        extensionDir: this.config.extensionDir ?? "./extension",
+        manualExtension: this.config.fleetManualExtension === true,
+        ...(proxy !== undefined ? { proxy } : {}),
+        ...(acct.surface !== undefined ? { surface: acct.surface } : {}),
+        proxyRequired: this.config.fleetProxyRequired === true,
+      });
+      log.info("fleet.relaunch", { accountId });
+    } catch (e) {
+      log.error("fleet.relaunch-failed", { accountId, error: String(e) });
+    }
+  }
+
+  /** Poll the account's pool until its worker link is up, up to timeoutMs.
+   * Returns true once linked, false on timeout. Used only by the fleet
+   * on-demand path (the legacy path relies on the pool's own retry). */
+  private async waitForWorkerLink(accountId: string, timeoutMs: number): Promise<boolean> {
+    if (!this.fleet) return false;
+    const pool = this.fleet.router.pool(accountId);
+    if (pool.hasWorker) return true;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (pool.hasWorker) return true;
+    }
+    return false;
+  }
+
   /** Bind a session to a tab through the correct pool for its account. For
    * scripted adapters (no real pool) returns the legacy pseudo tab id 1 so
    * the contract-test path is untouched. */
@@ -489,6 +536,14 @@ export class TabBridge {
       pool?: WorkerPool;
     };
     if (!adapter.pool) return 1;
+    // On-demand relaunch (fleet path only): if the account's worker link
+    // is down, launch its Chrome and wait for the link before binding.
+    if (accountId !== undefined && this.fleet) {
+      if (!adapter.pool.hasWorker) {
+        this.relaunchIfDown(accountId);
+        await this.waitForWorkerLink(accountId, timeoutMs);
+      }
+    }
     const bound = await adapter.pool.bind(sessionId, timeoutMs, opts);
     return bound.tabId === undefined ? 1 : bound;
   }
