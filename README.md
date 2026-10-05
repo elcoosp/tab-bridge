@@ -38,6 +38,7 @@
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)
 - [Usage](#usage)
+- [Multi-account fleet (v4)](#multi-account-fleet-v4)
 - [Configuration](#configuration)
 - [Reliability and Error Semantics](#reliability-and-error-semantics)
 - [Testing](#testing)
@@ -137,6 +138,33 @@ Bridge exists to make that mismatch explicit, bounded, and testable.
   retry, reply scraping of post-submission nodes only, provider rate-limit detection,
   and a MAIN-world SSE hook that captures completions off the wire with a DOM observer
   fallback.
+
+### Multi-account fleet (`src/fleet/`, `src/core/accounts.ts`, `src/core/accountgate.ts`)
+
+- **Profiles as credentials** — one Chrome process per account with its own
+  `--user-data-dir`; the bridge never reads, stores, or moves cookies.
+- **Place-then-stick scheduling** — a session's account is decided once, at bind time,
+  and never changes. On a 429 the turn fails typed; the account cools; the session's
+  next turn goes to the same account after the window.
+- **Per-account FIFO gate** — each account gets its own turn-slot queue so a capacity
+  release on account B can never admit account A's waiter (the v2 capacity-drift bug).
+- **Per-account network identity** — one proxy endpoint per account, WebRTC pinned to
+  the tunnel, `${VAR}` references expanded only at launch (fail-closed), shared-path
+  detection in `fleet doctor` and optional refusal via `--fleet-proxy-required`.
+- **Per-account surface profile** — locale / timezone / window size / window position /
+  canvas noise, applied at launch. Honest surfaces only: the user-agent, GPU strings,
+  and font list stay real (self-contradicting fingerprints are worse than shared ones).
+- **Anti-synchrony pacing** — deterministic per-account boot stagger so N profiles do
+  not create their first tabs in the same second.
+- **Empirical fingerprint checkup** — with ≥2 accounts, `fleet add` opens a
+  bridge-served probe page in the new profile and reports the *measured* canvas hash,
+  language, timezone, window metrics, and exit IP. `fleet doctor` diffs them across
+  accounts; the history is retrievable from `GET /v1/fleet/:id/checkup-history`.
+- **Typed fleet errors** — `rate_limited` (429), `account_paused` (503), `fleet_busy`
+  (503), `bind_failed` (503); each names the account so a dashboard can route around
+  the failure without inspecting logs.
+- **Explicit escape hatch** — `fleet drain` moves sessions between accounts on
+  operator command, priced, serialized, and (with `--dry-run`) plan-only.
 
 ### Generation gate (`src/core/turngate.ts`)
 
@@ -323,6 +351,18 @@ echoes the effective configuration so drift is visible.
 | `--max-tabs` | `4` | Cap on worker-managed tabs; `0` = unbounded |
 | `--tab-idle-close` | `15m` | Close ready+unbound tabs idle beyond this; `0` = never |
 | `--worker-origin <origin>` | `chrome-extension://*` | Comma-separated allowed Origin values for the worker upgrade |
+| **Fleet (v4)** | | |
+| `--fleet-file <path>` | `fleet.json` | Fleet registry JSON. **Empty string disables the fleet** (byte-for-byte pre-v4 behavior) |
+| `--fleet-root <dir>` | beside fleet file | Profile dir root |
+| `--fleet-launch <mode>` | `on-demand` | `on-demand` \| `always` \| `never` — when the bridge launches account browsers |
+| `--fleet-launch-stagger <dur>` | `45s` | Boot-phase window for `launchAll`; `0` disables (ADR-19) |
+| `--fleet-proxy-required` | `false` | Refuse to launch accounts without a network identity (ADR-17) |
+| `--fleet-relogin-window <mode>` | `auto` | `auto` \| `never` — auto-open the profile window when re-login is needed |
+| `--fleet-manual-extension` | `false` | Skip `--load-extension` (branded-stable fallback) |
+| `--browser-path <path>` | probed | Browser binary override (probe order: Chromium, Dev, Canary, Brave, Edge) |
+| `--extension-dir <dir>` | `./extension` | Unpacked extension dir for `--load-extension` |
+| `--per-account-turns <n>` | `2` | Generation slots per account (ADR-12v3) |
+| `--max-sessions-per-account <n>` | `8` | Cap of sessions bound per account; `0` = unbounded |
 
 > [!WARNING]
 > The bridge drives a logged-in DeepSeek account. Keep `--host` on `127.0.0.1` and set
@@ -423,6 +463,14 @@ cannot prove is DOM behavior — that is Tier 2's job.
   server.
 - **One DeepSeek account is one capacity unit**: rate-limit windows and the
   concurrency cap are account-wide, so parallel human use shares the same budget.
+  The v4 fleet multiplies *slots* (N accounts × `perAccountTurns`), not availability —
+  a cooling account's sessions wait on that account; they do not hop.
+- **Two accounts on one machine are not made unlinkable.** The fleet removes every
+  linkage it can reach (exit IP, language, timezone, window geometry, canvas hash,
+  boot timing) and leaves the operator a short checklist for behavioral residue. What
+  remains shared — TLS / JA4 fingerprint, GPU strings, font list, screen resolution,
+  OS timezone on Windows — is not spoofed on purpose: a self-contradicting fingerprint
+  is a stronger flag than a shared truth.
 
 > [!WARNING]
 > Tab Bridge is a harness against a live, undocumented web UI. The guarantees it makes
