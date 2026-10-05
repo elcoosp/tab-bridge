@@ -57,6 +57,29 @@ async function main(argv: string[]): Promise<void> {
 
   const bridge = new TabBridge(config);
   const server = createHttpServer({ bridge });
+  // Bug-hunt G18: warn at startup if the bridge is running without an
+  // API key on a non-loopback host — anyone reachable can consume the
+  // account's rate-limit budget as if they were the operator.
+  if (
+    !config.apiKey &&
+    config.host !== "127.0.0.1" &&
+    config.host !== "::1" &&
+    config.host !== "localhost"
+  ) {
+    log.warn("bridge.no-auth-non-loopback", {
+      host: config.host,
+      message:
+        "no --api-key-env set and host is not loopback — any reachable client can consume the account",
+    });
+  }
+  // Bug-hunt G16: an explicit warning when extension auto-load is off.
+  // The symptom (no worker connects) is otherwise hard to diagnose.
+  if (config.fleetManualExtension === true) {
+    log.warn("fleet.manual-extension", {
+      message:
+        "extension auto-load is disabled — each profile needs a one-time manual 'Load unpacked'",
+    });
+  }
   bridge.attachWorkerLink(server);
 
   server.listen(config.port, config.host, () => {
@@ -98,6 +121,31 @@ async function main(argv: string[]): Promise<void> {
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+  // Bug-hunt G1/G8: on an uncaught exception / unhandled rejection the
+  // process would exit without disposing the bridge — leaving the fleet's
+  // Chrome children orphaned. Route both into the same dispose path as a
+  // signal, then exit non-zero.
+  process.on("uncaughtException", (e) => {
+    log.error("bridge.uncaught-exception", {
+      message: e.message,
+      stack: e.stack?.split("\n").slice(0, 6).join(" | "),
+    });
+    try {
+      bridge.dispose();
+    } catch {
+      /* ignore */
+    }
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    log.error("bridge.unhandled-rejection", { reason: String(reason) });
+    try {
+      bridge.dispose();
+    } catch {
+      /* ignore */
+    }
+    process.exit(1);
+  });
 
   server.on("error", (e) => {
     log.error("bridge.listen-error", { message: (e as Error).message });

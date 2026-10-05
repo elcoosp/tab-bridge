@@ -1044,3 +1044,74 @@ test("group 34: fleet enroll — invalid id surfaces as a typed error", async ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// group 35: config — --fleet-launch=always requires a non-empty --fleet-file (G3)
+// ---------------------------------------------------------------------------
+test("group 35: parseServeArgs — cross-flag validation for --fleet-launch", async () => {
+  const cfgPath = new URL("../src/config.js", import.meta.url).href;
+  const m = (await import(cfgPath)) as { parseServeArgs: (args: string[]) => unknown };
+  // Refused combination.
+  assert.throws(
+    () => m.parseServeArgs(["--fleet-launch=always", "--fleet-file="]),
+    /--fleet-launch=always requires/
+  );
+  // Allowed: launch mode set but file present.
+  m.parseServeArgs(["--fleet-launch=always", "--fleet-file=fleet.json"]);
+  // Allowed: file cleared but launch mode is not "always".
+  m.parseServeArgs(["--fleet-launch=on-demand", "--fleet-file="]);
+  // Allowed: default everything.
+  m.parseServeArgs([]);
+});
+
+// ---------------------------------------------------------------------------
+// group 36: fleetStatus capacity naming + gate-disabled semantics (G11/G12)
+// ---------------------------------------------------------------------------
+test("group 36: fleetStatus — turnSlots null when gate disabled, sessionsInUse alias", async () => {
+  const { TabBridge } = await import("../src/bridge.js");
+  const { DEFAULTS } = await import("../src/config.js");
+  const dir = tmpDir();
+  try {
+    const fleetFile = join(dir, "fleet.json");
+    writeFileSync(fleetFile, JSON.stringify({ v: 1, accounts: [] }));
+    const bridge = new TabBridge({
+      ...DEFAULTS,
+      fleetFile,
+      fleetRoot: join(dir, "home"),
+      dbPath: "",
+    });
+    try {
+      // With the default (perAccountTurns=2) and no accounts: turnSlots=0
+      // and sessionsInUse=0 with sessionSlots alias.
+      const status = bridge.fleetStatus() as {
+        capacity: {
+          turnSlots: number | null;
+          sessionsInUse: number;
+          sessionSlots: number;
+        };
+      };
+      assert.equal(status.capacity.turnSlots, 0);
+      assert.equal(status.capacity.sessionsInUse, 0);
+      assert.equal(status.capacity.sessionSlots, 0);
+    } finally {
+      bridge.dispose();
+    }
+
+    // A second bridge with the gate disabled reports turnSlots=null.
+    const bridge2 = new TabBridge({
+      ...DEFAULTS,
+      fleetFile,
+      fleetRoot: join(dir, "home"),
+      dbPath: "",
+      perAccountTurns: 0,
+    });
+    try {
+      const status2 = bridge2.fleetStatus() as { capacity: { turnSlots: number | null } };
+      assert.equal(status2.capacity.turnSlots, null);
+    } finally {
+      bridge2.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -317,6 +317,11 @@ export function parseServeArgs(argv: string[]): Config {
         throw new Error(`unknown flag: ${flag}`);
     }
   }
+  // Bug-hunt G3: cross-flag validation. --fleet-launch=always has nothing
+  // to launch when the fleet is disabled by an empty --fleet-file.
+  if (cfg.fleetLaunch === "always" && (!cfg.fleetFile || cfg.fleetFile.length === 0)) {
+    throw new Error("--fleet-launch=always requires --fleet-file to be a non-empty path");
+  }
   return cfg;
 }
 

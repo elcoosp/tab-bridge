@@ -218,6 +218,13 @@ export class TabBridge {
             `  → fix the file, or start with --fleet-file="" to run in single-account mode`
         );
       }
+      // Bug-hunt G2: log the resolved fleet file path so a service manager
+      // (systemd/launchd) that starts the bridge from an unexpected CWD
+      // shows the actual file location in the log.
+      log.info("fleet.registry-opened", {
+        path: fleetRegistry.path,
+        accounts: fleetRegistry.all().length,
+      });
       const accounts = new AccountRegistry({
         maxSessionsPerAccount: config.maxSessionsPerAccount ?? 8,
       });
@@ -292,6 +299,31 @@ export class TabBridge {
               fleetRegistry.markEnrolled(e.accountId);
             } else if (e.state === "auth_invalid") {
               accounts.markNeedsRelogin(e.accountId, e.detail);
+              // Bug-hunt G13: honor --fleet-relogin-window (default "auto").
+              // Bring the account's window back up so the human can complete
+              // the captcha. Only attempt when the profile's Chrome is
+              // down — a second launch on a live profile would fail with
+              // "account already launched", so a live profile just logs
+              // that the operator's window is already available.
+              if (config.fleetReloginWindow !== "never") {
+                const rec = accounts.record(e.accountId);
+                if (rec && !rec.workerLinked) {
+                  try {
+                    this.fleetOpenWindow(e.accountId);
+                    log.info("fleet.relogin-window-opened", { accountId: e.accountId });
+                  } catch (err) {
+                    log.warn("fleet.relogin-window-failed", {
+                      accountId: e.accountId,
+                      error: String(err),
+                    });
+                  }
+                } else {
+                  log.info("fleet.relogin-requested", {
+                    accountId: e.accountId,
+                    window: "already-open",
+                  });
+                }
+              }
             } else if (e.state === "rate_limited") {
               accounts.markCooling(e.accountId, RATE_LIMIT_COOLDOWN_SEC);
             } else if (e.state === "server_busy") {
@@ -679,7 +711,14 @@ export class TabBridge {
       accounts,
       capacity: {
         readyAccounts: readyRows.length,
-        turnSlots: readyRows.length * maxTurns,
+        // Bug-hunt G11: when the per-account gate is disabled (maxTurns=0),
+        // "0 turn slots" is misleading — the honest answer is null (no
+        // tracked limit). Consumers render null as "unlimited".
+        turnSlots: maxTurns === 0 ? null : readyRows.length * maxTurns,
+        // Bug-hunt G12: this field used to be called `sessionSlots` but
+        // reported the count of *bound* sessions, not a capacity. Renamed
+        // to be honest; the old name is kept as an alias for one release.
+        sessionsInUse: rows.reduce((s, r) => s + r.activeSessions, 0),
         sessionSlots: rows.reduce((s, r) => s + r.activeSessions, 0),
         shortestCooldownInSec: this.fleet.accounts.shortestCooldownSec(),
       },
