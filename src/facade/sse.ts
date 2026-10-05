@@ -53,6 +53,19 @@ export class SseStream {
     this.res.flushHeaders?.();
   }
 
+  /** v4 §10.3: emit a metadata prelude as an SSE comment frame
+   * (universal compatibility — every OpenAI-compatible SSE client
+   * ignores comment lines). Used to advertise X-Fleet-Account as early
+   * as possible without requiring clients to parse extra data frames. */
+  sendMeta(fields: Record<string, unknown>): void {
+    if (this.clientGone) return;
+    try {
+      this.res.write(`: meta ${JSON.stringify(fields)}\n\n`);
+    } catch {
+      /* client gone — other write paths drop */
+    }
+  }
+
   sendChoice(delta: ChatChoiceDelta, model: string, id: string, created: number): void {
     this.start(model);
     this.write({

@@ -60,6 +60,12 @@ export interface TurnEvents {
   onCall?(call: ParsedCall): void;
   onStatus?(code: "submitting" | "streaming" | "done" | "aborted"): void;
   onPlan?(plan: PlanName, reason: string): void;
+  /** v4 ADR-13v3: fired once, at the very start of the turn, after
+   * place-then-stick has bound the session (or resolved it). Carries the
+   * account id serving this turn so callers (the SSE writer especially)
+   * can advertise X-Fleet-Account before any content. Never fired for
+   * ephemeral/legacy turns without an account. */
+  onAccount?(accountId: string): void;
 }
 
 export interface TurnOutput {
@@ -485,6 +491,7 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       tabHash: outputHash,
       calls: calls.length,
       repairs: repairsUsed,
+      ...(row.accountId !== undefined ? { accountId: row.accountId } : {}),
     });
     if (process.env.TAB_BRIDGE_DEBUG) {
       log.info("turn.emitted", {
@@ -530,6 +537,7 @@ export async function runTurn(req: TurnRequest, events: TurnEvents = {}): Promis
       plan: plan.plan,
       error: err.message || String(e),
       ...(submitNoBubble ? { submit_no_bubble: true } : {}),
+      ...(row.accountId !== undefined ? { accountId: row.accountId } : {}),
     });
     throw e;
   }

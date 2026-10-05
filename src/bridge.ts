@@ -418,6 +418,9 @@ export class TabBridge {
           ) => this.bindTabForAccount(row.accountId, sid, ms, { noCreate: true, ...(extra ?? {}) })
         : (sid: string, ms: number, extra?: { chatUrl?: string | null }) =>
             this.bindTabForAccount(row.accountId, sid, ms, extra ?? {});
+      // v4 §10.3: advertise the serving account before any content. The
+      // SSE writer emits this as a comment frame the instant it fires.
+      if (row.accountId !== undefined) params.events?.onAccount?.(row.accountId);
       const out = await runTurn(
         {
           messages: params.messages,
@@ -892,16 +895,28 @@ export class TabBridge {
       ? (() => {
           const rows = this.fleet!.accounts.all();
           const findings = isolationConflicts(this.fleet!.registry.all());
+          const ready = rows.filter((r) => r.state === "ready").length;
+          const maxSessions = this.config.maxSessionsPerAccount ?? 8;
+          // Alerts: surface conditions a dashboard can page on without
+          // having to compute them from the raw rows.
+          const alerts: string[] = [];
+          if (rows.length > 0 && ready === 0) alerts.push("no_ready_accounts");
+          if (findings.length > 0) alerts.push("isolation_findings");
+          if (maxSessions > 0) {
+            const full = rows.filter((r) => r.state === "ready" && r.activeSessions >= maxSessions).length;
+            if (full > 0 && full === ready) alerts.push("all_ready_accounts_at_session_cap");
+          }
           return {
             enabled: true,
             accounts: rows.length,
-            ready: rows.filter((r) => r.state === "ready").length,
+            ready,
             cooling: rows.filter((r) => r.state === "cooling").length,
             needsRelogin: rows.filter((r) => r.state === "needs_relogin").length,
             awaitingLogin: rows.filter((r) => r.state === "awaiting_login").length,
             sessions: rows.reduce((s, r) => s + r.activeSessions, 0),
             queueDepth: 0,
             isolationFindings: findings.length,
+            alerts,
           };
         })()
       : { enabled: false };

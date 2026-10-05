@@ -426,6 +426,11 @@ async function handleChat(bridge: TabBridge, req: IncomingMessage, res: ServerRe
     let roleSent = false;
     let toolIndex = 0;
     const events = {
+      // v4 §10.3: SSE comment frame carrying X-Fleet-Account as soon as
+      // the account is known — universal-compatibility metadata channel.
+      onAccount: (accountId: string) => {
+        sse.sendMeta({ "x-fleet-account": accountId });
+      },
       onContent: (text: string) => {
         // P6: a client that has gone away cannot read the stream — stop
         // stringifying and writing for a turn whose output goes nowhere.
