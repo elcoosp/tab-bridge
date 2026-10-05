@@ -16,7 +16,7 @@ import type { ChatProviderAdapter } from "./adapter/types.js";
 import { BridgeError, queueFull, queueTimeout, clientGone, RATE_LIMIT_COOLDOWN_SEC, SERVER_BUSY_COOLDOWN_SEC } from "./facade/errors.js";
 import { TurnGate, GateRejectionError } from "./core/turngate.js";
 import { FleetRegistry, fingerprintOfDir, proxyOf, isolationConflicts, type SurfaceProfile } from "./fleet/registry.js";
-import { FleetLauncher } from "./fleet/launcher.js";
+import { FleetLauncher, staggerDelayMs } from "./fleet/launcher.js";
 import { EnrollmentManager } from "./fleet/enroll.js";
 import { FleetRouter, type HelloFrame } from "./pool/fleet.js";
 import type { PoolConfig } from "./pool/pool.js";
@@ -510,8 +510,16 @@ export class TabBridge {
     const rows = this.fleet.accounts.all();
     const maxSessions = this.config.maxSessionsPerAccount ?? 8;
     const maxTurns = this.config.perAccountTurns ?? 2;
+    // Deterministic boot phase (ADR-19) so the doctor can show it without
+    // recomputing; zero when stagger is disabled.
+    const staggerWindow = this.config.fleetLaunchStaggerMs ?? 45_000;
     const accounts = rows.map((r) => {
       const acct = this.fleet!.registry.byId(r.id);
+      // Boot phase: same deterministic function the launcher uses.
+      let bootPhaseMs = 0;
+      if (staggerWindow > 0) {
+        bootPhaseMs = staggerDelayMs(r.id, staggerWindow);
+      }
       return {
         id: r.id,
         ...(r.label !== undefined ? { label: r.label } : {}),
@@ -526,6 +534,9 @@ export class TabBridge {
         awaitingHuman: r.state === "awaiting_login" || r.state === "needs_relogin",
         network: { proxy: acct?.proxy ? true : false, exitIp: null, exitProbe: "skipped" },
         surface: acct?.surface ?? {},
+        bootPhaseMs,
+        ...(acct?.enrolledAt !== undefined ? { enrolledAt: acct.enrolledAt } : {}),
+        ...(acct?.createdAt !== undefined ? { createdAt: acct.createdAt } : {}),
       };
     });
     const readyRows = rows.filter((r) => r.state === "ready" && r.workerLinked);
@@ -630,6 +641,16 @@ export class TabBridge {
       ...(acct.surface !== undefined ? { surface: acct.surface } : {}),
       proxyRequired: this.config.fleetProxyRequired === true,
     });
+  }
+
+  /** Fleet CLI: raw (unexpanded) proxy string for the doctor probe.
+   * Never logged, never surfaced in /v1/accounts, never expanded here —
+   * the caller is responsible for expanding ${VAR} against its own
+   * environment (fail-closed). Returns null when the account has no proxy. */
+  fleetRawProxy(id: string): string | null {
+    if (!this.fleet) return null;
+    const acct = this.fleet.registry.byId(id);
+    return acct?.proxy ?? null;
   }
 
   /** Fleet CLI: set/clear the account's network identity. */

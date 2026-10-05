@@ -639,6 +639,18 @@ async function handleFleet(
   const id = parts[2];
   const sub = parts[3];
 
+  // Operator-only debug endpoint: returns the account's RAW proxy string so
+  // the `fleet doctor` CLI can run an exit-IP probe through the actual
+  // endpoint. Never returns the value in any other response, never logs it,
+  // and never persists it expanded (ADR-10v2 hygiene): the raw value may
+  // contain ${VAR} references which the CLI expands through process.env
+  // before probing.
+  if (method === "GET" && sub === "_debug_proxy") {
+    const raw = bridge.fleetRawProxy(id);
+    sendJson(res, 200, { proxy: raw });
+    return;
+  }
+
   if (method === "POST" && sub === "open") {
     bridge.fleetOpenWindow(id);
     sendJson(res, 200, { ok: true });
