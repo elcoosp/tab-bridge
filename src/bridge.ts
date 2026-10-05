@@ -13,11 +13,13 @@ import { runTurn, type TurnEvents, type TurnOutput } from "./engine.js";
 import type { ChatMessage, ToolCall } from "./core/canonical.js";
 import type { ToolSpec } from "./emulation/types.js";
 import type { ChatProviderAdapter } from "./adapter/types.js";
-import { BridgeError, queueFull, queueTimeout, clientGone } from "./facade/errors.js";
+import { BridgeError, queueFull, queueTimeout, clientGone, RATE_LIMIT_COOLDOWN_SEC, SERVER_BUSY_COOLDOWN_SEC } from "./facade/errors.js";
 import { TurnGate, GateRejectionError } from "./core/turngate.js";
 import { FleetRegistry, fingerprintOfDir, proxyOf, isolationConflicts, type SurfaceProfile } from "./fleet/registry.js";
 import { FleetLauncher } from "./fleet/launcher.js";
 import { EnrollmentManager } from "./fleet/enroll.js";
+import { FleetRouter, type HelloFrame } from "./pool/fleet.js";
+import type { PoolConfig } from "./pool/pool.js";
 import { AccountRegistry } from "./core/accounts.js";
 import { AccountTurnGate } from "./core/accountgate.js";
 import { existsSync } from "node:fs";
@@ -86,7 +88,12 @@ export class TabBridge {
     launcher: FleetLauncher;
     enrollment: EnrollmentManager;
     gate: AccountTurnGate;
+    router: FleetRouter;
   } | null;
+  /** Per-account DeepSeekAdapter instances, created lazily the first time a
+   * turn is routed to an account. The default `this.adapter` is used for the
+   * legacy (fleet-disabled) path so existing deployments are untouched. */
+  private readonly adaptersByAccount = new Map<string, ChatProviderAdapter>();
   private readonly wsServer: WsServer;
   private readonly bindTabImpl: (
     sessionId: string,
@@ -113,13 +120,14 @@ export class TabBridge {
     for (const row of this.store.load().values()) {
       this.registry.restore(row);
     }
-    this.pool = new WorkerPool({
+    const poolConfig: PoolConfig = {
       autoCreateTabs: config.autoCreateTabs,
       managedOnly: config.managedOnly,
       warmTabs: config.warmTabs,
       maxTabs: config.maxTabs ?? 4,
       tabIdleCloseMs: config.tabIdleCloseMs ?? 15 * 60_000,
-    });
+    };
+    this.pool = new WorkerPool(poolConfig);
     this.adapter = adapter ?? new DeepSeekAdapter(this.pool, { maxPromptChars: config.maxPromptChars });
     this.turnGate = new TurnGate({
       maxConcurrent: config.maxConcurrentTurns,
@@ -144,7 +152,13 @@ export class TabBridge {
       // (accept chrome-extension:// and Origin-less clients, reject web-page
       // origins) applies otherwise.
       ...(config.workerOrigins !== undefined ? { allowedOrigins: config.workerOrigins } : {}),
-      onConnection: (conn) => this.pool.attach(conn),
+      onConnection: (conn) => {
+        // Fleet routing (ADR-11v2): when the fleet is enabled, each worker
+        // HELLO is routed to the pool of its account. The legacy single-pool
+        // path is preserved when the fleet is disabled.
+        if (this.fleet?.router) this.fleet.router.attach(conn);
+        else this.pool.attach(conn);
+      },
     });
 
     // ---- Fleet subsystem (ADR-15) -----------------------------------------
@@ -186,56 +200,57 @@ export class TabBridge {
         capacity: config.queueCapacity,
         queueTimeoutMs: config.queueTimeoutMs,
       });
-      this.fleet = { registry: fleetRegistry, accounts, launcher, enrollment, gate };
 
-      // Bridge the single pool's events into fleet account state. Until
-      // FleetRouter-per-account routing lands, every worker HELLO carries an
-      // instance that we attribute to whatever enrollment is currently open
-      // (serialized by construction); every HEALTH ok promotes the most
-      // recently-added awaiting_login account to ready. This is the honest
-      // bridge for a single-link deployment; multi-account parallel
-      // enrollment needs the router.
-      this.pool.on("event", (e) => {
-        if (!this.fleet) return;
-        if (e.type === "worker-up") {
-          const pending = this.fleet.enrollment.pendingAccountId;
-          if (pending && e.info.instance) {
+      // FleetRouter (ADR-11v2): one WorkerPool per account. The route()
+      // callback resolves a worker HELLO to an account (known instance via
+      // the registry, or a fresh claim via an open enrollment), and refuses
+      // unknown instances fail-closed. onFleetEvent() forwards per-account
+      // pool events into account-state transitions.
+      const router = new FleetRouter(poolConfig, {
+        route: (hello: HelloFrame) => {
+          const known = hello.instance
+            ? fleetRegistry.accountForInstance(hello.instance)
+            : undefined;
+          if (known) return { kind: "route", accountId: known.id };
+          const claimed = enrollment.consider(hello, known !== undefined);
+          if (claimed) {
             try {
-              this.fleet.registry.bindInstance(pending, e.info.instance);
+              fleetRegistry.bindInstance(claimed, hello.instance as string);
             } catch (err) {
               log.warn("fleet.instance-bind-failed", {
-                accountId: pending,
-                instance: e.info.instance,
+                accountId: claimed,
+                instance: hello.instance,
                 error: String(err),
               });
             }
-            this.fleet.accounts.markWorkerLinked(pending);
-            this.fleet.enrollment.consider(
-              { t: "HELLO", v: 1, ext: e.info.ext, instance: e.info.instance },
-              false
-            );
-          } else {
-            // No open enrollment: mark every known instance-linked account
-            // as linked (best-effort single-pool behaviour).
-            for (const a of this.fleet.registry.all()) {
-              if (a.instanceId) this.fleet.accounts.markWorkerLinked(a.id);
+            return { kind: "route", accountId: claimed };
+          }
+          return {
+            kind: "refuse",
+            reason: "unknown instance — run `fleet add <id>` in this profile",
+          };
+        },
+        onFleetEvent: (e) => {
+          if (e.type === "worker-up") {
+            accounts.markWorkerLinked(e.accountId);
+          } else if (e.type === "worker-down") {
+            accounts.markWorkerDown(e.accountId);
+          } else if (e.type === "health") {
+            if (e.state === "ok") {
+              accounts.markLoginOk(e.accountId);
+              fleetRegistry.markEnrolled(e.accountId);
+            } else if (e.state === "auth_invalid") {
+              accounts.markNeedsRelogin(e.accountId, e.detail);
+            } else if (e.state === "rate_limited") {
+              accounts.markCooling(e.accountId, RATE_LIMIT_COOLDOWN_SEC);
+            } else if (e.state === "server_busy") {
+              accounts.markCooling(e.accountId, SERVER_BUSY_COOLDOWN_SEC);
             }
           }
-        } else if (e.type === "worker-down") {
-          for (const r of this.fleet.accounts.all()) {
-            if (r.workerLinked) this.fleet.accounts.markWorkerDown(r.id);
-          }
-        } else if (e.type === "health" && e.state === "ok") {
-          const awaiting = this.fleet.accounts
-            .all()
-            .filter((r) => r.state === "awaiting_login");
-          if (awaiting.length > 0) {
-            this.fleet.accounts.markLoginOk(awaiting[0].id);
-            const acct = this.fleet.registry.byId(awaiting[0].id);
-            if (acct) this.fleet.registry.markEnrolled(acct.id);
-          }
-        }
+        },
       });
+
+      this.fleet = { registry: fleetRegistry, accounts, launcher, enrollment, gate, router };
 
       // --fleet-launch=always ⇒ launch every persisted account at boot with
       // its own deterministic stagger phase (ADR-19).
@@ -362,15 +377,20 @@ export class TabBridge {
         gateWaitMs = await this.turnGate.acquire(row.sessionId, params.signal);
         gateHeld = true;
       }
+      // Select the adapter for this session's account. When the fleet is
+      // active, the adapter rides the account's own WorkerPool; otherwise
+      // this is the default adapter over the default pool (legacy path).
+      const adapter = this.adapterForAccount(row.accountId);
       // P9: after admission, a client that gives up would otherwise leave
       // the bridge streaming DeepSeek's full reply into a dead socket.
-      const adapterWithReqId = this.adapter as ChatProviderAdapter & {
+      const adapterWithReqId = adapter as ChatProviderAdapter & {
         reqIdForTab?: (tabId: number) => string | undefined;
+        pool?: { abortIntent: (reqId: string) => void };
       };
       const onClientAbort = (): void => {
         if (row.tabId === null) return;
         const reqId = adapterWithReqId.reqIdForTab?.(row.tabId);
-        if (reqId) this.pool.abortIntent(reqId);
+        if (reqId) adapterWithReqId.pool?.abortIntent(reqId);
       };
       onClientAbortRef = onClientAbort;
       if (params.signal) {
@@ -384,8 +404,9 @@ export class TabBridge {
             sid: string,
             ms: number,
             extra?: { chatUrl?: string | null }
-          ) => this.bindTabImpl(sid, ms, { noCreate: true, ...(extra ?? {}) })
-        : this.bindTabImpl;
+          ) => this.bindTabForAccount(row.accountId, sid, ms, { noCreate: true, ...(extra ?? {}) })
+        : (sid: string, ms: number, extra?: { chatUrl?: string | null }) =>
+            this.bindTabForAccount(row.accountId, sid, ms, extra ?? {});
       const out = await runTurn(
         {
           messages: params.messages,
@@ -393,11 +414,11 @@ export class TabBridge {
           think: params.think,
           row,
           registry: this.registry,
-          adapter: this.adapter,
           repairRounds: this.config.repairRounds,
           turnTimeoutMs: this.config.turnTimeoutMs,
           bindTimeoutMs: this.config.bindTimeoutMs,
           holdbackCeiling: this.config.holdbackCeiling,
+          adapter,
           bindTab,
           resetOnSeed: this.config.resetOnSeed ?? "auto",
         },
@@ -438,6 +459,38 @@ export class TabBridge {
         }
       }
     }
+  }
+
+  /** The adapter that serves a given account: the default adapter when the
+   * fleet is disabled or the account id is absent (legacy path), otherwise a
+   * per-account DeepSeekAdapter over that account's WorkerPool — created
+   * lazily on first use. */
+  private adapterForAccount(accountId: string | undefined): ChatProviderAdapter {
+    if (!accountId || !this.fleet || !this.fleet.router) return this.adapter;
+    let a = this.adaptersByAccount.get(accountId);
+    if (!a) {
+      const pool = this.fleet.router.pool(accountId);
+      a = new DeepSeekAdapter(pool, { maxPromptChars: this.config.maxPromptChars });
+      this.adaptersByAccount.set(accountId, a);
+    }
+    return a;
+  }
+
+  /** Bind a session to a tab through the correct pool for its account. For
+   * scripted adapters (no real pool) returns the legacy pseudo tab id 1 so
+   * the contract-test path is untouched. */
+  private async bindTabForAccount(
+    accountId: string | undefined,
+    sessionId: string,
+    timeoutMs: number,
+    opts: { noCreate?: boolean; chatUrl?: string | null } = {}
+  ): Promise<number | { tabId: number; dirty?: boolean }> {
+    const adapter = this.adapterForAccount(accountId) as ChatProviderAdapter & {
+      pool?: WorkerPool;
+    };
+    if (!adapter.pool) return 1;
+    const bound = await adapter.pool.bind(sessionId, timeoutMs, opts);
+    return bound.tabId === undefined ? 1 : bound;
   }
 
   /** Fleet status snapshot — the wire shape of GET /v1/accounts. */
@@ -616,6 +669,13 @@ export class TabBridge {
           row.pendingReset = true;
         }
       }
+      // Drop the account's pool + adapters so a later re-enroll starts clean.
+      try {
+        this.fleet.router.detach(id, `removed:${id}`);
+      } catch {
+        /* ignore */
+      }
+      this.adaptersByAccount.delete(id);
       // Best-effort: kill the child if still running.
       try {
         this.fleet.launcher.killAll(`removed:${id}`);

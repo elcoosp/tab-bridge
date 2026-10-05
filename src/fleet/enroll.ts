@@ -43,7 +43,14 @@ export class EnrollmentManager {
               abort(new Error(`enrollment for "${accountId}" timed out after ${timeoutMs}ms (login not observed)`));
             }, timeoutMs)
           : null;
-      timer?.unref?.();
+      // NOTE: intentionally NOT unref'd. The timer is what rejects the
+      // enrollment promise on timeout, and an awaited promise must be
+      // backed by a handle that keeps the loop alive until it fires —
+      // otherwise an isolated node process (e.g. a single test file) can
+      // exit while the promise is still pending, and the test runner
+      // reports subsequent tests in the same file as "cancelled". The
+      // bridge's HTTP server keeps the production process alive anyway,
+      // and discardAll() clears the timer explicitly on shutdown.
       this.pending = { accountId, expiresAt: Date.now() + timeoutMs, settle, abort, timer };
       log.audit("fleet.enroll-begin", { accountId, timeoutMs });
     });
