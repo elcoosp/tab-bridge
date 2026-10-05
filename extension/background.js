@@ -213,7 +213,7 @@ function connect() {
     } catch {
       /* noop */
     }
-    send({ t: "HELLO", v: PROTOCOL_VERSION, ext: "deepseek-web", extVersion, instance: instanceId });
+    send({ t: "HELLO", v: PROTOCOL_VERSION, ext: "deepseek-web", extVersion, instance: instanceId , account: instanceId});
     startPingLoop();
   });
   ws.addEventListener("message", (ev) => {

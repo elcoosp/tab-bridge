@@ -154,7 +154,17 @@ export class WorkerPool extends EventEmitter {
       connectedAt: Date.now(),
       ...(hello.instance !== undefined ? { instance: hello.instance } : {}),
     };
-    log.info("worker.up", { ext: hello.ext, extVersion: hello.extVersion ?? "unknown", instance: hello.instance ?? "unknown" });
+    // P2 self-branding: if the extension sent an `account` field (a copy of
+    // its instance, present only when the optional patch is applied), log it
+    // alongside `instance`. Both are stable per-profile ids and carry no
+    // secrets — the field exists solely for human-readable log attribution.
+    const accountField = (hello as unknown as { account?: string }).account;
+    log.info("worker.up", {
+      ext: hello.ext,
+      extVersion: hello.extVersion ?? "unknown",
+      instance: hello.instance ?? "unknown",
+      ...(typeof accountField === "string" && accountField.length > 0 ? { account: accountField } : {}),
+    });
     this.emit("event", { type: "worker-up", info: this.info } satisfies PoolEvent);
   }
 
