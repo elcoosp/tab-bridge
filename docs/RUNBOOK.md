@@ -265,7 +265,7 @@ If you actually need a new identity, that is not a surface change —
 it is a **new account**: new profile, new login, new exit path, days
 later (§6.3).
 
-### 3.4 Per-account concurrency
+### 3.5 Per-account concurrency
 
 `--per-account-turns=2` matches DeepSeek's observed per-account
 generation cap. Leave it at 2 unless you have measured otherwise for
