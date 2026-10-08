@@ -12,12 +12,18 @@ serve:
 # Multi-account fleet: one Chrome profile per account, place-then-stick,
 # per-account network identity + surface, staggered boot, fingerprint checkup.
 # Recommended for any machine driving more than one DeepSeek account.
+# NOTE: --warm-tabs must be >= 1 in fleet mode. With 0 the worker creates no
+# managed tabs until the first BIND, but BIND needs a ready account and ready
+# needs a HEALTH ok from a managed tab — a fresh account deadlocks at
+# awaiting_login forever (login in the launcher-opened tab is ignored as a
+# foreign tab). 1 warm tab breaks the cycle: its HEALTH ok promotes the
+# account to ready, and on an already-logged-in profile that is ~1s after link.
 serve-fleet:
     TAB_BRIDGE_DEBUG=1 node dist/src/index.js serve --port 8789 \
       --api-key-env TAB_BRIDGE_KEY \
       --stateful=true --auto-create-tabs --managed-only \
       --ttl=30m --repair-rounds=1 --holdback-ceiling=65536 \
-      --reset-on-seed=auto --max-tabs=4 --tab-idle-close=15m --warm-tabs=0 \
+      --reset-on-seed=auto --max-tabs=4 --tab-idle-close=15m --warm-tabs=1 \
       --fleet-file=fleet.json --fleet-root=fleet-home \
       --fleet-launch=on-demand --fleet-relogin-window=auto \
       --per-account-turns=2 --max-sessions-per-account=8 \

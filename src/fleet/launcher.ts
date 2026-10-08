@@ -147,6 +147,17 @@ export class FleetLauncher {
       `--user-data-dir=${req.profileDir}`,
       "--no-first-run",
       "--no-default-browser-check",
+      // Background-throttling immunity (2026-10-07 field finding): fleet
+      // windows sit minimized/occluded behind the operator's work, and
+      // Chrome throttles timers/rAF in occluded renderers. The injector
+      // lives on DOM polling (send-enabled gating, submit verification,
+      // reply-baseline settle), so a minimized window stretches submits
+      // from seconds to minutes (observed: 152 s inline, 562 s
+      // paste-to-file, both flagged "unverified (background tab?)").
+      // These switches keep the renderers on wall-clock time.
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
     ];
     if (!req.manualExtension) {
       // Chrome-family builds are inconsistent about resolving relative

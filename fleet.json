@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "accounts": [
+    {
+      "id": "work",
+      "profileDir": "fleet-home/work",
+      "createdAt": 1791404052925,
+      "surface": {
+        "locale": "de-DE",
+        "timezone": "Europe/Berlin",
+        "windowSize": "1440x900",
+        "canvasNoise": true
+      },
+      "instanceId": "w-0g3vb72k",
+      "enrolledAt": 1791404094222
+    }
+  ]
+}

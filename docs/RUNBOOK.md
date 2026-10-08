@@ -278,6 +278,45 @@ means "no tracked limit", not "no capacity".
 owns. Each session generates a periodic reseed cost; 8 is a safe
 default for two or three accounts.
 
+### 3.6 Warm tabs are required in fleet mode (`--warm-tabs >= 1`)
+
+The bridge default is `--warm-tabs=0`. Do not use it with a fleet.
+
+With 0, the worker creates no managed tabs until the first `BIND`
+(`allocateTab` only runs on `BIND`, `ensureWarmTabs` early-returns when
+`want <= 0`). But `BIND` needs a `ready` account for placement, and
+`ready` needs a `HEALTH ok` from a worker-created managed tab
+(`markLoginOk`). A fresh account therefore deadlocks at
+`awaiting_login` forever — and the human's login happens in the
+launcher-opened tab, which the worker ignores as foreign
+(`ignoring foreign tab … not worker-created`), so the bridge never
+observes it. Every chat completion fails `503 fleet_busy`
+(`reason=none_ready`).
+
+Run with at least one warm tab:
+
+```bash
+--warm-tabs=1
+```
+
+The worker pre-creates one managed tab at handshake; its `HEALTH ok`
+promotes the account to `ready`. On an already-logged-in profile (cookie
+jar on disk) that is ~1s after link. `just serve-fleet` ships this
+setting; the systemd unit in §1 should add it too.
+
+Fleet launches also carry background-throttling immunity
+(`--disable-background-timer-throttling`,
+`--disable-backgrounding-occluded-windows`,
+`--disable-renderer-backgrounding`). Fleet windows sit minimized or
+occluded behind the operator's work, and Chrome throttles timers/rAF in
+occluded renderers. The injector lives on DOM polling (send-enabled
+gating, submit verification, reply-baseline settle), so a minimized
+window stretches submits from seconds to minutes (field-observed:
+152 s for an inline paste, 562 s for a paste-to-file, both flagged
+`unverified (background tab?)`). The switches keep the renderers on
+wall-clock time; minimizing a fleet window is still discouraged but no
+longer multiplies submit latency.
+
 ---
 
 ## 4. Day 2 — daily operation

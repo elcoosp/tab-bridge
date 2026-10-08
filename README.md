@@ -514,7 +514,7 @@ echoes the effective configuration so drift is visible.
 | `--ttl` | `30m` | Idle session TTL |
 | `--repair-rounds` | `1` | Bounded tool-protocol repair rounds (0–3) |
 | `--holdback-ceiling` | `65536` | Max chars buffered inside an open tool_call fence before it flushes as content with a warning |
-| `--warm-tabs` | `0` | Pre-created managed tabs (0–8) |
+| `--warm-tabs` | `0` | Pre-created managed tabs (0–8). Fleet mode requires `≥1` (see runbook §3.6) |
 | `--db` | `./bridge-sessions.json` | Session journal path |
 | `--turn-timeout-ms` | `240000` | Per-turn observation deadline |
 | `--bind-timeout-ms` | `20000` | Bind/readiness deadline |

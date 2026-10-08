@@ -293,6 +293,10 @@ test("group 9: launcher — base args and manual-extension flag", () => {
   assert.ok(args.includes("--user-data-dir=/tmp/p/work"));
   assert.ok(args.includes("--no-first-run"));
   assert.ok(args.includes("--no-default-browser-check"));
+  // Background-throttling immunity: fleet windows live minimized/occluded.
+  assert.ok(args.includes("--disable-background-timer-throttling"));
+  assert.ok(args.includes("--disable-backgrounding-occluded-windows"));
+  assert.ok(args.includes("--disable-renderer-backgrounding"));
   assert.ok(args.some((a) => a.startsWith("--load-extension=/tmp/ext")));
   assert.ok(args.some((a) => a.startsWith("--disable-extensions-except=")));
   assert.ok(args[args.length - 1].startsWith("https://"));

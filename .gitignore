@@ -5,3 +5,5 @@ node_modules
 bridge-sessions.json
 dump.txt
 wr.sh
+fleet-home
+flett.json
