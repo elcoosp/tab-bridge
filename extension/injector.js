@@ -138,6 +138,24 @@ const SERVER_BUSY_RETRY_WINDOW_MS = 90_000;
 const SERVER_BUSY_BACKOFF_INITIAL_MS = 2_000;
 const SERVER_BUSY_BACKOFF_MAX_MS = 32_000;
 
+/**
+ * Provider network failure: DeepSeek renders the generation-failed bubble
+ * slot (same `span._1ce76f5` inline bubble + warning-circle retry button
+ * as "Messages too frequent") with a connectivity text instead, e.g.
+ * "Check network and retry" (field-observed 2026-10-07). Disjoint from
+ * RATE_LIMIT_RE / SERVER_BUSY_RE / CONCURRENCY_RE by construction —
+ * none of them mention the network. Own recovery window below; the
+ * terminal wire code is `server_busy` (503 + Retry-After, 10-minute tab
+ * cooldown — never the 20-minute rate-limit quarantine), with a detail
+ * string that keeps the true cause visible in logs.
+ */
+const NETWORK_ERROR_RE =
+  /(check[^.]{0,40}network|network[^.]{0,40}(error|retry|failed|unstable|connection)|connection[^.]{0,40}(failed|error|lost|retry)|request\s*failed|load\s*failed|offline|请检查网络|网络(错误|异常|连接失败|不给力|开小差)|网络连接失败)/i;
+/** In-tab retry window: same 90 s harness-timeout rationale as the others. */
+const NETWORK_ERROR_RETRY_WINDOW_MS = 90_000;
+const NETWORK_ERROR_BACKOFF_INITIAL_MS = 2_000;
+const NETWORK_ERROR_BACKOFF_MAX_MS = 32_000;
+
 // ---------------------------------------------------------------------------
 // Debug instrumentation.
 //
@@ -745,6 +763,33 @@ function serverBusyVisible() {
   return null;
 }
 
+/** Leaf-only network-error bubble scan returning the matched text (or null).
+ * Same slot as the rate-limit bubble (`span._1ce76f5`-style inline error
+ * under the sent message); same leaf-only scan as serverBusyVisible. No
+ * Continue-button suppression here: unlike serverDownVisible's outage
+ * banner, a network-error bubble is never a healthy paused state, and the
+ * warning-circle retry button beside it IS the recovery path
+ * (maybeContinue clicks it). */
+function networkErrorVisible() {
+  let els;
+  try {
+    els = document.querySelectorAll("span, div, p");
+  } catch {
+    return null;
+  }
+  for (const el of els) {
+    try {
+      if (el.children.length > 2) continue;
+      const t = (el.textContent || "").trim();
+      if (!t || t.length > 200) continue;
+      if (NETWORK_ERROR_RE.test(t)) return t.slice(0, 200);
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -928,6 +973,29 @@ function submitServerBusyHit(preCount) {
   for (let i = Math.max(0, preCount); i < nodes.length; i++) {
     const t = (nodes[i].textContent || "").trim();
     if (t && t.length < 400 && SERVER_BUSY_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/** Provider network-failure text in transient notice surfaces (mirrors
+ * noticeServerBusyHit, disjoint pattern: NETWORK_ERROR_RE). */
+function noticeNetworkErrorHit() {
+  for (const el of findAll(SELECTORS.noticeRegions)) {
+    const t = (el.textContent || "").trim();
+    if (t && t.length < 300 && NETWORK_ERROR_RE.test(t)) return true;
+  }
+  return false;
+}
+
+/** Broad submit-block scan for the network-error bubble — notice surfaces
+ * AND chat nodes that appeared after `preCount` (same shapes as
+ * submitServerBusyHit: the bubble renders in the transcript slot). */
+function submitNetworkErrorHit(preCount) {
+  if (noticeNetworkErrorHit()) return true;
+  const nodes = conversationNodes();
+  for (let i = Math.max(0, preCount); i < nodes.length; i++) {
+    const t = (nodes[i].textContent || "").trim();
+    if (t && t.length < 400 && NETWORK_ERROR_RE.test(t)) return true;
   }
   return false;
 }
@@ -1388,6 +1456,7 @@ async function verifySubmitted(composer, baseCount, baseDsCount, stopBefore, had
     await sleep(250);
     if (submitRateLimitHit(baseCount)) return "rate-limited";
     if (submitServerBusyHit(baseCount)) return "server-busy";
+    if (submitNetworkErrorHit(baseCount)) return "network-error";
     if (dsMessageCount() > baseDsCount) return true;
     if (!stopBefore && findFirst(SELECTORS.stopButton)) return true;
     if (hadText && readComposer(composer).length === 0) return true;
@@ -1481,6 +1550,14 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   }
   const mode = await placeText(composer, text);
   if (mode === "ignored") {
+    if (submitNetworkErrorHit(preCount)) {
+      return {
+        ok: false,
+        code: "network_error",
+        detail: "provider notice: network error, check network and retry (submit rejected)",
+        userBubbleRendered: conversationNodes().length > preCount,
+      };
+    }
     if (submitServerBusyHit(preCount)) {
       return {
         ok: false,
@@ -1546,6 +1623,14 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
         userBubbleRendered: conversationNodes().length > preCount,
       };
     }
+    if (submitNetworkErrorHit(preCount)) {
+      return {
+        ok: false,
+        code: "network_error",
+        detail: "provider notice: network error, check network and retry (submit rejected)",
+        userBubbleRendered: conversationNodes().length > preCount,
+      };
+    }
     return {
       ok: false,
       code: "send-button-disabled",
@@ -1572,6 +1657,16 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
     detail: "provider notice: server busy, please try again later (submit rejected)",
     userBubbleRendered: conversationNodes().length > preCount,
   });
+  // Internal code only: handleTurn routes it into attemptNetworkErrorRecovery
+  // (expo-backoff retry click / re-submit); the terminal wire code stays
+  // `server_busy` so callers get 503 + Retry-After. If it ever escapes
+  // unrouted, kindForErrorCode maps unknown codes to dom_error (502).
+  const networkErrorResult = () => ({
+    ok: false,
+    code: "network_error",
+    detail: "provider notice: network error, check network and retry (submit rejected)",
+    userBubbleRendered: conversationNodes().length > preCount,
+  });
   const concurrencyBlockedResult = () => ({
     ok: false,
     code: "concurrency_blocked",
@@ -1582,6 +1677,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   // LIVE class list (BEM "--disabled" included).
   const btnA = findSendButton(composer);
   const a = clickSend(btnA) ? await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs) : false;
+  if (a === "network-error" || (a !== true && submitNetworkErrorHit(preCount))) return networkErrorResult();
   if (a === "server-busy" || (a !== true && submitServerBusyHit(preCount))) return serverBusyResult();
   if (a === "rate-limited" || (a !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (a !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
@@ -1589,6 +1685,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   // Method B: Enter on the composer.
   pressEnter(composer);
   const b = await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs);
+  if (b === "network-error" || (b !== true && submitNetworkErrorHit(preCount))) return networkErrorResult();
   if (b === "server-busy" || (b !== true && submitServerBusyHit(preCount))) return serverBusyResult();
   if (b === "rate-limited" || (b !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (b !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
@@ -1597,6 +1694,7 @@ async function submitPrompt(composer, text, readyTimeoutMs, quickVerify) {
   // attachment finished processing) and click it if it is now enabled.
   const btn2 = findSendButton(composer);
   const c = clickSend(btn2) ? await verifySubmitted(composer, baseCount, baseDsCount, stopBefore, hadText, verifyMs) : false;
+  if (c === "network-error" || (c !== true && submitNetworkErrorHit(preCount))) return networkErrorResult();
   if (c === "server-busy" || (c !== true && submitServerBusyHit(preCount))) return serverBusyResult();
   if (c === "rate-limited" || (c !== true && submitRateLimitHit(preCount))) return rateLimitedResult();
   if (c !== true && submitConcurrencyHit(preCount)) return concurrencyBlockedResult();
@@ -1689,6 +1787,8 @@ function emitDelta(t, text) {
 function attemptRateLimitRecovery(t, why, detail) {
   if (!t || t.finished) return false;
   if (t.rateLimitRecoveryActive) return true; // a retry is already in flight
+  // A server-busy or network-error recovery in flight owns the turn.
+  if (t.serverBusyRecoveryActive || t.networkRecoveryActive) return true;
 
   const now = Date.now();
   // v1.2.70 — rate-limit recovery IS activity. Every retry attempt, every
@@ -1772,6 +1872,9 @@ function attemptRateLimitRecovery(t, why, detail) {
       if (!t || t.finished) return;
       if (!r.ok) {
         dbg("rate-limit recovery: re-submit failed", r.code || "?", r.detail || "");
+        if (r.code === "network_error" || submitNetworkErrorHit(t.submitCount)) {
+          if (attemptNetworkErrorRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
         if (r.code === "server_busy" || submitServerBusyHit(t.submitCount)) {
           if (attemptServerBusyRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
         }
@@ -1803,8 +1906,8 @@ function attemptRateLimitRecovery(t, why, detail) {
 function attemptServerBusyRecovery(t, why, detail) {
   if (!t || t.finished) return false;
   if (t.serverBusyRecoveryActive) return true; // retry already in flight
-  // A rate-limit recovery in flight owns the turn; don't double-schedule.
-  if (t.rateLimitRecoveryActive) return true;
+  // A rate-limit or network-error recovery in flight owns the turn; don't double-schedule.
+  if (t.rateLimitRecoveryActive || t.networkRecoveryActive) return true;
 
   const now = Date.now();
   t.lastSseAt = now;
@@ -1873,6 +1976,9 @@ function attemptServerBusyRecovery(t, why, detail) {
       if (!t || t.finished) return;
       if (!r.ok) {
         dbg("server-busy recovery: re-submit failed", r.code || "?", r.detail || "");
+        if (r.code === "network_error" || submitNetworkErrorHit(t.submitCount)) {
+          if (attemptNetworkErrorRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
         if (r.code === "server_busy" || submitServerBusyHit(t.submitCount)) {
           if (attemptServerBusyRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
         }
@@ -1883,6 +1989,120 @@ function attemptServerBusyRecovery(t, why, detail) {
         return;
       }
       dbg("server-busy recovery: re-submitted, awaiting stream");
+      t.unverified = r.unverified === true;
+      scheduleNoStreamFallback(t, composer, text, true);
+    });
+  }, backoff);
+  return true;
+}
+
+/**
+ * Network-error recovery: same exponential-backoff shape as the other two
+ * recoveries (2s, 4s, 8s, … capped at 32s inside a 90s wall-clock window)
+ * for DeepSeek's "Check network and retry"-family bubbles, which render in
+ * the same inline-bubble slot as rate-limit notices but match none of the
+ * existing detectors.
+ *
+ * Preferred recovery: the warning-circle retry button beside the bubble
+ * resumes the SAME generation via the trusted-debugger click (no fresh
+ * submit, no duplicate user bubble). Fallback: re-submit the stored
+ * prompt. Terminal wire code is `server_busy` (503 + Retry-After,
+ * 10-minute tab cooldown) so callers back off and re-drive; the detail
+ * string preserves the true network cause for logs. Own timers/state so
+ * the three windows never interfere when signals mix in one turn.
+ *
+ * Returns true when a retry is scheduled (caller must NOT finishTurn),
+ * false when the window elapsed (caller must finishTurn "server_busy").
+ */
+function attemptNetworkErrorRecovery(t, why, detail) {
+  if (!t || t.finished) return false;
+  if (t.networkRecoveryActive) return true; // retry already in flight
+  // A rate-limit or server-busy recovery in flight owns the turn.
+  if (t.rateLimitRecoveryActive || t.serverBusyRecoveryActive) return true;
+
+  const now = Date.now();
+  t.lastSseAt = now;
+  if (!t.networkFirstAt) {
+    t.networkFirstAt = now;
+    t.networkGiveUpTimer = setTimeout(() => {
+      if (!t || t.finished) return;
+      dbg("network-error recovery window elapsed — declaring server_busy");
+      finishTurn(
+        false,
+        "server_busy",
+        `network error persisted past ${Math.round(NETWORK_ERROR_RETRY_WINDOW_MS / 1000)}s`,
+      );
+    }, NETWORK_ERROR_RETRY_WINDOW_MS);
+  }
+  const elapsed = now - t.networkFirstAt;
+  if (elapsed >= NETWORK_ERROR_RETRY_WINDOW_MS) {
+    dbg("network-error recovery window elapsed",
+        `${Math.round(elapsed / 1000)}s / ${Math.round(NETWORK_ERROR_RETRY_WINDOW_MS / 1000)}s`,
+        `(${why})`);
+    return false;
+  }
+
+  t.networkRetries = (t.networkRetries | 0) + 1;
+  const exp = NETWORK_ERROR_BACKOFF_INITIAL_MS * Math.pow(2, t.networkRetries - 1);
+  const remaining = NETWORK_ERROR_RETRY_WINDOW_MS - elapsed;
+  const backoff = Math.max(0, Math.min(exp, NETWORK_ERROR_BACKOFF_MAX_MS, remaining));
+  if (backoff <= 0) {
+    dbg("network-error recovery window exhausted", `(${why})`);
+    return false;
+  }
+
+  dbg("network-error recovery scheduled",
+      `#${t.networkRetries}`,
+      `in ${backoff}ms`,
+      `(elapsed ${Math.round(elapsed / 1000)}s / ${Math.round(NETWORK_ERROR_RETRY_WINDOW_MS / 1000)}s)`,
+      `(${why})`);
+
+  t.networkRecoveryActive = true;
+  const reqId = t.reqId;
+  const timeoutMs = t.opts.timeoutMs || 240000;
+  setTimeout(() => {
+    if (!t || t.finished) return;
+    t.networkRecoveryActive = false;
+    // Preferred: the retry affordance beside the bubble resumes the same
+    // generation without a fresh submit.
+    if (findContinueButton()) {
+      dbg("network-error recovery: clicking on-screen retry affordance");
+      maybeContinue(t, "network-error-retry");
+      return;
+    }
+    // Fallback: re-submit the stored prompt text.
+    const composer = findFirst(SELECTORS.composer);
+    const text = typeof t.promptText === "string" ? t.promptText : "";
+    if (!composer || !text) {
+      dbg("network-error recovery: composer or prompt missing, giving up");
+      finishTurn(false, "server_busy", detail || why);
+      return;
+    }
+    dbg("network-error recovery: re-submitting prompt");
+    try { setComposerValue(composer, ""); } catch { /* best effort */ }
+    t.submitCount = conversationNodes().length;
+    t.dsMessageBase = dsMessageCount();
+    t.awaitContinue = 0;
+    t.mode = "sse-await";
+    hookArmSync(reqId, timeoutMs);
+    hookPost({ type: "arm", turnId: reqId, timeoutMs });
+    void submitPrompt(composer, text, t.opts.submitWaitMs || SUBMIT_READY_TIMEOUT_MS, true).then((r) => {
+      if (!t || t.finished) return;
+      if (!r.ok) {
+        dbg("network-error recovery: re-submit failed", r.code || "?", r.detail || "");
+        if (r.code === "network_error" || submitNetworkErrorHit(t.submitCount)) {
+          if (attemptNetworkErrorRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
+        if (r.code === "server_busy" || submitServerBusyHit(t.submitCount)) {
+          if (attemptServerBusyRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
+        if (r.code === "rate_limited" || submitRateLimitHit(t.submitCount)) {
+          if (attemptRateLimitRecovery(t, "resubmit-rejected", r.detail || r.code)) return;
+        }
+        finishTurn(false, r.code || "server_busy", r.detail || "network-error re-submit failed");
+        return;
+      }
+      dbg("network-error recovery: re-submitted, awaiting stream");
       t.unverified = r.unverified === true;
       scheduleNoStreamFallback(t, composer, text, true);
     });
@@ -1923,6 +2143,7 @@ function finishTurn(ok, code, detail, aborted, extra) {
   if (t.fallbackTimer) clearTimeout(t.fallbackTimer);
   if (t.rateLimitGiveUpTimer) clearTimeout(t.rateLimitGiveUpTimer);
   if (t.serverBusyGiveUpTimer) clearTimeout(t.serverBusyGiveUpTimer);
+  if (t.networkGiveUpTimer) clearTimeout(t.networkGiveUpTimer);
   if (t.watchdog) clearInterval(t.watchdog);
   hookPost({ type: "disarm" });
   turn = null;
@@ -2314,6 +2535,10 @@ window.addEventListener("message", (ev) => {
         if (!attemptServerBusyRecovery(t, "sse-hint", d.content || "provider: server busy (stream hint)")) {
           finishTurn(false, "server_busy", d.content || "provider: server busy (stream hint)");
         }
+      } else if (NETWORK_ERROR_RE.test(d.content || "") || NETWORK_ERROR_RE.test(d.finishReason || "")) {
+        if (!attemptNetworkErrorRecovery(t, "sse-hint", d.content || "provider: network error (stream hint)")) {
+          finishTurn(false, "server_busy", d.content || "provider: network error (stream hint)");
+        }
       } else if (CONCURRENCY_RE.test(d.finishReason || "") || CONCURRENCY_RE.test(d.content || "")) {
         finishTurn(false, "concurrency_blocked", d.content || "provider: another message is being generated");
       }
@@ -2357,6 +2582,16 @@ window.addEventListener("message", (ev) => {
       }
       if (
         d.hintError &&
+        (NETWORK_ERROR_RE.test(d.hintError.finishReason || "") ||
+          NETWORK_ERROR_RE.test(d.hintError.content || ""))
+      ) {
+        if (!attemptNetworkErrorRecovery(t, "sse-complete-hint", d.hintError.content || "provider: network error")) {
+          finishTurn(false, "server_busy", d.hintError.content || "provider: network error");
+        }
+        break;
+      }
+      if (
+        d.hintError &&
         (CONCURRENCY_RE.test(d.hintError.finishReason || "") ||
           CONCURRENCY_RE.test(d.hintError.content || ""))
       ) {
@@ -2376,6 +2611,13 @@ window.addEventListener("message", (ev) => {
         if (busyText) {
           if (!attemptServerBusyRecovery(t, "banner", `provider notice: ${busyText}`)) {
             finishTurn(false, "server_busy", `provider notice: ${busyText}`);
+          }
+          break;
+        }
+        const netText = networkErrorVisible();
+        if (netText) {
+          if (!attemptNetworkErrorRecovery(t, "banner", `provider notice: ${netText}`)) {
+            finishTurn(false, "server_busy", `network error persisted: ${netText}`);
           }
           break;
         }
@@ -2412,18 +2654,33 @@ window.addEventListener("message", (ev) => {
         if (!attemptServerBusyRecovery(t, `http-${s}`, detail)) {
           finishTurn(false, "server_busy", detail);
         }
+      } else if (NETWORK_ERROR_RE.test(d.snippet || "")) {
+        if (!attemptNetworkErrorRecovery(t, `http-${s}`, detail)) {
+          finishTurn(false, "server_busy", detail);
+        }
       } else finishTurn(false, "dom-error", detail);
       break;
     }
     case "stream-error":
     case "hook-error":
-    case "fetch-rejected":
+    case "fetch-rejected": {
+      // A network-error bubble on screen means the provider-side transport
+      // failed, not the capture: run expo-backoff recovery instead of a
+      // terminal dom-error.
+      const netText = networkErrorVisible();
+      if (netText && t.emitted.length === 0) {
+        if (!attemptNetworkErrorRecovery(t, d.type, `provider notice: ${netText}`)) {
+          finishTurn(false, "server_busy", `network error persisted: ${netText}`);
+        }
+        break;
+      }
       if (t.emitted.length > 0) {
         finishTurn(false, "dom-error", "capture failed after partial stream: " + (d.error || d.type));
       } else {
         finishTurn(false, "dom-error", `${d.type}: ${d.error || "capture failed"}`);
       }
       break;
+    }
     default:
       break;
   }
@@ -2469,6 +2726,20 @@ function startWatchdog(t) {
     if (busyHit) {
       if (!attemptServerBusyRecovery(t, "toast", "provider notice: server busy, please try again later")) {
         finishTurn(false, "server_busy", "provider notice: server busy, please try again later");
+      }
+      return;
+    }
+    // Network-error bubble in the transcript slot (same position as the
+    // rate-limit bubble, connectivity text): expo-backoff retry click /
+    // re-submit instead of hanging until the SSE-idle guillotine. C5's
+    // guard applies — only trust the transcript scan pre-fragments.
+    const netHit =
+      noticeNetworkErrorHit() ||
+      (t.emitted.length === 0 && submitNetworkErrorHit(t.submitCount));
+    if (netHit) {
+      const netText = networkErrorVisible() || "network error, check network and retry";
+      if (!attemptNetworkErrorRecovery(t, "toast", `provider notice: ${netText}`)) {
+        finishTurn(false, "server_busy", `network error persisted: ${netText}`);
       }
       return;
     }
@@ -2567,6 +2838,13 @@ async function onNoStream(t, composer, originalText, isRetry) {
   if (busyText) {
     if (!attemptServerBusyRecovery(t, "no-stream", `provider notice: ${busyText}`)) {
       finishTurn(false, "server_busy", `provider notice: ${busyText}`);
+    }
+    return;
+  }
+  const netText = networkErrorVisible();
+  if (netText) {
+    if (!attemptNetworkErrorRecovery(t, "no-stream", `provider notice: ${netText}`)) {
+      finishTurn(false, "server_busy", `network error persisted: ${netText}`);
     }
     return;
   }
@@ -2676,6 +2954,10 @@ async function handleTurn(msg) {
     serverBusyGiveUpTimer: null, // fires finishTurn(server_busy) at window expiry
     serverBusyFirstAt: 0, // wall-clock start of the server-busy window
     serverBusyRecoveryActive: false, // debounce while a retry is scheduled
+    networkRetries: 0, // network-error recovery attempts this turn
+    networkGiveUpTimer: null, // fires finishTurn(server_busy) at window expiry
+    networkFirstAt: 0, // wall-clock start of the network-error window
+    networkRecoveryActive: false, // debounce while a retry is scheduled
     promptText: typeof msg.text === "string" ? msg.text : "", // v1.2.70: for re-submit
   };
   turn = t;
@@ -2712,6 +2994,9 @@ async function handleTurn(msg) {
     );
     if (!submitted.ok) {
       if (submitted.code === "rate_limited" && attemptRateLimitRecovery(t, "submit-rejected", submitted.detail)) {
+        return;
+      }
+      if (submitted.code === "network_error" && attemptNetworkErrorRecovery(t, "submit-rejected", submitted.detail)) {
         return;
       }
       finishTurn(false, submitted.code || "submit-failed", submitted.detail, false, {
